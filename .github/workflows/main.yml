@@ -1,136 +1,124 @@
-name: Fix linker options (LINKER: prefix) and build
-
+name: Fix Linker Options
 on:
   push:
-    branches: [ main, master ]
+    branches:
+      - main
+      - master
   workflow_dispatch:
 
 permissions:
   contents: write
 
 jobs:
-  fix-and-build:
+  build:
     runs-on: ubuntu-latest
     steps:
-    - name: Checkout
-      uses: actions/checkout@v4
-      with:
-        fetch-depth: 0
-        persist-credentials: true
+      - name: Checkout
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+          persist-credentials: true
 
-    - name: Verify extern "C" is present in android_main.cpp
-      run: |
-        if ! grep -q 'extern "C" void android_main' android/app/src/main/cpp/android_main.cpp; then
-          echo "ERROR: extern \"C\" is missing in android_main.cpp"
-          exit 1
-        fi
-        echo "android_main has extern \"C\" — good"
+      - name: Fix CMakeLists linker options
+        run: |
+          cat > android/app/src/main/cpp/CMakeLists.txt <<'CMAKE'
+          cmake_minimum_required(VERSION 3.22)
+          project(imguieditor)
+          set(CMAKE_CXX_STANDARD 17)
 
-    - name: Rewrite CMakeLists.txt with proper LINKER: options
-      run: |
-        cat > android/app/src/main/cpp/CMakeLists.txt <<'CMAKE'
-        cmake_minimum_required(VERSION 3.22)
-        project(imguieditor)
-        set(CMAKE_CXX_STANDARD 17)
+          set(GLUE_DIR "")
+          foreach(c "${ANDROID_NDK}/sources/android/native_app_glue" "${CMAKE_ANDROID_NDK}/sources/android/native_app_glue")
+              if(EXISTS "${c}/android_native_app_glue.c")
+                  set(GLUE_DIR "${c}")
+                  break()
+              endif()
+          endforeach()
 
-        # --- native_app_glue from NDK ---
-        set(GLUE_DIR "")
-        foreach(c "${ANDROID_NDK}/sources/android/native_app_glue"
-                  "${CMAKE_ANDROID_NDK}/sources/android/native_app_glue")
-            if(EXISTS "${c}/android_native_app_glue.c")
-                set(GLUE_DIR "${c}")
-                break()
-            endif()
-        endforeach()
+          if(NOT GLUE_DIR)
+              message(FATAL_ERROR "native_app_glue not found in NDK")
+          endif()
 
-        if(NOT GLUE_DIR)
-            message(FATAL_ERROR "native_app_glue not found in NDK")
-        endif()
+          set(IMGUI_DIR "${CMAKE_CURRENT_SOURCE_DIR}/vendor/imgui")
 
-        set(IMGUI_DIR "${CMAKE_CURRENT_SOURCE_DIR}/vendor/imgui")
+          add_library(imgui STATIC
+              ${IMGUI_DIR}/imgui.cpp
+              ${IMGUI_DIR}/imgui_draw.cpp
+              ${IMGUI_DIR}/imgui_tables.cpp
+              ${IMGUI_DIR}/imgui_widgets.cpp
+              ${IMGUI_DIR}/backends/imgui_impl_android.cpp
+              ${IMGUI_DIR}/backends/imgui_impl_opengl3.cpp
+              ${IMGUI_DIR}/misc/cpp/imgui_stdlib.cpp
+          )
+          target_include_directories(imgui PUBLIC
+              ${IMGUI_DIR}
+              ${IMGUI_DIR}/backends
+              ${IMGUI_DIR}/misc/cpp
+          )
 
-        # --- ImGui core + backends ---
-        add_library(imgui STATIC
-            ${IMGUI_DIR}/imgui.cpp
-            ${IMGUI_DIR}/imgui_draw.cpp
-            ${IMGUI_DIR}/imgui_tables.cpp
-            ${IMGUI_DIR}/imgui_widgets.cpp
-            ${IMGUI_DIR}/backends/imgui_impl_android.cpp
-            ${IMGUI_DIR}/backends/imgui_impl_opengl3.cpp
-            ${IMGUI_DIR}/misc/cpp/imgui_stdlib.cpp
-        )
-        target_include_directories(imgui PUBLIC
-            ${IMGUI_DIR}
-            ${IMGUI_DIR}/backends
-            ${IMGUI_DIR}/misc/cpp
-        )
+          add_library(imguieditor SHARED
+              android_main.cpp
+              widget_model.cpp
+              ${GLUE_DIR}/android_native_app_glue.c
+          )
+          target_include_directories(imguieditor PRIVATE
+              ${CMAKE_CURRENT_SOURCE_DIR}
+              ${GLUE_DIR}
+          )
 
-        # --- Our app ---
-        add_library(imguieditor SHARED
-            android_main.cpp
-            widget_model.cpp
-            ${GLUE_DIR}/android_native_app_glue.c
-        )
-        target_include_directories(imguieditor PRIVATE
-            ${CMAKE_CURRENT_SOURCE_DIR}
-            ${GLUE_DIR}
-        )
+          find_library(log-lib log)
+          target_link_libraries(imguieditor imgui android EGL GLESv3 ${log-lib})
 
-        find_library(log-lib log)
-        target_link_libraries(imguieditor imgui android EGL GLESv3 ${log-lib})
+          target_link_options(imguieditor PRIVATE
+              "LINKER:-u,ANativeActivity_onCreate"
+              "LINKER:-u,android_main"
+          )
+          CMAKE
+          echo "CMakeLists.txt rewritten with LINKER: prefix"
+          grep -A3 target_link_options android/app/src/main/cpp/CMakeLists.txt
 
-        # ★ FIX: use LINKER: prefix so CMake emits proper -Wl,-u,SYMBOL
-        #         for each symbol; this avoids CMake deduplicating "-u"
-        #         which previously turned "android_main" into an input file.
-        target_link_options(imguieditor PRIVATE
-            "LINKER:-u,ANativeActivity_onCreate"
-            "LINKER:-u,android_main"
-        )
-        CMAKE
-        echo "=== CMakeLists.txt written ==="
-        grep -A3 target_link_options android/app/src/main/cpp/CMakeLists.txt
+      - name: Commit fix
+        run: |
+          git config user.name "ImGui Engine Bot"
+          git config user.email "bot@imgui-engine.local"
+          git add -A
+          if git diff --staged --quiet; then
+            echo "Nothing to commit"
+          else
+            git commit -m "fix(linker): use LINKER prefix to avoid dedup bug"
+            git push
+          fi
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
 
-    - name: Commit fix
-      run: |
-        git config user.name "ImGui Engine Bot"
-        git config user.email "bot@imgui-engine.local"
-        git add -A
-        if git diff --staged --quiet; then echo "Nothing to commit"; else
-          git commit -m "fix(linker): use LINKER: prefix to avoid -u dedup and android_main-as-file bug [skip ci]"
-          git push
-        fi
-      env:
-        GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+      - name: Set up JDK 17
+        uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: "17"
 
-    - name: Set up JDK 17
-      uses: actions/setup-java@v4
-      with:
-        distribution: 'temurin'
-        java-version: '17'
+      - name: Set up Android SDK
+        uses: android-actions/setup-android@v3
+        with:
+          packages: platforms;android-34 build-tools;34.0.0
+          accept-android-sdk-licenses: true
 
-    - name: Set up Android SDK
-      uses: android-actions/setup-android@v3
-      with:
-        packages: 'platforms;android-34 build-tools;34.0.0'
-        accept-android-sdk-licenses: true
+      - name: Install NDK
+        run: |
+          echo "y" | sdkmanager --install "ndk;26.1.10909125"
+          echo "ANDROID_NDK_HOME=$ANDROID_HOME/ndk/26.1.10909125" >> $GITHUB_ENV
 
-    - name: Install NDK
-      run: |
-        echo "y" | sdkmanager --install "ndk;26.1.10909125"
-        echo "ANDROID_NDK_HOME=$ANDROID_HOME/ndk/26.1.10909125" >> $GITHUB_ENV
+      - name: Set up Gradle
+        uses: gradle/actions/setup-gradle@v3
 
-    - name: Set up Gradle
-      uses: gradle/actions/setup-gradle@v3
+      - name: Build APK
+        run: |
+          cd android
+          if [ ! -f ./gradlew ]; then gradle wrapper --gradle-version 8.4; fi
+          ./gradlew assembleDebug --no-daemon
 
-    - name: Build APK
-      run: |
-        cd android
-        if [ ! -f ./gradlew ]; then gradle wrapper --gradle-version 8.4; fi
-        ./gradlew assembleDebug --no-daemon
-
-    - name: Upload APK
-      uses: actions/upload-artifact@v4
-      with:
-        name: ImGui-Visual-Engine
-        path: android/app/build/outputs/apk/debug/*.apk
-        if-no-files-found: error
+      - name: Upload APK
+        uses: actions/upload-artifact@v4
+        with:
+          name: ImGui-Visual-Engine
+          path: android/app/build/outputs/apk/debug/*.apk
+          if-no-files-found: error
