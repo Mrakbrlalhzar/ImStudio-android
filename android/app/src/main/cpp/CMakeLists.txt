@@ -47,4 +47,4 @@ target_include_directories(imguieditor PRIVATE
 
 find_library(log-lib log)
 target_link_libraries(imguieditor imgui android EGL GLESv3 ${log-lib})
-target_link_options(imguieditor PRIVATE "-u" "ANativeActivity_onCreate")
+target_link_options(imguieditor PRIVATE "-u" "ANativeActivity_onCreate" "-u" "android_main")
