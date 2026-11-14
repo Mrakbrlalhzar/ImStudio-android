@@ -32,7 +32,7 @@ jobs:
 
     - name: Prepare helper
       run: |
-        cat > /tmp/write_if_missing.sh <<'HELPER_EOF'
+        cat > /tmp/write_if_missing <<'HELPER_EOF'
         #!/bin/bash
         # Usage: write_if_missing <path>
         # Reads stdin, writes to file only if it doesn't exist. Drains stdin otherwise.
@@ -45,8 +45,13 @@ jobs:
             cat > /dev/null
         fi
         HELPER_EOF
-        chmod +x /tmp/write_if_missing.sh
+        chmod +x /tmp/write_if_missing
         echo "/tmp" >> $GITHUB_PATH
+
+    - name: Verify helper is on PATH
+      run: |
+        which write_if_missing || echo "NOT FOUND"
+        echo "PATH=$PATH"
 
     # ============================================================
     # 2. کپی vendor (همیشه overwrite، همگام با upstream)
