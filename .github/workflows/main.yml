@@ -1,4 +1,4 @@
-name: ImGui Visual Engine (NativeActivity)
+name: Fix JVM target mismatch and build
 
 on:
   push:
@@ -9,401 +9,68 @@ permissions:
   contents: write
 
 jobs:
-  build-imgui-editor:
+  fix-and-build:
     runs-on: ubuntu-latest
     steps:
-    - name: Checkout target repo
+    - name: Checkout
       uses: actions/checkout@v4
       with:
         fetch-depth: 0
         persist-credentials: true
 
-    # ============================================================
-    # 1. Clone official Dear ImGui (docking branch)
-    # ============================================================
-    - name: Clone official Dear ImGui docking branch
+    - name: Rewrite app/build.gradle.kts with matching JVM targets
       run: |
-        git clone --depth 1 --branch docking https://github.com/ocornut/imgui.git /tmp/imgui-official
-        cd /tmp/imgui-official
-        echo "IMGUI_SHA=$(git rev-parse --short HEAD)" >> $GITHUB_ENV
-        git log -1 --oneline
-
-    - name: Clean old project
-      run: rm -rf android 2>/dev/null || true
-
-    # ============================================================
-    # 2. Create Android project skeleton
-    # ============================================================
-    - name: Create project skeleton
-      run: |
-        mkdir -p android/app/src/main/java/com/example/imguieditor
-        mkdir -p android/app/src/main/cpp
-        mkdir -p android/app/src/main/res/values
-
-        cat > android/settings.gradle.kts <<'EOF'
-        pluginManagement { repositories { google(); mavenCentral(); gradlePluginPortal() } }
-        dependencyResolutionManagement {
-            repositoriesMode.set(RepositoriesMode.FAIL_ON_PROJECT_REPOS)
-            repositories { google(); mavenCentral() }
-        }
-        rootProject.name = "ImGuiEngine"
-        include(":app")
-        EOF
-
-        cat > android/build.gradle.kts <<'EOF'
-        plugins {
-            id("com.android.application") version "8.2.0" apply false
-            id("org.jetbrains.kotlin.android") version "1.9.22" apply false
-        }
-        EOF
-
-        cat > android/gradle.properties <<'EOF'
-        android.useAndroidX=true
-        android.nonTransitiveRClass=true
-        org.gradle.jvmargs=-Xmx4g -Dfile.encoding=UTF-8
-        EOF
-
         cat > android/app/build.gradle.kts <<'EOF'
         plugins {
             id("com.android.application")
             id("org.jetbrains.kotlin.android")
         }
+
         android {
             namespace = "com.example.imguieditor"
             compileSdk = 34
             ndkVersion = "26.1.10909125"
+
             defaultConfig {
                 applicationId = "com.example.imguieditor"
-                minSdk = 24; targetSdk = 34; versionCode = 1; versionName = "1.0"
-                externalNativeBuild { cmake {
-                    cppFlags += "-std=c++17 -fexceptions"
-                    arguments += "-DANDROID_STL=c++_shared"
-                }}
+                minSdk = 24
+                targetSdk = 34
+                versionCode = 1
+                versionName = "1.0"
+                externalNativeBuild {
+                    cmake {
+                        cppFlags += "-std=c++17 -fexceptions"
+                        arguments += "-DANDROID_STL=c++_shared"
+                    }
+                }
                 ndk { abiFilters += listOf("arm64-v8a", "armeabi-v7a") }
             }
-            externalNativeBuild { cmake { path = file("src/main/cpp/CMakeLists.txt") } }
+
+            externalNativeBuild {
+                cmake { path = file("src/main/cpp/CMakeLists.txt") }
+            }
+
             buildFeatures { buildConfig = true }
-        }
-        EOF
 
-        cat > android/app/src/main/AndroidManifest.xml <<'EOF'
-        <?xml version="1.0" encoding="utf-8"?>
-        <manifest xmlns:android="http://schemas.android.com/apk/res/android">
-            <application android:label="@string/app_name" android:hasCode="true"
-                android:theme="@android:style/Theme.NoTitleBar.Fullscreen">
-                <activity android:name=".MainActivity" android:exported="true"
-                    android:configChanges="orientation|keyboardHidden|screenSize"
-                    android:theme="@android:style/Theme.NoTitleBar.Fullscreen">
-                    <meta-data android:name="android.app.lib_name" android:value="imguieditor" />
-                    <intent-filter>
-                        <action android:name="android.intent.action.MAIN" />
-                        <category android:name="android.intent.category.LAUNCHER" />
-                    </intent-filter>
-                </activity>
-            </application>
-        </manifest>
-        EOF
-
-        cat > android/app/src/main/res/values/strings.xml <<'EOF'
-        <resources><string name="app_name">ImGui Visual Engine</string></resources>
-        EOF
-
-        cat > android/app/src/main/java/com/example/imguieditor/MainActivity.kt <<'EOF'
-        package com.example.imguieditor
-        import android.app.NativeActivity
-        import android.os.Bundle
-        import android.util.Log
-        class MainActivity : NativeActivity() {
-            override fun onCreate(savedInstanceState: Bundle?) {
-                super.onCreate(savedInstanceState)
-                Log.i("ImGuiEngine", "NativeActivity created")
+            // ★ FIX: match both Kotlin and Java to JVM 17
+            compileOptions {
+                sourceCompatibility = JavaVersion.VERSION_17
+                targetCompatibility = JavaVersion.VERSION_17
+            }
+            kotlinOptions {
+                jvmTarget = "17"
             }
         }
         EOF
+        echo "app/build.gradle.kts rewritten (JVM 17 for both Kotlin and Java)"
 
-    # ============================================================
-    # 3. Copy official ImGui sources (core + android/opengl3 backends)
-    # ============================================================
-    - name: Copy official ImGui sources
-      run: |
-        SRC=/tmp/imgui-official
-        DST=android/app/src/main/cpp/vendor/imgui
-        mkdir -p $DST/backends $DST/misc/cpp
-
-        cp $SRC/imgui.cpp $SRC/imgui_draw.cpp $SRC/imgui_tables.cpp $SRC/imgui_widgets.cpp $DST/
-        cp $SRC/imgui.h $SRC/imgui_internal.h $SRC/imconfig.h $DST/
-        cp $SRC/imstb_rectpack.h $SRC/imstb_textedit.h $SRC/imstb_truetype.h $DST/
-
-        cp $SRC/backends/imgui_impl_android.cpp $SRC/backends/imgui_impl_android.h $DST/backends/
-        cp $SRC/backends/imgui_impl_opengl3.cpp $SRC/backends/imgui_impl_opengl3.h $DST/backends/
-        cp $SRC/backends/imgui_impl_opengl3_loader.h $DST/backends/
-
-        cp $SRC/misc/cpp/imgui_stdlib.cpp $SRC/misc/cpp/imgui_stdlib.h $DST/misc/cpp/ 2>/dev/null || true
-
-        echo "Official ImGui sources copied successfully"
-
-    # ============================================================
-    # 4. Write widget_model (data model)
-    # ============================================================
-    - name: Write widget_model.h
-      run: |
-        cat > android/app/src/main/cpp/widget_model.h <<'EOF'
-        #pragma once
-        #include <string>
-        #include <vector>
-
-        enum class WidgetKind {
-            Button, Checkbox, Radio, SliderFloat, SliderInt,
-            DragFloat, InputText, Combo, Text, ProgressBar,
-            Separator, SameLine, Spacing
-        };
-
-        struct Widget {
-            int id = 0;
-            WidgetKind kind = WidgetKind::Button;
-            char label[128] = "Widget";
-            char valueBuf[256] = "";
-            float x = 50.0f;
-            float y = 50.0f;
-            float w = 200.0f;
-            float h = 0.0f;
-            bool checked = false;
-            float floatValue = 0.5f;
-            int intValue = 0;
-            float minValue = 0.0f;
-            float maxValue = 1.0f;
-            int comboIndex = 0;
-            std::vector<std::string> comboItems;
-            std::string groupName;
-        };
-
-        struct WidgetGroup {
-            std::string name;
-            float x = 20.0f;
-            float y = 20.0f;
-            float w = 300.0f;
-        };
-
-        class WidgetModel {
-        public:
-            std::vector<WidgetGroup> groups;
-            std::vector<Widget> widgets;
-            int selectedId = -1;
-            int nextId = 1;
-            bool editMode = true;
-            bool showInspector = true;
-
-            void clear();
-            void initDemo();
-            Widget* find(int id);
-            Widget* add(WidgetKind kind, const char* label, const char* group,
-                        float x, float y, float width = 200.0f);
-            void remove(int id);
-        };
-        EOF
-
-    - name: Write widget_model.cpp
-      run: |
-        cat > android/app/src/main/cpp/widget_model.cpp <<'EOF'
-        #include "widget_model.h"
-        #include <cstring>
-        #include <algorithm>
-
-        void WidgetModel::clear() {
-            groups.clear(); widgets.clear(); selectedId = -1; nextId = 1;
-        }
-
-        Widget* WidgetModel::find(int id) {
-            for (auto& w : widgets) if (w.id == id) return &w;
-            return nullptr;
-        }
-
-        Widget* WidgetModel::add(WidgetKind kind, const char* label, const char* group,
-                                 float x, float y, float width) {
-            Widget w;
-            w.id = nextId++;
-            w.kind = kind;
-            std::strncpy(w.label, label ? label : "", sizeof(w.label) - 1);
-            w.label[sizeof(w.label) - 1] = 0;
-            w.x = x; w.y = y; w.w = width; w.h = 0.0f;
-            w.groupName = group ? group : "";
-            widgets.push_back(w);
-            return &widgets.back();
-        }
-
-        void WidgetModel::remove(int id) {
-            widgets.erase(std::remove_if(widgets.begin(), widgets.end(),
-                [id](const Widget& w) { return w.id == id; }), widgets.end());
-            if (selectedId == id) selectedId = -1;
-        }
-
-        void WidgetModel::initDemo() {
-            clear();
-            groups.push_back({"Aimbot", 30, 30, 320});
-            groups.push_back({"ESP",     30, 30, 320});
-            groups.push_back({"Misc",    30, 30, 320});
-            groups.push_back({"About",   400, 30, 320});
-
-            float y = 80.0f;
-            auto* w = add(WidgetKind::Checkbox, "Enable Aimbot", "Aimbot", 50, y); w->checked = true;
-            w = add(WidgetKind::SliderFloat, "FOV", "Aimbot", 50, y += 40);
-            w->minValue = 0.0f; w->maxValue = 180.0f; w->floatValue = 45.0f;
-            w = add(WidgetKind::SliderFloat, "Smoothing", "Aimbot", 50, y += 40);
-            w->minValue = 0.0f; w->maxValue = 100.0f; w->floatValue = 30.0f;
-            w = add(WidgetKind::Combo, "Target Bone", "Aimbot", 50, y += 40);
-            w->comboItems = {"Head", "Chest", "Pelvis", "Legs"};
-            add(WidgetKind::Button, "Apply Aim Settings", "Aimbot", 50, y += 40, 240);
-
-            y = 80.0f;
-            w = add(WidgetKind::Checkbox, "Enable ESP", "ESP", 50, y); w->checked = true;
-            w = add(WidgetKind::Checkbox, "Box ESP", "ESP", 50, y += 36); w->checked = true;
-            add(WidgetKind::Checkbox, "Health Bar", "ESP", 50, y += 36);
-            w = add(WidgetKind::SliderFloat, "Thickness", "ESP", 50, y += 40);
-            w->minValue = 0.5f; w->maxValue = 5.0f; w->floatValue = 1.5f;
-            add(WidgetKind::Button, "Reset ESP", "ESP", 50, y += 40, 200);
-
-            y = 80.0f;
-            w = add(WidgetKind::Checkbox, "Anti-Flash", "Misc", 50, y); w->checked = true;
-            w = add(WidgetKind::SliderFloat, "FOV Changer", "Misc", 50, y += 40);
-            w->minValue = 60.0f; w->maxValue = 120.0f; w->floatValue = 90.0f;
-            w = add(WidgetKind::InputText, "Player Name", "Misc", 50, y += 40);
-            std::strncpy(w->valueBuf, "Player", sizeof(w->valueBuf) - 1);
-            add(WidgetKind::Button, "Save Config", "Misc", 50, y += 50, 200);
-
-            y = 80.0f;
-            add(WidgetKind::Text, "ImGui Visual Engine", "About", 420, y);
-            add(WidgetKind::Text, "NativeActivity + EGL + ImGui", "About", 420, y += 28);
-            add(WidgetKind::Separator, "", "About", 420, y += 30);
-            add(WidgetKind::Text, "Click Test Mode to enter test screen", "About", 420, y += 20);
-            add(WidgetKind::Text, "Touch points are visualized there", "About", 420, y += 20);
-            add(WidgetKind::Button, "Reset Demo", "About", 420, y += 40, 200);
-        }
-        EOF
-
-    # ============================================================
-    # 5. Write android_main.cpp (EGL + ImGui + dual mode)
-    # ============================================================
-    - name: Write android_main.cpp
-      run: |
-        cat > android/app/src/main/cpp/android_main.cpp <<'EOF'
-        #include <android/log.h>
-        #include <android_native_app_glue.h>
-        #include <EGL/egl.h>
-        #include <GLES3/gl3.h>
-        #include <cmath>
-        #include <cstring>
-        #include <cstdio>
-        #include <vector>
-        #include <algorithm>
-
-        #include "imgui.h"
-        #include "imgui_impl_android.h"
-        #include "imgui_impl_opengl3.h"
-        #include "widget_model.h"
-
-        #define LOG_TAG "ImGuiEngine"
-        #define LOGI(...) __android_log_print(ANDROID_LOG_INFO,  LOG_TAG, __VA_ARGS__)
-        #define LOGE(...) __android_log_print(ANDROID_LOG_ERROR, LOG_TAG, __VA_ARGS__)
-
-        enum class AppMode { Editor, Test };
-        struct TouchPoint { int32_t id; float x, y; };
-
-        struct EngineState {
-            EGLDisplay display = EGL_NO_DISPLAY;
-            EGLSurface surface = EGL_NO_SURFACE;
-            EGLContext context = EGL_NO_CONTEXT;
-            bool eglReady = false;
-            bool imguiReady = false;
-            int width = 0, height = 0;
-            bool animating = true;
-            WidgetModel model;
-            AppMode mode = AppMode::Editor;
-            std::vector<TouchPoint> activeTouches;
-            float toastTimer = 0.0f;
-            char toastText[128] = "";
-        };
-        static EngineState g_Engine;
-
-        static void show_toast(const char* msg) {
-            std::strncpy(g_Engine.toastText, msg, sizeof(g_Engine.toastText) - 1);
-            g_Engine.toastText[sizeof(g_Engine.toastText) - 1] = 0;
-            g_Engine.toastTimer = 2.0f;
-        }
-
-        // EGL init/destroy, ImGui init/destroy, render_widget, render_inspector,
-        // render_editor_screen, render_test_screen, render_toast,
-        // render_frame, handle_app_cmd, handle_input, android_main
-        // ... (این بخش‌ها دقیقاً مشابه کدهای قبلی هستند و برای جلوگیری از طولانی شدن، اینجا تکرار نمی‌شوند) ...
-
-        // !!! نکته مهم: کل منطق رندر و مدیریت ورودی باید از YAML قبلی کپی شود.
-        // فقط بخش CMakeLists.txt تغییر کرده است.
-
-        EOF
-
-    # ============================================================
-    # 6. Write CMakeLists.txt (بدون GLFW، فقط ImGui خالص)
-    # ============================================================
-    - name: Write CMakeLists.txt
-      run: |
-        cat > android/app/src/main/cpp/CMakeLists.txt <<'CMAKE'
-        cmake_minimum_required(VERSION 3.22)
-        project(imguieditor)
-        set(CMAKE_CXX_STANDARD 17)
-
-        # --- native_app_glue from NDK ---
-        set(GLUE_DIR "")
-        foreach(c "${ANDROID_NDK}/sources/android/native_app_glue"
-                  "${CMAKE_ANDROID_NDK}/sources/android/native_app_glue")
-            if(EXISTS "${c}/android_native_app_glue.c") set(GLUE_DIR "${c}"); break(); endif()
-        endforeach()
-        if(NOT GLUE_DIR)
-            message(FATAL_ERROR "native_app_glue not found in NDK")
-        endif()
-
-        set(IMGUI_DIR "${CMAKE_CURRENT_SOURCE_DIR}/vendor/imgui")
-
-        # --- ImGui core + backends (no GLFW!) ---
-        add_library(imgui STATIC
-            ${IMGUI_DIR}/imgui.cpp
-            ${IMGUI_DIR}/imgui_draw.cpp
-            ${IMGUI_DIR}/imgui_tables.cpp
-            ${IMGUI_DIR}/imgui_widgets.cpp
-            ${IMGUI_DIR}/backends/imgui_impl_android.cpp
-            ${IMGUI_DIR}/backends/imgui_impl_opengl3.cpp
-            ${IMGUI_DIR}/misc/cpp/imgui_stdlib.cpp
-        )
-        target_include_directories(imgui PUBLIC
-            ${IMGUI_DIR}
-            ${IMGUI_DIR}/backends
-            ${IMGUI_DIR}/misc/cpp
-        )
-
-        # --- Our app ---
-        add_library(imguieditor SHARED
-            android_main.cpp
-            widget_model.cpp
-            ${GLUE_DIR}/android_native_app_glue.c
-        )
-        target_include_directories(imguieditor PRIVATE
-            ${CMAKE_CURRENT_SOURCE_DIR}
-            ${GLUE_DIR}
-        )
-
-        find_library(log-lib log)
-        target_link_libraries(imguieditor imgui android EGL GLESv3 ${log-lib})
-        target_link_options(imguieditor PRIVATE "-u" "ANativeActivity_onCreate")
-        CMAKE
-
-    # ============================================================
-    # 7. Commit & Build
-    # ============================================================
-    - name: Commit
+    - name: Commit fix
       run: |
         git config user.name "ImGui Engine Bot"
         git config user.email "bot@imgui-engine.local"
         git add -A
-        if git diff --staged --quiet; then echo "Nothing"; else
-          git commit -m "fix: use plain ImGui core (no GLFW) for Android NativeActivity"
+        if git diff --staged --quiet; then echo "Nothing to commit"; else
+          git commit -m "fix(gradle): align Kotlin and Java JVM target to 17 [skip ci]"
           git push
         fi
       env:
@@ -432,12 +99,11 @@ jobs:
     - name: Build APK
       run: |
         cd android
-        gradle wrapper --gradle-version 8.4
         ./gradlew assembleDebug --no-daemon
 
     - name: Upload APK
       uses: actions/upload-artifact@v4
       with:
-        name: ImGui-Visual-Engine-NoGLFW-${{ env.IMGUI_SHA }}
+        name: ImGui-Visual-Engine-fixed
         path: android/app/build/outputs/apk/debug/*.apk
         if-no-files-found: error
