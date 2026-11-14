@@ -2,24 +2,17 @@ plugins {
     id("com.android.application")
     id("org.jetbrains.kotlin.android")
 }
-
 android {
     namespace = "com.raais.imstudio"
     compileSdk = 34
     ndkVersion = "26.1.10909125"
-
     defaultConfig {
         applicationId = "com.raais.imstudio"
-        minSdk = 24
-        targetSdk = 34
-        versionCode = 1
-        versionName = "1.0"
-        externalNativeBuild {
-            cmake {
-                cppFlags += "-std=c++17 -fexceptions"
-                arguments += "-DANDROID_STL=c++_shared"
-            }
-        }
+        minSdk = 24; targetSdk = 34; versionCode = 1; versionName = "1.0"
+        externalNativeBuild { cmake {
+            cppFlags += "-std=c++17 -fexceptions"
+            arguments += "-DANDROID_STL=c++_shared"
+        }}
         ndk { abiFilters += listOf("arm64-v8a", "armeabi-v7a") }
     }
     externalNativeBuild { cmake { path = file("src/main/cpp/CMakeLists.txt") } }
@@ -31,7 +24,6 @@ android {
         targetCompatibility = JavaVersion.VERSION_1_8
     }
 }
-
 dependencies {
     implementation(platform("androidx.compose:compose-bom:2024.02.00"))
     implementation("androidx.compose.ui:ui")

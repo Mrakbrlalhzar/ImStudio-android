@@ -2,22 +2,20 @@
 #include "ims_buffer.h"
 #include "ims_object.h"
 #include "imgui.h"
-
 #include <android/log.h>
 #include <mutex>
 #include <new>
+#include <stdexcept>
 
 #define LOG_TAG "ImStudioCore"
 #define LOGI(...) __android_log_print(ANDROID_LOG_INFO,  LOG_TAG, __VA_ARGS__)
-#define LOGW(...) __android_log_print(ANDROID_LOG_WARN,  LOG_TAG, __VA_ARGS__)
 #define LOGE(...) __android_log_print(ANDROID_LOG_ERROR, LOG_TAG, __VA_ARGS__)
 
 namespace imstudio::engine {
-
 static ImStudio::BufferWindow* g_BufferPtr = nullptr;
-static std::mutex             g_Mutex;
+static std::mutex g_Mutex;
 
-static bool ensure_initialized_locked() {
+static bool ensure_locked() {
     if (ImGui::GetCurrentContext() == nullptr) {
         LOGI("[ensure] Creating ImGui context...");
         IMGUI_CHECKVERSION();
@@ -27,8 +25,6 @@ static bool ensure_initialized_locked() {
             return false;
         }
         LOGI("[ensure] ImGui context at %p", (void*)ImGui::GetCurrentContext());
-    } else {
-        LOGI("[ensure] ImGui context already at %p", (void*)ImGui::GetCurrentContext());
     }
     if (g_BufferPtr == nullptr) {
         LOGI("[ensure] Allocating BufferWindow...");
@@ -44,8 +40,7 @@ static bool ensure_initialized_locked() {
 
 static ImStudio::BufferWindow& buf() {
     std::lock_guard<std::mutex> lock(g_Mutex);
-    if (!ensure_initialized_locked())
-        throw std::runtime_error("ImStudio engine not initialized");
+    if (!ensure_locked()) throw std::runtime_error("ImStudio engine not initialized");
     return *g_BufferPtr;
 }
 
@@ -80,7 +75,6 @@ int add_widget(const std::string& type) {
     LOGI("[add_widget] -> id=%d", id);
     return id;
 }
-
 bool delete_widget(int id) { if (auto* o = get_obj(id)) { o->del(); return true; } return false; }
 int get_count() { return (int)buf().objects.size(); }
 int get_id_at(int index) {
@@ -101,5 +95,4 @@ bool set_value_s(int id, const std::string& v) { auto* o = get_obj(id); if (!o) 
 bool move(int id, float x, float y)            { auto* o = get_obj(id); if (!o) return false; o->pos.x = x; o->pos.y = y; return true; }
 bool resize(int id, float sx, float sy)        { auto* o = get_obj(id); if (!o) return false; o->size.x = sx; o->size.y = sy; return true; }
 bool set_width(int id, float w)                { auto* o = get_obj(id); if (!o) return false; o->width = w; return true; }
-
-} // namespace imstudio::engine
+} // namespace

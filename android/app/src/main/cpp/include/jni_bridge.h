@@ -1,10 +1,8 @@
 #pragma once
-// Public C++ API consumed by jni_bridge.cpp.
-// These mirror the JNI signatures exposed to Kotlin.
 #include <string>
-
 namespace imstudio::engine {
     void init();
+    void shutdown();
     int  add_widget(const std::string& type);
     bool delete_widget(int id);
     int  get_count();

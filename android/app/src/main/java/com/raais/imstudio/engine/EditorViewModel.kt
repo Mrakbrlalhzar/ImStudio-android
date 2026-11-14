@@ -8,4 +8,5 @@ class EditorViewModel : ViewModel() {
     fun select(id: Int?) { state.selectedId.value = id }
     fun addWidget(type: WidgetType) = state.addWidget(type.nativeName)
     fun generateCode(): String = state.generateCode()
+    override fun onCleared() { super.onCleared(); state.dispose() }
 }

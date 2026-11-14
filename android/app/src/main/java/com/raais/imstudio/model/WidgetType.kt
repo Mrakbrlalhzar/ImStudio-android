@@ -1,9 +1,5 @@
 package com.raais.imstudio.model
-enum class WidgetType(
-    val displayName: String,
-    val nativeName: String,
-    val category: WidgetCategory
-) {
+enum class WidgetType(val displayName: String, val nativeName: String, val category: WidgetCategory) {
     Button("دکمه", "button", WidgetCategory.Primitives),
     Radio("رادیو", "radio", WidgetCategory.Primitives),
     Checkbox("چک‌باکس", "checkbox", WidgetCategory.Primitives),

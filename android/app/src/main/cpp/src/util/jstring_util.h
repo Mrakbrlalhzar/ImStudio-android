@@ -1,7 +1,6 @@
 #pragma once
 #include <jni.h>
 #include <string>
-
 namespace imstudio::util {
     inline std::string from_jstring(JNIEnv* env, jstring s) {
         if (!s) return {};

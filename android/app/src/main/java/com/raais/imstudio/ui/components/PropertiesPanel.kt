@@ -1,5 +1,4 @@
 package com.raais.imstudio.ui.components
-
 import androidx.compose.foundation.background
 import androidx.compose.foundation.layout.*
 import androidx.compose.foundation.rememberScrollState
@@ -10,66 +9,35 @@ import androidx.compose.ui.Modifier
 import androidx.compose.ui.unit.dp
 import com.raais.imstudio.engine.ImStudioState
 
-@Composable
-fun PropertiesPanel(state: ImStudioState) {
+@Composable fun PropertiesPanel(state: ImStudioState) {
     val sel = state.selected()
-    Column(
-        modifier = Modifier.fillMaxHeight()
-            .background(MaterialTheme.colorScheme.surface)
-            .verticalScroll(rememberScrollState())
-            .padding(16.dp),
-        verticalArrangement = Arrangement.spacedBy(12.dp)
-    ) {
+    Column(modifier = Modifier.fillMaxHeight()
+        .background(MaterialTheme.colorScheme.surface)
+        .verticalScroll(rememberScrollState()).padding(16.dp),
+        verticalArrangement = Arrangement.spacedBy(12.dp)) {
         Text("ویژگی‌ها", style = MaterialTheme.typography.titleMedium)
-        if (sel == null) {
-            Text("یک ویجت را انتخاب کنید",
-                color = MaterialTheme.colorScheme.onSurfaceVariant)
-            return@Column
-        }
-        OutlinedTextField(
-            value = sel.label,
-            onValueChange = { state.setLabel(sel.id, it) },
-            label = { Text("Label") },
-            singleLine = true,
-            modifier = Modifier.fillMaxWidth()
-        )
-        OutlinedTextField(
-            value = sel.valueS,
-            onValueChange = { state.setValueS(sel.id, it) },
-            label = { Text("Value (value_s)") },
-            singleLine = true,
-            modifier = Modifier.fillMaxWidth()
-        )
+        if (sel == null) { Text("یک ویجت انتخاب کنید", color = MaterialTheme.colorScheme.onSurfaceVariant); return@Column }
+        OutlinedTextField(value = sel.label, onValueChange = { state.setLabel(sel.id, it) },
+            label = { Text("Label") }, singleLine = true, modifier = Modifier.fillMaxWidth())
+        OutlinedTextField(value = sel.valueS, onValueChange = { state.setValueS(sel.id, it) },
+            label = { Text("Value") }, singleLine = true, modifier = Modifier.fillMaxWidth())
         Row(horizontalArrangement = Arrangement.spacedBy(8.dp)) {
-            NumField("X", sel.x) { state.moveWidget(sel.id, it, sel.y) }
-            NumField("Y", sel.y) { state.moveWidget(sel.id, sel.x, it) }
+            Num("X", sel.x) { state.moveWidget(sel.id, it, sel.y) }
+            Num("Y", sel.y) { state.moveWidget(sel.id, sel.x, it) }
         }
         Row(horizontalArrangement = Arrangement.spacedBy(8.dp)) {
-            NumField("Size X", sel.sizeX) { state.resizeWidget(sel.id, it, sel.sizeY) }
-            NumField("Size Y", sel.sizeY) { state.resizeWidget(sel.id, sel.sizeX, it) }
+            Num("Size X", sel.sizeX) { state.resizeWidget(sel.id, it, sel.sizeY) }
+            Num("Size Y", sel.sizeY) { state.resizeWidget(sel.id, sel.sizeX, it) }
         }
-        OutlinedTextField(
-            value = sel.type, onValueChange = {}, enabled = false,
-            label = { Text("Type") }, modifier = Modifier.fillMaxWidth()
-        )
+        OutlinedTextField(value = sel.type, onValueChange = {}, enabled = false,
+            label = { Text("Type") }, modifier = Modifier.fillMaxWidth())
         HorizontalDivider()
-        Button(
-            onClick = { state.deleteWidget(sel.id) },
-            colors = ButtonDefaults.buttonColors(
-                containerColor = MaterialTheme.colorScheme.error
-            ),
-            modifier = Modifier.fillMaxWidth()
-        ) { Text("حذف ویجت") }
+        Button(onClick = { state.deleteWidget(sel.id) },
+            colors = ButtonDefaults.buttonColors(containerColor = MaterialTheme.colorScheme.error),
+            modifier = Modifier.fillMaxWidth()) { Text("حذف ویجت") }
     }
 }
-
-@Composable
-private fun RowScope.NumField(label: String, value: Float, onChange: (Float) -> Unit) {
-    OutlinedTextField(
-        value = value.toString(),
-        onValueChange = { it.toFloatOrNull()?.let(onChange) },
-        label = { Text(label) },
-        singleLine = true,
-        modifier = Modifier.weight(1f)
-    )
+@Composable private fun RowScope.Num(lbl: String, v: Float, onChange: (Float) -> Unit) {
+    OutlinedTextField(value = v.toString(), onValueChange = { it.toFloatOrNull()?.let(onChange) },
+        label = { Text(lbl) }, singleLine = true, modifier = Modifier.weight(1f))
 }
