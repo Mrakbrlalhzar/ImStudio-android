@@ -65,7 +65,7 @@ void WidgetModel::initDemo() {
 
     y = 80.0f;
     add(WidgetKind::Text, "ImGui Visual Engine", "About", 420, y);
-    add(WidgetKind::Text, "Full Bundle + Dual Mode", "About", 420, y += 28);
+    add(WidgetKind::Text, "NativeActivity + EGL + ImGui", "About", 420, y += 28);
     add(WidgetKind::Separator, "", "About", 420, y += 30);
     add(WidgetKind::Text, "Click Test Mode to enter test screen", "About", 420, y += 20);
     add(WidgetKind::Text, "Touch points are visualized there", "About", 420, y += 20);
