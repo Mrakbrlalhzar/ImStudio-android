@@ -1,4 +1,4 @@
-name: ImStudio Android — Folder Import
+name: Fix Code Icon Import & Build
 
 on:
   push:
@@ -9,1178 +9,31 @@ permissions:
   contents: write
 
 jobs:
-  sync-generate-build:
+  fix-and-build:
     runs-on: ubuntu-latest
     steps:
-    - name: Checkout target repo
+    - name: Checkout
       uses: actions/checkout@v4
-      with: { fetch-depth: 0, persist-credentials: true }
+      with:
+        fetch-depth: 0
+        persist-credentials: true
 
-    - name: Clone upstream ImStudio
+    - name: Rewrite EditorScreen.kt with correct import
       run: |
-        git clone --depth 1 https://github.com/Raais/ImStudio /tmp/ImStudio
-        echo "UPSTREAM_SHA=$(cd /tmp/ImStudio && git rev-parse --short HEAD)" >> $GITHUB_ENV
-
-    - name: Clean stale build cache
-      run: rm -rf android/app/.cxx android/app/build/intermediates/cxx 2>/dev/null || true
-
-    # ============================================================
-    # 1. nlohmann/json
-    # ============================================================
-    - name: Download nlohmann/json.hpp
-      run: |
-        mkdir -p android/app/src/main/cpp/vendor/json
-        curl -fsSL -o android/app/src/main/cpp/vendor/json/json.hpp \
-            https://github.com/nlohmann/json/releases/download/v3.11.3/json.hpp
-
-    # ============================================================
-    # 2. buffer_accessor.h
-    # ============================================================
-    - name: Write buffer_accessor.h
-      run: |
-        cat > android/app/src/main/cpp/src/engine/buffer_accessor.h <<'EOF'
-        #pragma once
-        #include <string>
-        namespace imstudio::engine {
-            void init(); void shutdown();
-            void clear_all();
-            int  add_widget(const std::string& type);
-            bool delete_widget(int id);
-            int  get_count(); int  get_id_at(int index);
-            std::string get_type(int id); std::string get_label(int id); std::string get_value_s(int id);
-            float get_x(int id); float get_y(int id);
-            float get_size_x(int id); float get_size_y(int id); float get_width(int id);
-            bool set_label(int id, const std::string& v);
-            bool set_value_s(int id, const std::string& v);
-            bool move(int id, float x, float y);
-            bool resize(int id, float sx, float sy);
-            bool set_width(int id, float w);
-            std::string generate_full_code();
-            bool load_from_text(const std::string& text);
-            std::string dump_to_json();
-            bool import_from_cpp(const std::string& code);
-
-            // ★ Multi-file import with detailed diagnostics
-            void import_begin();
-            void import_file(const std::string& path, const std::string& content);
-            std::string import_end();   // returns report JSON
-        }
-        EOF
-
-    # ============================================================
-    # 3. buffer_accessor.cpp — with multi-file import
-    # ============================================================
-    - name: Write buffer_accessor.cpp
-      run: |
-        cat > android/app/src/main/cpp/src/engine/buffer_accessor.cpp <<'EOF'
-        #include "engine/buffer_accessor.h"
-        #include "ims_buffer.h"
-        #include "ims_object.h"
-        #include "imgui.h"
-        #include "json.hpp"
-        #include <android/log.h>
-        #include <mutex>
-        #include <new>
-        #include <stdexcept>
-        #include <sstream>
-        #include <cctype>
-        #include <algorithm>
-        #include <cstring>
-        #include <unordered_map>
-        #include <unordered_set>
-
-        #define LOG_TAG "ImStudioCore"
-        #define LOGI(...) __android_log_print(ANDROID_LOG_INFO,  LOG_TAG, __VA_ARGS__)
-        #define LOGE(...) __android_log_print(ANDROID_LOG_ERROR, LOG_TAG, __VA_ARGS__)
-
-        using nlohmann::json;
-
-        namespace imstudio::engine {
-
-        static ImStudio::BufferWindow* g_BufferPtr = nullptr;
-        static std::mutex g_Mutex;
-
-        static bool ensure_locked() {
-            if (ImGui::GetCurrentContext() == nullptr) {
-                IMGUI_CHECKVERSION();
-                ImGui::CreateContext();
-                if (!ImGui::GetCurrentContext()) return false;
-            }
-            if (g_BufferPtr == nullptr) {
-                g_BufferPtr = new (std::nothrow) ImStudio::BufferWindow();
-                if (!g_BufferPtr) return false;
-            }
-            return true;
-        }
-        static ImStudio::BufferWindow& buf() {
-            std::lock_guard<std::mutex> lock(g_Mutex);
-            if (!ensure_locked()) throw std::runtime_error("engine not initialized");
-            return *g_BufferPtr;
-        }
-        ImStudio::BufferWindow& get_buffer() { return buf(); }
-
-        void init() {
-            auto& b = buf();
-            b.objects.clear(); b.idgen = 0; b.selected_obj_id = -1;
-            b.staticlayout = false; b.objects.reserve(2048);
-        }
-        void shutdown() {
-            std::lock_guard<std::mutex> lock(g_Mutex);
-            if (g_BufferPtr) { delete g_BufferPtr; g_BufferPtr = nullptr; }
-            if (ImGui::GetCurrentContext()) ImGui::DestroyContext();
-        }
-        void clear_all() {
-            auto& b = buf();
-            b.objects.clear(); b.idgen = 0; b.selected_obj_id = -1;
-        }
-        static ImStudio::Object* get_obj(int id) { return buf().getobj(id); }
-
-        int add_widget(const std::string& type) {
-            auto& b = buf(); b.create(type, false);
-            return b.objects.empty() ? -1 : b.objects.back().id;
-        }
-        bool delete_widget(int id) { if (auto* o = get_obj(id)) { o->del(); return true; } return false; }
-        int get_count() { return (int)buf().objects.size(); }
-        int get_id_at(int i) { auto& b = buf(); if (i<0||i>=(int)b.objects.size()) return -1; return b.objects[i].id; }
-        std::string get_type(int id)    { auto* o=get_obj(id); return o?o->type:""; }
-        std::string get_label(int id)   { auto* o=get_obj(id); return o?o->label:""; }
-        std::string get_value_s(int id) { auto* o=get_obj(id); return o?o->value_s:""; }
-        float get_x(int id)      { auto* o=get_obj(id); return o?o->pos.x:0.f; }
-        float get_y(int id)      { auto* o=get_obj(id); return o?o->pos.y:0.f; }
-        float get_size_x(int id) { auto* o=get_obj(id); return o?o->size.x:0.f; }
-        float get_size_y(int id) { auto* o=get_obj(id); return o?o->size.y:0.f; }
-        float get_width(int id)  { auto* o=get_obj(id); return o?o->width:0.f; }
-        bool set_label(int id, const std::string& v)   { auto* o=get_obj(id); if(!o)return false; o->label=v; return true; }
-        bool set_value_s(int id, const std::string& v) { auto* o=get_obj(id); if(!o)return false; o->value_s=v; return true; }
-        bool move(int id, float x, float y)            { auto* o=get_obj(id); if(!o)return false; o->pos.x=x; o->pos.y=y; return true; }
-        bool resize(int id, float sx, float sy)        { auto* o=get_obj(id); if(!o)return false; o->size.x=sx; o->size.y=sy; return true; }
-        bool set_width(int id, float w)                { auto* o=get_obj(id); if(!o)return false; o->width=w; return true; }
-
-        // ---------- JSON dump/load ----------
-        static json make_obj_json(const ImStudio::Object& o) {
-            return json{{"id",o.id},{"type",o.type},{"label",o.label},{"value_s",o.value_s},
-                {"value_b",o.value_b},{"x",o.pos.x},{"y",o.pos.y},{"sizeX",o.size.x},
-                {"sizeY",o.size.y},{"width",o.width},{"item_current",o.item_current}};
-        }
-        static void apply_json_to_obj(const json& j, ImStudio::Object& o) {
-            if (j.contains("label") && j["label"].is_string()) o.label = j["label"].get<std::string>();
-            if (j.contains("value_s") && j["value_s"].is_string()) o.value_s = j["value_s"].get<std::string>();
-            if (j.contains("value_b") && j["value_b"].is_boolean()) o.value_b = j["value_b"].get<bool>();
-            if (j.contains("pos") && j["pos"].is_object()) {
-                o.pos.x = j["pos"].value("x", 0.f); o.pos.y = j["pos"].value("y", 0.f);
-            } else {
-                if (j.contains("x") && j["x"].is_number()) o.pos.x = j["x"].get<float>();
-                if (j.contains("y") && j["y"].is_number()) o.pos.y = j["y"].get<float>();
-            }
-            if (j.contains("size") && j["size"].is_object()) {
-                o.size.x = j["size"].value("x", 0.f); o.size.y = j["size"].value("y", 0.f);
-            } else {
-                if (j.contains("sizeX") && j["sizeX"].is_number()) o.size.x = j["sizeX"].get<float>();
-                if (j.contains("sizeY") && j["sizeY"].is_number()) o.size.y = j["sizeY"].get<float>();
-            }
-            if (j.contains("width") && j["width"].is_number()) o.width = j["width"].get<float>();
-            if (j.contains("item_current") && j["item_current"].is_number()) o.item_current = j["item_current"].get<int>();
-        }
-        bool load_from_text(const std::string& text) {
-            json j;
-            try { j = json::parse(text); } catch (...) { return false; }
-            json arr;
-            if (j.is_array()) arr = j;
-            else if (j.is_object()) {
-                if (j.contains("objects") && j["objects"].is_array()) arr = j["objects"];
-                else if (j.contains("widgets") && j["widgets"].is_array()) arr = j["widgets"];
-                else if (j.contains("items") && j["items"].is_array()) arr = j["items"];
-                else return false;
-            } else return false;
-            try {
-                clear_all(); auto& b = buf(); int maxId = 0, count = 0;
-                for (const auto& item : arr) {
-                    if (!item.is_object()) continue;
-                    std::string type = item.value("type", "button");
-                    b.create(type, false);
-                    if (b.objects.empty()) continue;
-                    auto& o = b.objects.back();
-                    if (item.contains("id") && item["id"].is_number()) maxId = std::max(maxId, item["id"].get<int>());
-                    apply_json_to_obj(item, o); ++count;
-                }
-                if (maxId >= b.idgen) b.idgen = maxId + 1;
-                return count > 0;
-            } catch (...) { return false; }
-        }
-        std::string dump_to_json() {
-            try {
-                auto& b = buf(); json arr = json::array();
-                for (auto& o : b.objects) arr.push_back(make_obj_json(o));
-                return json{{"version",1},{"objects",arr}}.dump(2);
-            } catch (...) { return "{\"version\":1,\"objects\":[]}"; }
-        }
-
-        // ============================================================
-        // Shared C++ parsing helpers
-        // ============================================================
-        static std::string trim(const std::string& s) {
-            size_t a = s.find_first_not_of(" \t\r\n");
-            if (a == std::string::npos) return "";
-            size_t b = s.find_last_not_of(" \t\r\n");
-            return s.substr(a, b - a + 1);
-        }
-        static std::string first_string_literal(const std::string& line) {
-            auto q1 = line.find('"');
-            if (q1 == std::string::npos) return "";
-            auto q2 = line.find('"', q1 + 1);
-            if (q2 == std::string::npos) return "";
-            return line.substr(q1 + 1, q2 - q1 - 1);
-        }
-
-        struct ParsedWidget { std::string type; std::string label; float x = -1, y = -1; };
-
-        struct Pat { const char* needle; const char* type; };
-        static const std::vector<Pat>& widget_patterns() {
-            static const std::vector<Pat> pats = {
-                {"Button","button"}, {"SmallButton","button"}, {"InvisibleButton","button"},
-                {"Checkbox","checkbox"}, {"RadioButton","radio"},
-                {"SliderFloat","sliderfloat"}, {"SliderInt","sliderint"},
-                {"DragFloat","dragfloat"}, {"DragInt","dragint"},
-                {"InputText","textinput"}, {"InputTextWithHint","textinput"},
-                {"InputInt","inputint"}, {"InputFloat","inputfloat"},
-                {"Combo","combo"}, {"ListBox","listbox"},
-                {"Text","text"}, {"TextUnformatted","text"}, {"TextWrapped","text"},
-                {"TextDisabled","text"}, {"LabelText","text"},
-                {"ProgressBar","progressbar"},
-                {"Separator","separator"}, {"Spacing","spacing"},
-                {"MenuItem","menuitem"}, {"TreeNode","treenode"},
-                {"CollapsingHeader","treenode"},
-                {"TabItemButton","button"}, {"TabItem","tab"}, {"BeginTabItem","tab"},
-            };
-            return pats;
-        }
-
-        static bool parse_line_for_widget(const std::string& line, ParsedWidget& out,
-                                          float& lastSetX, float& lastSetY) {
-            std::string trimmed = trim(line);
-            if (trimmed.empty() || trimmed.rfind("//",0)==0) return false;
-
-            if (trimmed.find("SetCursorPos") != std::string::npos) {
-                auto vpos = trimmed.find("ImVec2");
-                if (vpos != std::string::npos) {
-                    auto p1 = trimmed.find_first_of("-0123456789", vpos);
-                    if (p1 != std::string::npos) {
-                        char* end = nullptr;
-                        float x = std::strtof(trimmed.c_str()+p1, &end);
-                        if (end != trimmed.c_str()+p1) {
-                            auto comma = trimmed.find(',', p1);
-                            if (comma != std::string::npos) {
-                                auto p2 = trimmed.find_first_of("-0123456789", comma);
-                                if (p2 != std::string::npos) {
-                                    float y = std::strtof(trimmed.c_str()+p2, &end);
-                                    lastSetX = x; lastSetY = y;
-                                }
-                            }
-                        }
-                    }
-                }
-                return false;
-            }
-
-            for (auto& p : widget_patterns()) {
-                std::string needle = std::string("ImGui::") + p.needle;
-                auto pos = trimmed.find(needle);
-                if (pos == std::string::npos) continue;
-                size_t after = pos + needle.size();
-                while (after < trimmed.size() && std::isspace((unsigned char)trimmed[after])) ++after;
-                if (after >= trimmed.size() || trimmed[after] != '(') continue;
-
-                out.type = p.type;
-                out.label = first_string_literal(trimmed);
-                out.x = lastSetX;
-                out.y = lastSetY;
-                lastSetX = -1; lastSetY = -1;
-                return true;
-            }
-            return false;
-        }
-
-        static bool is_label_field_type(const std::string& t) {
-            return t=="button"||t=="checkbox"||t=="radio"||t=="text"||
-                   t=="combo"||t=="listbox"||t=="menuitem"||t=="treenode"||t=="tab";
-        }
-
-        // ============================================================
-        // Single-file import (legacy)
-        // ============================================================
-        bool import_from_cpp(const std::string& code) {
-            LOGI("[import_cpp] size=%zu", code.size());
-            std::vector<std::string> lines; std::string cur;
-            for (char c : code) {
-                if (c == '\n') { lines.push_back(cur); cur.clear(); }
-                else if (c != '\r') cur.push_back(c);
-            }
-            if (!cur.empty()) lines.push_back(cur);
-
-            try {
-                clear_all();
-                auto& b = buf();
-                int count = 0;
-                float cursorX = 20.f, cursorY = 20.f;
-                float lastSetX = -1, lastSetY = -1;
-
-                for (auto& raw : lines) {
-                    ParsedWidget pw;
-                    if (!parse_line_for_widget(raw, pw, lastSetX, lastSetY)) continue;
-                    b.create(pw.type, false);
-                    if (b.objects.empty()) continue;
-                    auto& o = b.objects.back();
-                    if (!pw.label.empty()) {
-                        if (is_label_field_type(pw.type)) o.value_s = pw.label;
-                        else o.label = pw.label;
-                    }
-                    if (pw.x >= 0) { o.pos.x = pw.x; o.pos.y = pw.y; }
-                    else { o.pos.x = cursorX; o.pos.y = cursorY; cursorY += 44.f; }
-                    ++count;
-                }
-                return count > 0;
-            } catch (const std::exception& e) {
-                LOGE("[import_cpp] failed: %s", e.what());
-                return false;
-            }
-        }
-
-        // ============================================================
-        // ★ Multi-file import session state
-        // ============================================================
-        struct FileReport {
-            std::string path;
-            size_t size = 0;
-            int lines_scanned = 0;
-            int widgets_found = 0;
-            int lines_non_imgui = 0;
-            std::vector<std::string> recognized_widgets;   // unique type names
-            std::vector<std::pair<int,std::string>> warnings;   // (line, message)
-            std::vector<std::pair<int,std::string>> unrecognized_imgui;  // (line, fn name)
-            std::string status;  // "ok", "no_widgets", "no_imgui", "parse_error"
-        };
-
-        struct ImportSessionState {
-            bool active = false;
-            int total_widgets = 0;
-            std::vector<FileReport> file_reports;
-            std::unordered_map<std::string, std::string> label_locations;  // "type:label" -> "path:line"
-            std::vector<std::string> global_warnings;
-        };
-
-        static ImportSessionState g_ImportSession;
-
-        void import_begin() {
-            LOGI("[import_begin]");
-            g_ImportSession = ImportSessionState();
-            g_ImportSession.active = true;
-            clear_all();
-        }
-
-        void import_file(const std::string& path, const std::string& content) {
-            LOGI("[import_file] %s (%zu bytes)", path.c_str(), content.size());
-            FileReport rep;
-            rep.path = path;
-            rep.size = content.size();
-
-            // Split lines
-            std::vector<std::string> lines; std::string cur;
-            for (char c : content) {
-                if (c == '\n') { lines.push_back(cur); cur.clear(); }
-                else if (c != '\r') cur.push_back(c);
-            }
-            if (!cur.empty()) lines.push_back(cur);
-            rep.lines_scanned = (int)lines.size();
-
-            try {
-                auto& b = buf();
-                float cursorX = 20.f, cursorY = 20.f;
-                float lastSetX = -1, lastSetY = -1;
-                std::unordered_set<std::string> recognized_set;
-
-                for (size_t i = 0; i < lines.size(); ++i) {
-                    const std::string& raw = lines[i];
-                    std::string trimmed = trim(raw);
-                    if (trimmed.empty() || trimmed.rfind("//",0)==0) continue;
-
-                    ParsedWidget pw;
-                    if (parse_line_for_widget(raw, pw, lastSetX, lastSetY)) {
-                        b.create(pw.type, false);
-                        if (b.objects.empty()) {
-                            rep.warnings.emplace_back((int)i+1, "create() failed");
-                            continue;
-                        }
-                        auto& o = b.objects.back();
-                        if (!pw.label.empty()) {
-                            if (is_label_field_type(pw.type)) o.value_s = pw.label;
-                            else o.label = pw.label;
-
-                            // Duplicate detection
-                            std::string key = pw.type + ":" + pw.label;
-                            auto it = g_ImportSession.label_locations.find(key);
-                            if (it != g_ImportSession.label_locations.end()) {
-                                std::string loc = path + ":" + std::to_string(i+1);
-                                g_ImportSession.global_warnings.push_back(
-                                    "Duplicate '" + pw.label + "' (" + pw.type +
-                                    ") in " + loc + " — also at " + it->second);
-                            } else {
-                                g_ImportSession.label_locations[key] = path + ":" + std::to_string(i+1);
-                            }
-                        }
-                        if (pw.x >= 0) { o.pos.x = pw.x; o.pos.y = pw.y; }
-                        else { o.pos.x = cursorX; o.pos.y = cursorY; cursorY += 44.f; }
-
-                        rep.widgets_found++;
-                        recognized_set.insert(pw.type);
-                        continue;
-                    }
-
-                    // Detect any ImGui:: call that isn't a widget
-                    auto igu = trimmed.find("ImGui::");
-                    if (igu != std::string::npos) {
-                        size_t s = igu + 7;
-                        size_t e = s;
-                        while (e < trimmed.size() &&
-                               (std::isalnum((unsigned char)trimmed[e]) || trimmed[e] == '_')) ++e;
-                        std::string fn = trimmed.substr(s, e - s);
-                        if (!fn.empty()) rep.unrecognized_imgui.emplace_back((int)i+1, fn);
-                    } else {
-                        rep.lines_non_imgui++;
-                    }
-                }
-
-                for (auto& t : recognized_set) rep.recognized_widgets.push_back(t);
-
-                if (rep.widgets_found == 0) {
-                    rep.status = rep.unrecognized_imgui.empty() ? "no_imgui" : "no_widgets";
-                } else {
-                    rep.status = "ok";
-                }
-
-                g_ImportSession.total_widgets += rep.widgets_found;
-                g_ImportSession.file_reports.push_back(std::move(rep));
-            } catch (const std::exception& e) {
-                LOGE("[import_file] exception: %s", e.what());
-                rep.status = "parse_error";
-                rep.warnings.emplace_back(0, std::string("exception: ") + e.what());
-                g_ImportSession.file_reports.push_back(std::move(rep));
-            }
-        }
-
-        std::string import_end() {
-            LOGI("[import_end] files=%zu widgets=%d",
-                 g_ImportSession.file_reports.size(), g_ImportSession.total_widgets);
-            json files = json::array();
-            int with_widgets = 0, without_imgui = 0, total_warns = 0;
-
-            for (auto& r : g_ImportSession.file_reports) {
-                if (r.widgets_found > 0) with_widgets++;
-                if (r.widgets_found == 0 && r.unrecognized_imgui.empty()) without_imgui++;
-                total_warns += (int)r.warnings.size();
-
-                json f = {
-                    {"path", r.path},
-                    {"size_bytes", (long long)r.size},
-                    {"lines_scanned", r.lines_scanned},
-                    {"widgets_found", r.widgets_found},
-                    {"lines_non_imgui", r.lines_non_imgui},
-                    {"status", r.status},
-                    {"recognized_widgets", r.recognized_widgets}
-                };
-
-                json warns = json::array();
-                for (auto& w : r.warnings) {
-                    warns.push_back({{"line", w.first}, {"message", w.second}});
-                }
-                f["warnings"] = warns;
-
-                json uis = json::array();
-                for (auto& u : r.unrecognized_imgui) {
-                    uis.push_back({{"line", u.first}, {"text", "ImGui::" + u.second + "(...)"}});
-                }
-                f["unrecognized_imgui"] = uis;
-
-                files.push_back(f);
-            }
-
-            json root = {
-                {"session", {
-                    {"total_files", (int)g_ImportSession.file_reports.size()},
-                    {"files_with_widgets", with_widgets},
-                    {"files_without_imgui", without_imgui},
-                    {"total_widgets", g_ImportSession.total_widgets},
-                    {"total_warnings", total_warns},
-                    {"total_global_warnings", (int)g_ImportSession.global_warnings.size()}
-                }},
-                {"files", files},
-                {"global_warnings", g_ImportSession.global_warnings}
-            };
-
-            g_ImportSession.active = false;
-            return root.dump(2);
-        }
-
-        } // namespace imstudio::engine
-        EOF
-
-    # ============================================================
-    # 4. jni_bridge.cpp
-    # ============================================================
-    - name: Write jni_bridge.cpp
-      run: |
-        cat > android/app/src/main/cpp/src/jni_bridge.cpp <<'EOF'
-        #include <jni.h>
-        #include "jni_bridge.h"
-        #include "engine/buffer_accessor.h"
-        #include "engine/code_generator.h"
-        #include "util/jstring_util.h"
-        #include <android/log.h>
-        #include <exception>
-        #include <stdexcept>
-        #define LOG_TAG "ImStudioJNI"
-        #define LOGI(...) __android_log_print(ANDROID_LOG_INFO,  LOG_TAG, __VA_ARGS__)
-        #define LOGE(...) __android_log_print(ANDROID_LOG_ERROR, LOG_TAG, __VA_ARGS__)
-        using namespace imstudio::engine;
-        using imstudio::util::from_jstring;
-        using imstudio::util::to_jstring;
-
-        static void throw_runtime(JNIEnv* env, const char* msg) {
-            if (env->ExceptionCheck()) return;
-            jclass c = env->FindClass("java/lang/RuntimeException");
-            if (c) env->ThrowNew(c, msg);
-        }
-        #define TRY try {
-        #define CATCH(env) } catch (const std::exception& e) { \
-            LOGE("C++ ex: %s", e.what()); throw_runtime((env), e.what()); \
-        } catch (...) { throw_runtime((env), "Unknown C++ exception"); }
-
-        extern "C" {
-        JNIEXPORT jint JNI_OnLoad(JavaVM*, void*) {
-            try { imstudio::engine::init(); } catch (...) {}
-            return JNI_VERSION_1_6;
-        }
-        JNIEXPORT void JNI_OnUnload(JavaVM*, void*) {
-            try { imstudio::engine::shutdown(); } catch (...) {}
-        }
-        JNIEXPORT void JNICALL Java_com_raais_imstudio_NativeBridge_initBuffer(JNIEnv* env, jobject) {
-            TRY imstudio::engine::init(); CATCH(env)
-        }
-        JNIEXPORT void JNICALL Java_com_raais_imstudio_NativeBridge_shutdown(JNIEnv* env, jobject) {
-            TRY imstudio::engine::shutdown(); CATCH(env)
-        }
-        JNIEXPORT void JNICALL Java_com_raais_imstudio_NativeBridge_clearAll(JNIEnv* env, jobject) {
-            TRY clear_all(); CATCH(env)
-        }
-        JNIEXPORT jboolean JNICALL Java_com_raais_imstudio_NativeBridge_loadFromText(JNIEnv* env, jobject, jstring text) {
-            TRY return load_from_text(from_jstring(env, text)) ? JNI_TRUE : JNI_FALSE; CATCH(env) return JNI_FALSE;
-        }
-        JNIEXPORT jboolean JNICALL Java_com_raais_imstudio_NativeBridge_importFromCpp(JNIEnv* env, jobject, jstring code) {
-            TRY return import_from_cpp(from_jstring(env, code)) ? JNI_TRUE : JNI_FALSE; CATCH(env) return JNI_FALSE;
-        }
-        // ★ NEW: multi-file import
-        JNIEXPORT void JNICALL Java_com_raais_imstudio_NativeBridge_importBegin(JNIEnv* env, jobject) {
-            TRY imstudio::engine::import_begin(); CATCH(env)
-        }
-        JNIEXPORT void JNICALL Java_com_raais_imstudio_NativeBridge_importFile(JNIEnv* env, jobject, jstring path, jstring content) {
-            TRY {
-                std::string p = from_jstring(env, path);
-                std::string c = from_jstring(env, content);
-                imstudio::engine::import_file(p, c);
-            } CATCH(env)
-        }
-        JNIEXPORT jstring JNICALL Java_com_raais_imstudio_NativeBridge_importEnd(JNIEnv* env, jobject) {
-            TRY return to_jstring(env, imstudio::engine::import_end());
-            CATCH(env) return env->NewStringUTF("{}");
-        }
-        JNIEXPORT jstring JNICALL Java_com_raais_imstudio_NativeBridge_dumpToJson(JNIEnv* env, jobject) {
-            TRY return to_jstring(env, dump_to_json()); CATCH(env) return env->NewStringUTF("{\"version\":1,\"objects\":[]}");
-        }
-        JNIEXPORT jint JNICALL Java_com_raais_imstudio_NativeBridge_createWidget(JNIEnv* env, jobject, jstring t) {
-            TRY return add_widget(from_jstring(env, t)); CATCH(env) return -1;
-        }
-        JNIEXPORT jboolean JNICALL Java_com_raais_imstudio_NativeBridge_deleteWidget(JNIEnv* env, jobject, jint id) {
-            TRY return delete_widget(id) ? JNI_TRUE : JNI_FALSE; CATCH(env) return JNI_FALSE;
-        }
-        JNIEXPORT jint JNICALL Java_com_raais_imstudio_NativeBridge_getWidgetCount(JNIEnv* env, jobject) {
-            TRY return get_count(); CATCH(env) return 0;
-        }
-        JNIEXPORT jint JNICALL Java_com_raais_imstudio_NativeBridge_getWidgetId(JNIEnv* env, jobject, jint i) {
-            TRY return get_id_at(i); CATCH(env) return -1;
-        }
-        JNIEXPORT jstring JNICALL Java_com_raais_imstudio_NativeBridge_getWidgetType(JNIEnv* env, jobject, jint id) {
-            TRY return to_jstring(env, get_type(id)); CATCH(env) return env->NewStringUTF("");
-        }
-        JNIEXPORT jstring JNICALL Java_com_raais_imstudio_NativeBridge_getWidgetLabel(JNIEnv* env, jobject, jint id) {
-            TRY return to_jstring(env, get_label(id)); CATCH(env) return env->NewStringUTF("");
-        }
-        JNIEXPORT jstring JNICALL Java_com_raais_imstudio_NativeBridge_getWidgetValueS(JNIEnv* env, jobject, jint id) {
-            TRY return to_jstring(env, get_value_s(id)); CATCH(env) return env->NewStringUTF("");
-        }
-        JNIEXPORT jfloat JNICALL Java_com_raais_imstudio_NativeBridge_getWidgetX(JNIEnv* env, jobject, jint id) {
-            TRY return get_x(id); CATCH(env) return 0.f;
-        }
-        JNIEXPORT jfloat JNICALL Java_com_raais_imstudio_NativeBridge_getWidgetY(JNIEnv* env, jobject, jint id) {
-            TRY return get_y(id); CATCH(env) return 0.f;
-        }
-        JNIEXPORT jfloat JNICALL Java_com_raais_imstudio_NativeBridge_getWidgetSizeX(JNIEnv* env, jobject, jint id) {
-            TRY return get_size_x(id); CATCH(env) return 0.f;
-        }
-        JNIEXPORT jfloat JNICALL Java_com_raais_imstudio_NativeBridge_getWidgetSizeY(JNIEnv* env, jobject, jint id) {
-            TRY return get_size_y(id); CATCH(env) return 0.f;
-        }
-        JNIEXPORT jfloat JNICALL Java_com_raais_imstudio_NativeBridge_getWidgetWidth(JNIEnv* env, jobject, jint id) {
-            TRY return get_width(id); CATCH(env) return 0.f;
-        }
-        JNIEXPORT jboolean JNICALL Java_com_raais_imstudio_NativeBridge_setWidgetLabel(JNIEnv* env, jobject, jint id, jstring v) {
-            TRY return set_label(id, from_jstring(env, v)) ? JNI_TRUE : JNI_FALSE; CATCH(env) return JNI_FALSE;
-        }
-        JNIEXPORT jboolean JNICALL Java_com_raais_imstudio_NativeBridge_setWidgetValueS(JNIEnv* env, jobject, jint id, jstring v) {
-            TRY return set_value_s(id, from_jstring(env, v)) ? JNI_TRUE : JNI_FALSE; CATCH(env) return JNI_FALSE;
-        }
-        JNIEXPORT jboolean JNICALL Java_com_raais_imstudio_NativeBridge_moveWidget(JNIEnv* env, jobject, jint id, jfloat x, jfloat y) {
-            TRY return move(id, x, y) ? JNI_TRUE : JNI_FALSE; CATCH(env) return JNI_FALSE;
-        }
-        JNIEXPORT jboolean JNICALL Java_com_raais_imstudio_NativeBridge_resizeWidget(JNIEnv* env, jobject, jint id, jfloat sx, jfloat sy) {
-            TRY return resize(id, sx, sy) ? JNI_TRUE : JNI_FALSE; CATCH(env) return JNI_FALSE;
-        }
-        JNIEXPORT jboolean JNICALL Java_com_raais_imstudio_NativeBridge_setWidgetWidth(JNIEnv* env, jobject, jint id, jfloat w) {
-            TRY return set_width(id, w) ? JNI_TRUE : JNI_FALSE; CATCH(env) return JNI_FALSE;
-        }
-        JNIEXPORT jstring JNICALL Java_com_raais_imstudio_NativeBridge_generateCode(JNIEnv* env, jobject) {
-            TRY return to_jstring(env, generate_full_code()); CATCH(env) return env->NewStringUTF("// error");
-        }
-        }
-        EOF
-
-    # ============================================================
-    # 5. CMakeLists.txt
-    # ============================================================
-    - name: Write CMakeLists.txt
-      run: |
-        cat > android/app/src/main/cpp/CMakeLists.txt <<'CMAKE'
-        cmake_minimum_required(VERSION 3.22)
-        project(imstudio_core)
-        set(CMAKE_CXX_STANDARD 17)
-
-        set(IMASSERT_HDR "${CMAKE_CURRENT_BINARY_DIR}/imassert_override.h")
-        file(WRITE "${IMASSERT_HDR}"
-            "#pragma once\n#undef IM_ASSERT\n#define IM_ASSERT(_EXPR) ((void)0)\n")
-
-        add_library(imgui STATIC
-            vendor/imgui/imgui.cpp
-            vendor/imgui/imgui_draw.cpp
-            vendor/imgui/imgui_tables.cpp
-            vendor/imgui/imgui_widgets.cpp
-            vendor/imgui/imgui_demo.cpp
-            vendor/imgui/misc/cpp/imgui_stdlib.cpp
-        )
-        target_include_directories(imgui PUBLIC vendor/imgui vendor/imgui/misc/cpp)
-        target_compile_options(imgui PUBLIC "-include" "${IMASSERT_HDR}")
-
-        add_library(fmt INTERFACE)
-        target_include_directories(fmt INTERFACE vendor/fmt/include)
-        target_compile_definitions(fmt INTERFACE FMT_HEADER_ONLY=1)
-
-        set(IMS_SOURCES
-            vendor/imstudio/ims_generator.cpp
-            vendor/imstudio/ims_buffer.cpp
-            vendor/imstudio/ims_object.cpp
-        )
-        if(EXISTS ${CMAKE_CURRENT_SOURCE_DIR}/vendor/imstudio/ims_object_draw.cpp)
-            list(APPEND IMS_SOURCES vendor/imstudio/ims_object_draw.cpp)
-        endif()
-        if(EXISTS ${CMAKE_CURRENT_SOURCE_DIR}/vendor/imstudio/ims_utils.cpp)
-            list(APPEND IMS_SOURCES vendor/imstudio/ims_utils.cpp)
-        endif()
-
-        add_library(imstudio_core SHARED
-            src/jni_bridge.cpp
-            src/engine/buffer_accessor.cpp
-            src/engine/code_generator.cpp
-            src/engine/crash_handler.cpp
-            ${IMS_SOURCES}
-        )
-        target_compile_definitions(imstudio_core PRIVATE FMT_HEADER_ONLY=1)
-        target_compile_options(imstudio_core PRIVATE "-include" "${IMASSERT_HDR}")
-        target_include_directories(imstudio_core PRIVATE
-            include src
-            vendor/imstudio vendor/imgui vendor/imgui/misc/cpp
-            vendor/json)
-
-        find_library(log-lib log)
-        target_link_libraries(imstudio_core imgui fmt ${log-lib} dl)
-        CMAKE
-
-    # ============================================================
-    # 6. Gradle files
-    # ============================================================
-    - name: Write Gradle files
-      run: |
-        cat > android/settings.gradle.kts <<'EOF'
-        pluginManagement { repositories { google(); mavenCentral(); gradlePluginPortal() } }
-        dependencyResolutionManagement {
-            repositoriesMode.set(RepositoriesMode.FAIL_ON_PROJECT_REPOS)
-            repositories { google(); mavenCentral() }
-        }
-        rootProject.name = "ImStudioAndroid"
-        include(":app")
-        EOF
-        cat > android/build.gradle.kts <<'EOF'
-        plugins {
-            id("com.android.application") version "8.2.0" apply false
-            id("org.jetbrains.kotlin.android") version "1.9.22" apply false
-            id("org.jetbrains.kotlin.plugin.serialization") version "1.9.22" apply false
-        }
-        EOF
-        cat > android/gradle.properties <<'EOF'
-        android.useAndroidX=true
-        android.nonTransitiveRClass=true
-        org.gradle.jvmargs=-Xmx4g -Dfile.encoding=UTF-8
-        EOF
-        cat > android/app/build.gradle.kts <<'EOF'
-        plugins {
-            id("com.android.application")
-            id("org.jetbrains.kotlin.android")
-            id("org.jetbrains.kotlin.plugin.serialization")
-        }
-        android {
-            namespace = "com.raais.imstudio"
-            compileSdk = 34
-            ndkVersion = "26.1.10909125"
-            defaultConfig {
-                applicationId = "com.raais.imstudio"
-                minSdk = 24; targetSdk = 34; versionCode = 1; versionName = "1.0"
-                externalNativeBuild { cmake {
-                    cppFlags += "-std=c++17 -fexceptions"
-                    arguments += "-DANDROID_STL=c++_shared"
-                }}
-                ndk { abiFilters += listOf("arm64-v8a", "armeabi-v7a") }
-            }
-            externalNativeBuild { cmake { path = file("src/main/cpp/CMakeLists.txt") } }
-            buildFeatures { compose = true }
-            composeOptions { kotlinCompilerExtensionVersion = "1.5.8" }
-            kotlinOptions { jvmTarget = "1.8" }
-            compileOptions {
-                sourceCompatibility = JavaVersion.VERSION_1_8
-                targetCompatibility = JavaVersion.VERSION_1_8
-            }
-        }
-        dependencies {
-            implementation(platform("androidx.compose:compose-bom:2024.02.00"))
-            implementation("androidx.compose.ui:ui")
-            implementation("androidx.compose.ui:ui-graphics")
-            implementation("androidx.compose.ui:ui-tooling-preview")
-            implementation("androidx.compose.material3:material3")
-            implementation("androidx.compose.material:material-icons-extended")
-            implementation("androidx.activity:activity-compose:1.8.2")
-            implementation("androidx.lifecycle:lifecycle-viewmodel-compose:2.7.0")
-            implementation("androidx.lifecycle:lifecycle-runtime-compose:2.7.0")
-            implementation("androidx.documentfile:documentfile:1.0.1")
-            implementation("org.jetbrains.kotlinx:kotlinx-serialization-json:1.6.2")
-        }
-        EOF
-        cat > android/app/src/main/AndroidManifest.xml <<'EOF'
-        <?xml version="1.0" encoding="utf-8"?>
-        <manifest xmlns:android="http://schemas.android.com/apk/res/android">
-            <application android:label="@string/app_name" android:theme="@style/Theme.ImStudio">
-                <activity android:name=".ui.MainActivity" android:exported="true"
-                    android:configChanges="orientation|keyboardHidden|screenSize">
-                    <intent-filter>
-                        <action android:name="android.intent.action.MAIN" />
-                        <category android:name="android.intent.category.LAUNCHER" />
-                    </intent-filter>
-                </activity>
-            </application>
-        </manifest>
-        EOF
-        cat > android/app/src/main/res/values/strings.xml <<'EOF'
-        <resources><string name="app_name">ImStudio</string></resources>
-        EOF
-        cat > android/app/src/main/res/values/themes.xml <<'EOF'
-        <resources>
-            <style name="Theme.ImStudio" parent="android:Theme.Material.NoActionBar" />
-        </resources>
-        EOF
-
-    # ============================================================
-    # 7. Kotlin: NativeBridge + ImportReport models + state
-    # ============================================================
-    - name: Write Kotlin core
-      run: |
-        mkdir -p android/app/src/main/java/com/raais/imstudio/{model,engine,util,ui/{theme,components,dialogs,screens}}
-
-        cat > android/app/src/main/java/com/raais/imstudio/NativeBridge.kt <<'EOF'
-        package com.raais.imstudio
-        import android.util.Log
-        object NativeBridge {
-            private const val TAG = "ImStudioNativeBridge"
-            @Volatile var loadError: String? = null; private set
-            @Volatile var isLoaded: Boolean = false; private set
-            init {
-                try { System.loadLibrary("imstudio_core"); isLoaded = true; Log.i(TAG, "lib loaded") }
-                catch (t: Throwable) { loadError = "${t.javaClass.simpleName}: ${t.message}"; Log.e(TAG, "load failed", t) }
-            }
-            external fun initCrashHandler(dir: String)
-            external fun initBuffer()
-            external fun shutdown()
-            external fun clearAll()
-            external fun loadFromText(text: String): Boolean
-            external fun importFromCpp(code: String): Boolean
-            // ★ NEW: multi-file import
-            external fun importBegin()
-            external fun importFile(path: String, content: String)
-            external fun importEnd(): String
-            external fun dumpToJson(): String
-            external fun createWidget(type: String): Int
-            external fun deleteWidget(id: Int): Boolean
-            external fun getWidgetCount(): Int
-            external fun getWidgetId(index: Int): Int
-            external fun getWidgetType(id: Int): String
-            external fun getWidgetLabel(id: Int): String
-            external fun getWidgetValueS(id: Int): String
-            external fun getWidgetX(id: Int): Float
-            external fun getWidgetY(id: Int): Float
-            external fun getWidgetSizeX(id: Int): Float
-            external fun getWidgetSizeY(id: Int): Float
-            external fun getWidgetWidth(id: Int): Float
-            external fun setWidgetLabel(id: Int, value: String): Boolean
-            external fun setWidgetValueS(id: Int, value: String): Boolean
-            external fun moveWidget(id: Int, x: Float, y: Float): Boolean
-            external fun resizeWidget(id: Int, sx: Float, sy: Float): Boolean
-            external fun setWidgetWidth(id: Int, w: Float): Boolean
-            external fun generateCode(): String
-        }
-        EOF
-
-        cat > android/app/src/main/java/com/raais/imstudio/model/Widget.kt <<'EOF'
-        package com.raais.imstudio.model
-        import androidx.compose.runtime.Immutable
-        @Immutable
-        data class Widget(
-            val id: Int, val type: String, val label: String, val valueS: String,
-            val x: Float, val y: Float, val sizeX: Float, val sizeY: Float, val width: Float
-        ) { val displayText: String get() = valueS.ifBlank { label.ifBlank { type } } }
-        EOF
-        cat > android/app/src/main/java/com/raais/imstudio/model/WidgetCategory.kt <<'EOF'
-        package com.raais.imstudio.model
-        enum class WidgetCategory(val displayName: String) {
-            Primitives("ابزارهای پایه"), DataInputs("ورودی داده"), Layout("چیدمان")
-        }
-        EOF
-        cat > android/app/src/main/java/com/raais/imstudio/model/WidgetType.kt <<'EOF'
-        package com.raais.imstudio.model
-        enum class WidgetType(val displayName: String, val nativeName: String, val category: WidgetCategory) {
-            Button("دکمه", "button", WidgetCategory.Primitives),
-            Radio("رادیو", "radio", WidgetCategory.Primitives),
-            Checkbox("چک‌باکس", "checkbox", WidgetCategory.Primitives),
-            Text("متن", "text", WidgetCategory.Primitives),
-            Combo("کمبوباکس", "combo", WidgetCategory.Primitives),
-            ListBox("لیست‌باکس", "listbox", WidgetCategory.Primitives),
-            TextInput("ورودی متنی", "textinput", WidgetCategory.DataInputs),
-            InputInt("ورودی صحیح", "inputint", WidgetCategory.DataInputs),
-            InputFloat("ورودی اعشاری", "inputfloat", WidgetCategory.DataInputs),
-            DragFloat("درگ اعشاری", "dragfloat", WidgetCategory.DataInputs),
-            SliderFloat("اسلایدر اعشاری", "sliderfloat", WidgetCategory.DataInputs),
-            Separator("جداکننده", "separator", WidgetCategory.Layout),
-            Spacing("فاصله", "spacing", WidgetCategory.Layout)
-        }
-        EOF
-
-        # ★ Import report data model
-        cat > android/app/src/main/java/com/raais/imstudio/model/ImportReport.kt <<'EOF'
-        package com.raais.imstudio.model
-
-        import kotlinx.serialization.SerialName
-        import kotlinx.serialization.Serializable
-
-        @Serializable
-        data class ImportIssue(
-            val line: Int = 0,
-            val text: String = "",
-            val message: String = ""
-        )
-
-        @Serializable
-        data class ImportFileReport(
-            val path: String = "",
-            @SerialName("size_bytes") val sizeBytes: Long = 0,
-            @SerialName("lines_scanned") val linesScanned: Int = 0,
-            @SerialName("widgets_found") val widgetsFound: Int = 0,
-            @SerialName("lines_non_imgui") val linesNonImGui: Int = 0,
-            val status: String = "ok",
-            @SerialName("recognized_widgets") val recognizedWidgets: List<String> = emptyList(),
-            val warnings: List<ImportIssue> = emptyList(),
-            @SerialName("unrecognized_imgui") val unrecognizedImGui: List<ImportIssue> = emptyList()
-        )
-
-        @Serializable
-        data class ImportSession(
-            @SerialName("total_files") val totalFiles: Int = 0,
-            @SerialName("files_with_widgets") val filesWithWidgets: Int = 0,
-            @SerialName("files_without_imgui") val filesWithoutImGui: Int = 0,
-            @SerialName("total_widgets") val totalWidgets: Int = 0,
-            @SerialName("total_warnings") val totalWarnings: Int = 0,
-            @SerialName("total_global_warnings") val totalGlobalWarnings: Int = 0
-        )
-
-        @Serializable
-        data class ImportReport(
-            val session: ImportSession = ImportSession(),
-            val files: List<ImportFileReport> = emptyList(),
-            @SerialName("global_warnings") val globalWarnings: List<String> = emptyList()
-        )
-        EOF
-
-        cat > android/app/src/main/java/com/raais/imstudio/engine/ImStudioState.kt <<'EOF'
-        package com.raais.imstudio.engine
-        import android.util.Log
-        import androidx.compose.runtime.mutableStateListOf
-        import androidx.compose.runtime.mutableStateOf
-        import com.raais.imstudio.NativeBridge
-        import com.raais.imstudio.model.ImportReport
-        import com.raais.imstudio.model.Widget
-        import kotlinx.serialization.json.Json
-
-        class ImStudioState {
-            private val TAG = "ImStudioState"
-            private val json = Json { ignoreUnknownKeys = true }
-            val widgets = mutableStateListOf<Widget>()
-            val selectedId = mutableStateOf<Int?>(null)
-            val nativeError = mutableStateOf<String?>(null)
-            val lastMessage = mutableStateOf<String?>(null)
-            val lastImportReport = mutableStateOf<ImportReport?>(null)
-
-            init {
-                if (!NativeBridge.isLoaded) {
-                    nativeError.value = "Native lib not loaded: ${NativeBridge.loadError}"
-                    Log.e(TAG, nativeError.value!!)
-                } else {
-                    try { NativeBridge.initBuffer(); Log.i(TAG, "initBuffer OK") }
-                    catch (t: Throwable) {
-                        nativeError.value = "initBuffer: ${t.javaClass.simpleName}: ${t.message}"
-                        Log.e(TAG, nativeError.value!!, t)
-                    }
-                }
-            }
-
-            fun refresh() {
-                if (nativeError.value != null) return
-                try {
-                    val n = NativeBridge.getWidgetCount()
-                    val out = ArrayList<Widget>(n)
-                    for (i in 0 until n) {
-                        val id = NativeBridge.getWidgetId(i)
-                        if (id < 0) continue
-                        out += Widget(id, NativeBridge.getWidgetType(id),
-                            NativeBridge.getWidgetLabel(id), NativeBridge.getWidgetValueS(id),
-                            NativeBridge.getWidgetX(id), NativeBridge.getWidgetY(id),
-                            NativeBridge.getWidgetSizeX(id), NativeBridge.getWidgetSizeY(id),
-                            NativeBridge.getWidgetWidth(id))
-                    }
-                    widgets.clear(); widgets.addAll(out)
-                    if (selectedId.value != null && widgets.none { it.id == selectedId.value })
-                        selectedId.value = null
-                } catch (t: Throwable) { Log.e(TAG, "refresh", t) }
-            }
-
-            fun addWidget(name: String) {
-                if (nativeError.value != null) return
-                try { val id = NativeBridge.createWidget(name); refresh(); if (id >= 0) selectedId.value = id }
-                catch (t: Throwable) { Log.e(TAG, "addWidget", t) }
-            }
-            fun deleteWidget(id: Int) { runCatching { NativeBridge.deleteWidget(id) }; refresh() }
-            fun moveWidget(id: Int, x: Float, y: Float) { runCatching { NativeBridge.moveWidget(id, x, y) }; refresh() }
-            fun resizeWidget(id: Int, sx: Float, sy: Float) { runCatching { NativeBridge.resizeWidget(id, sx, sy) }; refresh() }
-            fun setLabel(id: Int, v: String) { runCatching { NativeBridge.setWidgetLabel(id, v) }; refresh() }
-            fun setValueS(id: Int, v: String) { runCatching { NativeBridge.setWidgetValueS(id, v) }; refresh() }
-            fun generateCode(): String = try { NativeBridge.generateCode() } catch (t: Throwable) { "// error: ${t.message}" }
-            fun selected(): Widget? = widgets.find { it.id == selectedId.value }
-
-            fun clearAll(): Boolean {
-                if (!NativeBridge.isLoaded) return false
-                val ok = runCatching { NativeBridge.clearAll(); true }.getOrDefault(false)
-                refresh()
-                lastMessage.value = if (ok) "همه ویجت‌ها پاک شدند" else "پاک‌سازی ناموفق"
-                return ok
-            }
-
-            fun loadFromText(text: String): Boolean {
-                if (!NativeBridge.isLoaded) return false
-                val ok = try { NativeBridge.loadFromText(text) } catch (t: Throwable) { Log.e(TAG, "loadFromText", t); false }
-                refresh()
-                lastMessage.value = if (ok) "پروژه بارگذاری شد (${widgets.size} ویجت)" else "فرمت پشتیبانی نمی‌شود"
-                return ok
-            }
-
-            fun importFromCpp(code: String): Boolean {
-                if (!NativeBridge.isLoaded) return false
-                val ok = try { NativeBridge.importFromCpp(code) } catch (t: Throwable) { Log.e(TAG, "importFromCpp", t); false }
-                refresh()
-                lastMessage.value = if (ok) "کد C++ ایمپورت شد (${widgets.size} ویجت)"
-                    else "هیچ ویجت ImGui شناخته‌شده‌ای پیدا نشد"
-                return ok
-            }
-
-            /** ★ Folder import — accepts list of (path, content) pairs sorted by caller */
-            fun importFromFiles(files: List<Pair<String, String>>): ImportReport? {
-                if (!NativeBridge.isLoaded) return null
-                try {
-                    NativeBridge.importBegin()
-                    for ((path, content) in files) {
-                        NativeBridge.importFile(path, content)
-                    }
-                    val reportJson = NativeBridge.importEnd()
-                    val report = try { json.decodeFromString<ImportReport>(reportJson) }
-                        catch (t: Throwable) { Log.e(TAG, "report decode failed: $reportJson", t); ImportReport() }
-                    lastImportReport.value = report
-                    refresh()
-                    lastMessage.value = "ایمپورت: ${report.session.totalWidgets} ویجت از ${report.session.totalFiles} فایل"
-                    return report
-                } catch (t: Throwable) {
-                    Log.e(TAG, "importFromFiles", t)
-                    lastMessage.value = "ایمپورت ناموفق: ${t.message}"
-                    return null
-                }
-            }
-
-            fun dumpToJson(): String =
-                if (!NativeBridge.isLoaded) "{\"version\":1,\"objects\":[]}"
-                else try { NativeBridge.dumpToJson() } catch (t: Throwable) { "{\"version\":1,\"objects\":[]}" }
-
-            fun dispose() { if (NativeBridge.isLoaded) runCatching { NativeBridge.shutdown() } }
-        }
-        EOF
-
-        cat > android/app/src/main/java/com/raais/imstudio/engine/EditorViewModel.kt <<'EOF'
-        package com.raais.imstudio.engine
-        import androidx.lifecycle.ViewModel
-        import com.raais.imstudio.model.ImportReport
-        import com.raais.imstudio.model.WidgetType
-        class EditorViewModel : ViewModel() {
-            val state = ImStudioState()
-            fun refresh() = state.refresh()
-            fun select(id: Int?) { state.selectedId.value = id }
-            fun addWidget(type: WidgetType) = state.addWidget(type.nativeName)
-            fun generateCode(): String = state.generateCode()
-            fun clearAll() = state.clearAll()
-            fun loadFromText(text: String) = state.loadFromText(text)
-            fun importFromCpp(code: String) = state.importFromCpp(code)
-            fun importFromFiles(files: List<Pair<String, String>>): ImportReport? = state.importFromFiles(files)
-            fun dumpToJson() = state.dumpToJson()
-            override fun onCleared() { super.onCleared(); state.dispose() }
-        }
-        EOF
-
-        cat > android/app/src/main/java/com/raais/imstudio/util/ClipboardUtil.kt <<'EOF'
-        package com.raais.imstudio.util
-        import android.content.ClipData
-        import android.content.ClipboardManager
-        import android.content.Context
-        fun copyToClipboard(context: Context, text: String, label: String = "ImStudio") {
-            val cm = context.getSystemService(Context.CLIPBOARD_SERVICE) as ClipboardManager
-            cm.setPrimaryClip(ClipData.newPlainText(label, text))
-        }
-        EOF
-        cat > android/app/src/main/java/com/raais/imstudio/util/CrashLogger.kt <<'EOF'
-        package com.raais.imstudio.util
-        import android.content.Context
-        import android.util.Log
-        import com.raais.imstudio.NativeBridge
-        import java.io.File
-        import java.io.PrintWriter
-        import java.io.StringWriter
-        import java.text.SimpleDateFormat
-        import java.util.Date
-        import java.util.Locale
-        object CrashLogger {
-            private const val TAG = "ImStudioCrash"
-            fun crashDir(context: Context): File {
-                val ext = context.getExternalFilesDir(null) ?: context.filesDir
-                return File(ext, "crashes").apply { mkdirs() }
-            }
-            fun install(context: Context) {
-                val dir = crashDir(context)
-                val def = Thread.getDefaultUncaughtExceptionHandler()
-                Thread.setDefaultUncaughtExceptionHandler { thread, throwable ->
-                    try {
-                        val ts = SimpleDateFormat("yyyyMMdd_HHmmss", Locale.US).format(Date())
-                        val f = File(dir, "java_crash_${ts}.log")
-                        val sw = StringWriter(); throwable.printStackTrace(PrintWriter(sw))
-                        f.writeText("Thread: ${thread.name}\nTime: ${Date()}\n\n$sw")
-                    } catch (_: Throwable) {}
-                    def?.uncaughtException(thread, throwable)
-                }
-                try { NativeBridge.initCrashHandler(dir.absolutePath) } catch (_: Throwable) {}
-            }
-            fun listCrashFiles(context: Context): List<File> =
-                crashDir(context).listFiles()?.sortedByDescending { it.lastModified() } ?: emptyList()
-        }
-        EOF
-
-    # ============================================================
-    # 8. UI: Import folder + report dialog
-    # ============================================================
-    - name: Write Compose UI with folder import + report dialog
-      run: |
-        cat > android/app/src/main/java/com/raais/imstudio/ui/MainActivity.kt <<'EOF'
-        package com.raais.imstudio.ui
-        import android.os.Bundle
-        import androidx.activity.ComponentActivity
-        import androidx.activity.compose.setContent
-        import androidx.lifecycle.ViewModelProvider
-        import com.raais.imstudio.engine.EditorViewModel
-        import com.raais.imstudio.ui.screens.EditorScreen
-        import com.raais.imstudio.ui.theme.ImStudioTheme
-        import com.raais.imstudio.util.CrashLogger
-        class MainActivity : ComponentActivity() {
-            override fun onCreate(savedInstanceState: Bundle?) {
-                super.onCreate(savedInstanceState)
-                CrashLogger.install(applicationContext)
-                val vm = ViewModelProvider(this)[EditorViewModel::class.java]
-                setContent { ImStudioTheme { EditorScreen(vm) } }
-            }
-        }
-        EOF
-        cat > android/app/src/main/java/com/raais/imstudio/ui/theme/Color.kt <<'EOF'
-        package com.raais.imstudio.ui.theme
-        import androidx.compose.ui.graphics.Color
-        val BgDark = Color(0xFF121212); val SurfaceDark = Color(0xFF1E1E1E)
-        val SurfaceVariantDark = Color(0xFF2C2C2C); val Primary = Color(0xFF4A90D9)
-        val PrimaryLight = Color(0xFF6DB3F2); val OnSurfaceDark = Color(0xFFE0E0E0)
-        val OnSurfaceMuted = Color(0xFFB0B0B0); val ErrorRed = Color(0xFFCF6679)
-        EOF
-        cat > android/app/src/main/java/com/raais/imstudio/ui/theme/Type.kt <<'EOF'
-        package com.raais.imstudio.ui.theme
-        import androidx.compose.material3.Typography
-        val ImStudioTypography = Typography()
-        EOF
-        cat > android/app/src/main/java/com/raais/imstudio/ui/theme/Theme.kt <<'EOF'
-        package com.raais.imstudio.ui.theme
-        import androidx.compose.material3.MaterialTheme
-        import androidx.compose.material3.darkColorScheme
-        import androidx.compose.runtime.Composable
-        private val DarkColors = darkColorScheme(
-            primary = Primary, onPrimary = androidx.compose.ui.graphics.Color.White,
-            secondary = PrimaryLight, background = BgDark, surface = SurfaceDark,
-            surfaceVariant = SurfaceVariantDark, onSurface = OnSurfaceDark,
-            onSurfaceVariant = OnSurfaceMuted, error = ErrorRed
-        )
-        @Composable fun ImStudioTheme(content: @Composable () -> Unit) {
-            MaterialTheme(colorScheme = DarkColors, typography = ImStudioTypography, content = content)
-        }
-        EOF
-
+        mkdir -p android/app/src/main/java/com/raais/imstudio/ui/screens
         cat > android/app/src/main/java/com/raais/imstudio/ui/screens/EditorScreen.kt <<'EOF'
         package com.raais.imstudio.ui.screens
 
         import android.content.Intent
         import android.net.Uri
+        import android.util.Log
         import android.widget.Toast
         import androidx.activity.compose.rememberLauncherForActivityResult
         import androidx.activity.result.contract.ActivityResultContracts
         import androidx.compose.foundation.layout.*
         import androidx.compose.material.icons.Icons
         import androidx.compose.material.icons.filled.Add
+        import androidx.compose.material.icons.filled.Code
         import androidx.compose.material.icons.filled.Delete
         import androidx.compose.material.icons.filled.Folder
         import androidx.compose.material.icons.filled.FolderOpen
@@ -1194,7 +47,9 @@ jobs:
         import androidx.documentfile.provider.DocumentFile
         import com.raais.imstudio.engine.EditorViewModel
         import com.raais.imstudio.model.WidgetType
-        import com.raais.imstudio.ui.components.*
+        import com.raais.imstudio.ui.components.ComponentPaletteSheet
+        import com.raais.imstudio.ui.components.DesignCanvas
+        import com.raais.imstudio.ui.components.PropertiesPanel
         import com.raais.imstudio.ui.dialogs.CodeDialog
         import com.raais.imstudio.ui.dialogs.ConfirmDeleteDialog
         import com.raais.imstudio.ui.dialogs.ImportReportDialog
@@ -1223,37 +78,59 @@ jobs:
             var pendingClear by remember { mutableStateOf(false) }
             var importRunning by remember { mutableStateOf(false) }
 
-            val loadLauncher = rememberLauncherForActivityResult(ActivityResultContracts.OpenDocument()) { uri: Uri? ->
+            val loadLauncher = rememberLauncherForActivityResult(
+                ActivityResultContracts.OpenDocument()
+            ) { uri: Uri? ->
                 uri ?: return@rememberLauncherForActivityResult
                 try {
-                    val text = ctx.contentResolver.openInputStream(uri)?.use { it.bufferedReader().readText() } ?: ""
+                    val text = ctx.contentResolver.openInputStream(uri)
+                        ?.use { it.bufferedReader().readText() } ?: ""
                     val ok = vm.loadFromText(text)
-                    Toast.makeText(ctx, if (ok) "JSON بارگذاری شد" else "فرمت JSON نامعتبر", Toast.LENGTH_LONG).show()
-                } catch (t: Throwable) { Toast.makeText(ctx, "خطا: ${t.message}", Toast.LENGTH_LONG).show() }
+                    Toast.makeText(ctx,
+                        if (ok) "JSON بارگذاری شد" else "فرمت JSON نامعتبر",
+                        Toast.LENGTH_LONG).show()
+                } catch (t: Throwable) {
+                    Toast.makeText(ctx, "خطا: ${t.message}", Toast.LENGTH_LONG).show()
+                }
             }
-            val saveLauncher = rememberLauncherForActivityResult(ActivityResultContracts.CreateDocument("application/json")) { uri: Uri? ->
+
+            val saveLauncher = rememberLauncherForActivityResult(
+                ActivityResultContracts.CreateDocument("application/json")
+            ) { uri: Uri? ->
                 uri ?: return@rememberLauncherForActivityResult
                 try {
                     val json = vm.dumpToJson()
-                    ctx.contentResolver.openOutputStream(uri)?.use { it.write(json.toByteArray()) }
+                    ctx.contentResolver.openOutputStream(uri)
+                        ?.use { it.write(json.toByteArray()) }
                     Toast.makeText(ctx, "ذخیره شد", Toast.LENGTH_SHORT).show()
-                } catch (t: Throwable) { Toast.makeText(ctx, "خطا: ${t.message}", Toast.LENGTH_LONG).show() }
+                } catch (t: Throwable) {
+                    Toast.makeText(ctx, "خطا: ${t.message}", Toast.LENGTH_LONG).show()
+                }
             }
-            val importCppLauncher = rememberLauncherForActivityResult(ActivityResultContracts.OpenDocument()) { uri: Uri? ->
+
+            val importCppLauncher = rememberLauncherForActivityResult(
+                ActivityResultContracts.OpenDocument()
+            ) { uri: Uri? ->
                 uri ?: return@rememberLauncherForActivityResult
                 try {
-                    val text = ctx.contentResolver.openInputStream(uri)?.use { it.bufferedReader().readText() } ?: ""
+                    val text = ctx.contentResolver.openInputStream(uri)
+                        ?.use { it.bufferedReader().readText() } ?: ""
                     val ok = vm.importFromCpp(text)
-                    Toast.makeText(ctx, if (ok) "کد ایمپورت شد" else "ویجت ImGui پیدا نشد", Toast.LENGTH_LONG).show()
-                } catch (t: Throwable) { Toast.makeText(ctx, "خطا: ${t.message}", Toast.LENGTH_LONG).show() }
+                    Toast.makeText(ctx,
+                        if (ok) "کد ایمپورت شد" else "ویجت ImGui پیدا نشد",
+                        Toast.LENGTH_LONG).show()
+                } catch (t: Throwable) {
+                    Toast.makeText(ctx, "خطا: ${t.message}", Toast.LENGTH_LONG).show()
+                }
             }
-            // ★ Folder import
-            val folderLauncher = rememberLauncherForActivityResult(ActivityResultContracts.OpenDocumentTree()) { uri: Uri? ->
+
+            val folderLauncher = rememberLauncherForActivityResult(
+                ActivityResultContracts.OpenDocumentTree()
+            ) { uri: Uri? ->
                 uri ?: return@rememberLauncherForActivityResult
                 try {
                     ctx.contentResolver.takePersistableUriPermission(
-                        uri, Intent.FLAG_GRANT_READ_URI_PERMISSION
-                    )
+                        uri, Intent.FLAG_GRANT_READ_URI_PERMISSION)
                 } catch (_: Throwable) {}
                 importRunning = true
                 scope.launch {
@@ -1274,15 +151,18 @@ jobs:
                                     val content = ctx.contentResolver.openInputStream(f.uri)
                                         ?.use { it.bufferedReader().readText() } ?: ""
                                     out.add(name to content)
-                                } catch (_: Throwable) {}
+                                } catch (t: Throwable) {
+                                    Log.w("FolderImport", "read $name failed", t)
+                                }
                             }
-                            // Sort: .cpp first, then .h/.hpp, then alphabetic
                             out.sortWith(compareBy(
                                 { pair ->
                                     val n = pair.first.lowercase()
                                     when {
-                                        n.endsWith(".cpp") || n.endsWith(".cc") || n.endsWith(".cxx") -> 0
-                                        n.endsWith(".hpp") || n.endsWith(".h") || n.endsWith(".inl") -> 1
+                                        n.endsWith(".cpp") || n.endsWith(".cc") ||
+                                            n.endsWith(".cxx") -> 0
+                                        n.endsWith(".hpp") || n.endsWith(".h") ||
+                                            n.endsWith(".inl") -> 1
                                         else -> 2
                                     }
                                 },
@@ -1290,21 +170,18 @@ jobs:
                             ))
                             out
                         } catch (t: Throwable) {
-                            android.util.Log.e("FolderImport", "read failed", t)
+                            Log.e("FolderImport", "read failed", t)
                             null
                         }
                     }
                     if (result.isNullOrEmpty()) {
                         importRunning = false
-                        Toast.makeText(ctx, "فایلی برای ایمپورت پیدا نشد", Toast.LENGTH_LONG).show()
+                        Toast.makeText(ctx, "فایلی پیدا نشد", Toast.LENGTH_LONG).show()
                     } else {
                         val report = vm.importFromFiles(result)
                         importRunning = false
-                        if (report != null) {
-                            showReport = true
-                        } else {
-                            Toast.makeText(ctx, "ایمپورت ناموفق", Toast.LENGTH_LONG).show()
-                        }
+                        if (report != null) showReport = true
+                        else Toast.makeText(ctx, "ایمپورت ناموفق", Toast.LENGTH_LONG).show()
                     }
                 }
             }
@@ -1330,55 +207,69 @@ jobs:
                                     Icon(Icons.Default.Save, contentDescription = "ذخیره")
                                 }
                                 IconButton(onClick = { showCode = true }) {
-                                    Icon(androidx.compose.material.icons.Icons.Default.Code, contentDescription = "کد")
+                                    Icon(Icons.Default.Code, contentDescription = "کد")
                                 }
                                 IconButton(onClick = { pendingClear = true }) {
                                     Icon(Icons.Default.Delete, contentDescription = "پاک‌سازی")
                                 }
                             } else {
                                 CircularProgressIndicator(
-                                    modifier = Modifier.size(24.dp),
-                                    strokeWidth = 2.dp
-                                )
+                                    modifier = Modifier.size(24.dp), strokeWidth = 2.dp)
                             }
                         }
                     )
                 },
                 floatingActionButton = {
-                    if (!importRunning) FloatingActionButton(onClick = {
-                        if (nativeError == null) showPalette = true
-                    }) { Icon(Icons.Default.Add, contentDescription = "افزودن") }
+                    if (!importRunning) {
+                        FloatingActionButton(onClick = {
+                            if (nativeError == null) showPalette = true
+                        }) {
+                            Icon(Icons.Default.Add, contentDescription = "افزودن")
+                        }
+                    }
                 }
             ) { padding ->
                 Column(modifier = Modifier.padding(padding).fillMaxSize()) {
                     if (nativeError != null) {
                         Surface(color = MaterialTheme.colorScheme.errorContainer) {
                             Column(Modifier.padding(16.dp)) {
-                                Text("خطای native", style = MaterialTheme.typography.titleMedium)
-                                Text(nativeError, style = MaterialTheme.typography.bodySmall)
+                                Text("خطای native",
+                                    style = MaterialTheme.typography.titleMedium)
+                                Text(nativeError,
+                                    style = MaterialTheme.typography.bodySmall)
                             }
                         }
                     }
                     if (lastMessage != null) {
                         Surface(color = MaterialTheme.colorScheme.secondaryContainer) {
-                            Row(modifier = Modifier.padding(12.dp).fillMaxWidth(),
-                                horizontalArrangement = Arrangement.SpaceBetween) {
-                                Text(lastMessage, style = MaterialTheme.typography.bodySmall)
+                            Row(
+                                modifier = Modifier.padding(12.dp).fillMaxWidth(),
+                                horizontalArrangement = Arrangement.SpaceBetween
+                            ) {
+                                Text(lastMessage,
+                                    style = MaterialTheme.typography.bodySmall)
                                 if (lastReport != null) {
-                                    TextButton(onClick = { showReport = true }) { Text("گزارش") }
+                                    TextButton(onClick = { showReport = true }) {
+                                        Text("گزارش")
+                                    }
                                 }
                             }
                         }
                     }
                     if (crashFiles.isNotEmpty()) {
                         Surface(color = MaterialTheme.colorScheme.tertiaryContainer) {
-                            Text("${crashFiles.size} فایل کرش ذخیره‌شده", Modifier.padding(12.dp),
+                            Text("${crashFiles.size} فایل کرش ذخیره‌شده",
+                                Modifier.padding(12.dp),
                                 style = MaterialTheme.typography.bodySmall)
                         }
                     }
                     Row(modifier = Modifier.weight(1f).fillMaxWidth()) {
                         Box(modifier = Modifier.weight(0.62f).fillMaxHeight()) {
-                            DesignCanvas(state, onSelect = { vm.select(it) }, onLongPress = { pendingDelete = it })
+                            DesignCanvas(
+                                state = state,
+                                onSelect = { vm.select(it) },
+                                onLongPress = { pendingDelete = it }
+                            )
                         }
                         Box(modifier = Modifier.weight(0.38f).fillMaxHeight()) {
                             PropertiesPanel(state)
@@ -1390,402 +281,47 @@ jobs:
             if (showPalette) ComponentPaletteSheet(
                 onSelect = { t: WidgetType -> vm.addWidget(t); showPalette = false },
                 onDismiss = { showPalette = false })
-            if (showCode) CodeDialog(code = vm.generateCode(), onDismiss = { showCode = false })
+            if (showCode) CodeDialog(code = vm.generateCode(),
+                onDismiss = { showCode = false })
             if (showReport) lastReport?.let { rep ->
                 ImportReportDialog(report = rep, onDismiss = { showReport = false })
             }
             if (pendingDelete != null) {
                 val id = pendingDelete!!
-                ConfirmDeleteDialog(widgetId = id,
+                ConfirmDeleteDialog(
+                    widgetId = id,
                     onConfirm = { state.deleteWidget(id); pendingDelete = null },
-                    onDismiss = { pendingDelete = null })
+                    onDismiss = { pendingDelete = null }
+                )
             }
             if (pendingClear) {
-                AlertDialog(onDismissRequest = { pendingClear = false },
+                AlertDialog(
+                    onDismissRequest = { pendingClear = false },
                     title = { Text("پاک‌سازی") },
                     text = { Text("همه ویجت‌ها حذف شوند؟") },
-                    confirmButton = { TextButton(onClick = { vm.clearAll(); pendingClear = false }) { Text("پاک کن") } },
-                    dismissButton = { TextButton(onClick = { pendingClear = false }) { Text("لغو") } })
+                    confirmButton = {
+                        TextButton(onClick = {
+                            vm.clearAll(); pendingClear = false
+                        }) { Text("پاک کن") }
+                    },
+                    dismissButton = {
+                        TextButton(onClick = { pendingClear = false }) { Text("لغو") }
+                    }
+                )
             }
         }
         EOF
+        echo "EditorScreen.kt rewritten with Icons.Default.Code fix"
 
-        # ★ Import report dialog
-        cat > android/app/src/main/java/com/raais/imstudio/ui/dialogs/ImportReportDialog.kt <<'EOF'
-        package com.raais.imstudio.ui.dialogs
-
-        import androidx.compose.foundation.background
-        import androidx.compose.foundation.layout.*
-        import androidx.compose.foundation.rememberScrollState
-        import androidx.compose.foundation.verticalScroll
-        import androidx.compose.material3.*
-        import androidx.compose.runtime.Composable
-        import androidx.compose.ui.Modifier
-        import androidx.compose.ui.graphics.Color
-        import androidx.compose.ui.text.font.FontFamily
-        import androidx.compose.ui.unit.dp
-        import androidx.compose.ui.unit.sp
-        import androidx.compose.ui.window.Dialog
-        import com.raais.imstudio.model.ImportFileReport
-        import com.raais.imstudio.model.ImportReport
-
-        @Composable
-        fun ImportReportDialog(report: ImportReport, onDismiss: () -> Unit) {
-            val s = report.session
-            Dialog(onDismissRequest = onDismiss) {
-                Surface(
-                    shape = MaterialTheme.shapes.large,
-                    color = MaterialTheme.colorScheme.surface
-                ) {
-                    Column(modifier = Modifier.padding(16.dp)) {
-                        Text("گزارش ایمپورت", style = MaterialTheme.typography.titleLarge)
-
-                        Spacer(Modifier.height(12.dp))
-
-                        // Session summary
-                        Surface(
-                            color = MaterialTheme.colorScheme.surfaceVariant,
-                            shape = MaterialTheme.shapes.small
-                        ) {
-                            Column(modifier = Modifier.padding(12.dp).fillMaxWidth()) {
-                                Text("خلاصه", style = MaterialTheme.typography.titleSmall)
-                                Spacer(Modifier.height(4.dp))
-                                Text("کل فایل‌ها: ${s.totalFiles}", fontSize = 12.sp)
-                                Text("فایل‌های دارای ویجت: ${s.filesWithWidgets}", fontSize = 12.sp)
-                                Text("فایل‌های بدون ImGui: ${s.filesWithoutImGui}", fontSize = 12.sp)
-                                Text("کل ویجت‌ها: ${s.totalWidgets}",
-                                    fontSize = 12.sp, color = Color(0xFF6DB3F2))
-                                if (s.totalWarnings > 0)
-                                    Text("هشدارها: ${s.totalWarnings}",
-                                        fontSize = 12.sp, color = Color(0xFFFFB74D))
-                                if (s.totalGlobalWarnings > 0)
-                                    Text("هشدارهای سراسری: ${s.totalGlobalWarnings}",
-                                        fontSize = 12.sp, color = Color(0xFFFFB74D))
-                            }
-                        }
-
-                        Spacer(Modifier.height(12.dp))
-
-                        // Per-file details
-                        Box(
-                            modifier = Modifier
-                                .heightIn(max = 420.dp)
-                                .verticalScroll(rememberScrollState())
-                        ) {
-                            Column {
-                                report.files.forEach { f ->
-                                    FileReportCard(f)
-                                    Spacer(Modifier.height(8.dp))
-                                }
-                                if (report.globalWarnings.isNotEmpty()) {
-                                    Text("هشدارهای سراسری",
-                                        style = MaterialTheme.typography.titleSmall,
-                                        color = Color(0xFFFFB74D))
-                                    Spacer(Modifier.height(4.dp))
-                                    report.globalWarnings.forEach { w ->
-                                        Text("• $w", fontSize = 11.sp)
-                                    }
-                                }
-                            }
-                        }
-
-                        Spacer(Modifier.height(12.dp))
-                        Row(modifier = Modifier.fillMaxWidth(),
-                            horizontalArrangement = Arrangement.End) {
-                            TextButton(onClick = onDismiss) { Text("بستن") }
-                        }
-                    }
-                }
-            }
-        }
-
-        @Composable
-        private fun FileReportCard(f: ImportFileReport) {
-            val statusColor = when (f.status) {
-                "ok" -> Color(0xFF81C784)
-                "no_widgets" -> Color(0xFFFFB74D)
-                "no_imgui" -> Color(0xFF9E9E9E)
-                "parse_error" -> Color(0xFFCF6679)
-                else -> MaterialTheme.colorScheme.onSurface
-            }
-            Surface(color = MaterialTheme.colorScheme.surfaceVariant,
-                    shape = MaterialTheme.shapes.small) {
-                Column(modifier = Modifier.padding(10.dp).fillMaxWidth()) {
-                    Row(modifier = Modifier.fillMaxWidth(),
-                        horizontalArrangement = Arrangement.SpaceBetween) {
-                        Text(f.path, style = MaterialTheme.typography.bodyMedium,
-                             fontFamily = FontFamily.Monospace, maxLines = 1)
-                        Text(f.status, fontSize = 11.sp, color = statusColor,
-                             fontFamily = FontFamily.Monospace)
-                    }
-                    Spacer(Modifier.height(4.dp))
-                    Text("${f.linesScanned} خط، ${f.sizeBytes} بایت، " +
-                         "${f.widgetsFound} ویجت، ${f.linesNonImGui} خط بدون ImGui",
-                         fontSize = 11.sp, color = MaterialTheme.colorScheme.onSurfaceVariant)
-
-                    if (f.recognizedWidgets.isNotEmpty()) {
-                        Text("ویجت‌های یافت‌شده: ${f.recognizedWidgets.joinToString(", ")}",
-                             fontSize = 11.sp)
-                    }
-                    if (f.warnings.isNotEmpty()) {
-                        Spacer(Modifier.height(4.dp))
-                        Text("⚠ هشدارها", fontSize = 11.sp, color = Color(0xFFFFB74D))
-                        f.warnings.take(5).forEach { w ->
-                            Text("  • خط ${w.line}: ${w.message}", fontSize = 10.sp,
-                                 fontFamily = FontFamily.Monospace)
-                        }
-                        if (f.warnings.size > 5) {
-                            Text("  ... و ${f.warnings.size - 5} مورد دیگر", fontSize = 10.sp)
-                        }
-                    }
-                    if (f.unrecognizedImGui.isNotEmpty()) {
-                        Spacer(Modifier.height(4.dp))
-                        Text("ImGui:: غیر-ویجت (${f.unrecognizedImGui.size} مورد)",
-                             fontSize = 11.sp, color = MaterialTheme.colorScheme.onSurfaceVariant)
-                        f.unrecognizedImGui.take(3).forEach { u ->
-                            Text("  • خط ${u.line}: ${u.text}", fontSize = 10.sp,
-                                 fontFamily = FontFamily.Monospace,
-                                 color = MaterialTheme.colorScheme.onSurfaceVariant)
-                        }
-                        if (f.unrecognizedImGui.size > 3) {
-                            Text("  ... و ${f.unrecognizedImGui.size - 3} مورد دیگر", fontSize = 10.sp)
-                        }
-                    }
-                }
-            }
-        }
-        EOF
-
-        # Design canvas, properties, palette, code dialog, confirm dialog
-        cat > android/app/src/main/java/com/raais/imstudio/ui/components/DesignCanvas.kt <<'EOF'
-        package com.raais.imstudio.ui.components
-        import androidx.compose.foundation.Canvas
-        import androidx.compose.foundation.background
-        import androidx.compose.foundation.gestures.detectDragGestures
-        import androidx.compose.foundation.gestures.detectTapGestures
-        import androidx.compose.foundation.layout.*
-        import androidx.compose.material3.Text
-        import androidx.compose.runtime.*
-        import androidx.compose.ui.Alignment
-        import androidx.compose.ui.Modifier
-        import androidx.compose.ui.geometry.Offset
-        import androidx.compose.ui.graphics.Color
-        import androidx.compose.ui.graphics.drawscope.DrawScope
-        import androidx.compose.ui.input.pointer.pointerInput
-        import androidx.compose.ui.text.style.TextOverflow
-        import androidx.compose.ui.unit.dp
-        import com.raais.imstudio.engine.ImStudioState
-        import com.raais.imstudio.model.Widget
-        @Composable fun DesignCanvas(state: ImStudioState, onSelect: (Int?) -> Unit, onLongPress: (Int) -> Unit) {
-            Box(modifier = Modifier.fillMaxSize().background(Color(0xFF121212))
-                .pointerInput(Unit) { detectTapGestures(onTap = { onSelect(null) }) }) {
-                Canvas(modifier = Modifier.fillMaxSize()) { drawGrid() }
-                state.widgets.forEach { w -> key(w.id) {
-                    WidgetItem(w, state.selectedId.value == w.id,
-                        onSelect = { onSelect(w.id) }, onLongPress = { onLongPress(w.id) },
-                        onMove = { dx, dy -> state.moveWidget(w.id, w.x + dx, w.y + dy) })
-                } }
-            }
-        }
-        private fun DrawScope.drawGrid() {
-            val c = Color(0xFF1F1F1F); val s = 24f
-            var x = 0f; while (x < size.width) { drawLine(c, Offset(x, 0f), Offset(x, size.height), 1f); x += s }
-            var y = 0f; while (y < size.height) { drawLine(c, Offset(0f, y), Offset(size.width, y), 1f); y += s }
-        }
-        @Composable private fun WidgetItem(w: Widget, isSel: Boolean, onSelect: () -> Unit,
-                               onLongPress: () -> Unit, onMove: (Float, Float) -> Unit) {
-            var drag by remember(w.id) { mutableStateOf(Offset.Zero) }
-            val dw = if (w.sizeX > 0f) w.sizeX.dp else w.width.dp
-            val dh = if (w.sizeY > 0f) w.sizeY.dp else 36.dp
-            Box(modifier = Modifier.offset(x = (w.x + drag.x).dp, y = (w.y + drag.y).dp)
-                .size(width = dw, height = dh)
-                .background(if (isSel) Color(0xFF4A90D9) else Color(0xFF2C2C2C))
-                .pointerInput(w.id) { detectDragGestures(
-                    onDragStart = { onSelect() },
-                    onDrag = { ch, d -> ch.consume(); drag += d },
-                    onDragEnd = { onMove(drag.x, drag.y); drag = Offset.Zero }) }
-                .pointerInput(w.id) { detectTapGestures(onLongPress = { onLongPress() }) },
-                contentAlignment = Alignment.Center) {
-                Text(w.displayText, color = Color(0xFFE0E0E0), maxLines = 1, overflow = TextOverflow.Ellipsis)
-            }
-        }
-        EOF
-        cat > android/app/src/main/java/com/raais/imstudio/ui/components/PropertiesPanel.kt <<'EOF'
-        package com.raais.imstudio.ui.components
-        import androidx.compose.foundation.background
-        import androidx.compose.foundation.layout.*
-        import androidx.compose.foundation.rememberScrollState
-        import androidx.compose.foundation.verticalScroll
-        import androidx.compose.material3.*
-        import androidx.compose.runtime.Composable
-        import androidx.compose.ui.Modifier
-        import androidx.compose.ui.unit.dp
-        import com.raais.imstudio.engine.ImStudioState
-        import com.raais.imstudio.model.Widget
-        @Composable fun PropertiesPanel(state: ImStudioState) {
-            val sel: Widget? = state.selected()
-            Column(modifier = Modifier.fillMaxHeight().background(MaterialTheme.colorScheme.surface)
-                .verticalScroll(rememberScrollState()).padding(16.dp),
-                verticalArrangement = Arrangement.spacedBy(12.dp)) {
-                Text("ویژگی‌ها", style = MaterialTheme.typography.titleMedium)
-                if (sel != null) {
-                    OutlinedTextField(value = sel.label, onValueChange = { state.setLabel(sel.id, it) },
-                        label = { Text("Label") }, singleLine = true, modifier = Modifier.fillMaxWidth())
-                    OutlinedTextField(value = sel.valueS, onValueChange = { state.setValueS(sel.id, it) },
-                        label = { Text("Value") }, singleLine = true, modifier = Modifier.fillMaxWidth())
-                    Row(horizontalArrangement = Arrangement.spacedBy(8.dp)) {
-                        Num("X", sel.x) { state.moveWidget(sel.id, it, sel.y) }
-                        Num("Y", sel.y) { state.moveWidget(sel.id, sel.x, it) }
-                    }
-                    Row(horizontalArrangement = Arrangement.spacedBy(8.dp)) {
-                        Num("Size X", sel.sizeX) { state.resizeWidget(sel.id, it, sel.sizeY) }
-                        Num("Size Y", sel.sizeY) { state.resizeWidget(sel.id, sel.sizeX, it) }
-                    }
-                    OutlinedTextField(value = sel.type, onValueChange = {}, enabled = false,
-                        label = { Text("Type") }, modifier = Modifier.fillMaxWidth())
-                    HorizontalDivider()
-                    Button(onClick = { state.deleteWidget(sel.id) },
-                        colors = ButtonDefaults.buttonColors(containerColor = MaterialTheme.colorScheme.error),
-                        modifier = Modifier.fillMaxWidth()) { Text("حذف ویجت") }
-                } else {
-                    Text("یک ویجت انتخاب کنید", color = MaterialTheme.colorScheme.onSurfaceVariant)
-                }
-            }
-        }
-        @Composable private fun RowScope.Num(lbl: String, v: Float, onChange: (Float) -> Unit) {
-            OutlinedTextField(value = v.toString(), onValueChange = { it.toFloatOrNull()?.let(onChange) },
-                label = { Text(lbl) }, singleLine = true, modifier = Modifier.weight(1f))
-        }
-        EOF
-        cat > android/app/src/main/java/com/raais/imstudio/ui/components/ComponentPaletteSheet.kt <<'EOF'
-        package com.raais.imstudio.ui.components
-        import androidx.compose.foundation.layout.*
-        import androidx.compose.foundation.lazy.LazyColumn
-        import androidx.compose.foundation.lazy.items
-        import androidx.compose.material3.*
-        import androidx.compose.runtime.Composable
-        import androidx.compose.ui.Modifier
-        import androidx.compose.ui.unit.dp
-        import com.raais.imstudio.model.WidgetCategory
-        import com.raais.imstudio.model.WidgetType
-        @OptIn(ExperimentalMaterial3Api::class)
-        @Composable fun ComponentPaletteSheet(onSelect: (WidgetType) -> Unit, onDismiss: () -> Unit) {
-            ModalBottomSheet(onDismissRequest = onDismiss) {
-                LazyColumn(modifier = Modifier.fillMaxWidth().padding(horizontal = 16.dp),
-                    verticalArrangement = Arrangement.spacedBy(4.dp)) {
-                    WidgetCategory.entries.forEach { cat ->
-                        item(key = "h_${cat.name}") {
-                            Text(cat.displayName, style = MaterialTheme.typography.titleSmall,
-                                modifier = Modifier.padding(vertical = 8.dp))
-                        }
-                        items(WidgetType.entries.filter { it.category == cat }, key = { "t_${it.name}" }) { t ->
-                            ListItem(headlineContent = { Text(t.displayName) },
-                                supportingContent = { Text(t.nativeName) },
-                                trailingContent = { TextButton(onClick = { onSelect(t) }) { Text("افزودن") } })
-                        }
-                    }
-                }
-            }
-        }
-        EOF
-        cat > android/app/src/main/java/com/raais/imstudio/ui/dialogs/CodeDialog.kt <<'EOF'
-        package com.raais.imstudio.ui.dialogs
-        import androidx.compose.foundation.horizontalScroll
-        import androidx.compose.foundation.layout.*
-        import androidx.compose.foundation.rememberScrollState
-        import androidx.compose.foundation.verticalScroll
-        import androidx.compose.material.icons.Icons
-        import androidx.compose.material.icons.filled.ContentCopy
-        import androidx.compose.material3.*
-        import androidx.compose.runtime.Composable
-        import androidx.compose.ui.Modifier
-        import androidx.compose.ui.platform.LocalContext
-        import androidx.compose.ui.text.font.FontFamily
-        import androidx.compose.ui.unit.dp
-        import androidx.compose.ui.unit.sp
-        import androidx.compose.ui.window.Dialog
-        import com.raais.imstudio.util.copyToClipboard
-        @Composable fun CodeDialog(code: String, onDismiss: () -> Unit) {
-            val ctx = LocalContext.current
-            Dialog(onDismissRequest = onDismiss) {
-                Surface(shape = MaterialTheme.shapes.large, color = MaterialTheme.colorScheme.surface) {
-                    Column(modifier = Modifier.padding(16.dp)) {
-                        Text("کد تولیدشده", style = MaterialTheme.typography.titleLarge)
-                        Spacer(Modifier.height(12.dp))
-                        Box(modifier = Modifier.heightIn(max = 420.dp)
-                            .horizontalScroll(rememberScrollState())
-                            .verticalScroll(rememberScrollState())) {
-                            Text(code, fontFamily = FontFamily.Monospace, fontSize = 12.sp)
-                        }
-                        Spacer(Modifier.height(12.dp))
-                        Row(modifier = Modifier.fillMaxWidth(), horizontalArrangement = Arrangement.End) {
-                            TextButton(onClick = { copyToClipboard(ctx, code, "ImStudio code") }) {
-                                Icon(Icons.Default.ContentCopy, contentDescription = null)
-                                Spacer(Modifier.width(4.dp)); Text("کپی")
-                            }
-                            Spacer(Modifier.width(8.dp))
-                            TextButton(onClick = onDismiss) { Text("بستن") }
-                        }
-                    }
-                }
-            }
-        }
-        EOF
-        cat > android/app/src/main/java/com/raais/imstudio/ui/dialogs/ConfirmDialog.kt <<'EOF'
-        package com.raais.imstudio.ui.dialogs
-        import androidx.compose.material3.AlertDialog
-        import androidx.compose.material3.Text
-        import androidx.compose.material3.TextButton
-        import androidx.compose.runtime.Composable
-        @Composable fun ConfirmDeleteDialog(widgetId: Int, onConfirm: () -> Unit, onDismiss: () -> Unit) {
-            AlertDialog(onDismissRequest = onDismiss, title = { Text("حذف ویجت") },
-                text = { Text("حذف ویجت #$widgetId؟") },
-                confirmButton = { TextButton(onClick = onConfirm) { Text("حذف") } },
-                dismissButton = { TextButton(onClick = onDismiss) { Text("لغو") } })
-        }
-        EOF
-
-    # ============================================================
-    # 9. gitignore, README, commit, build
-    # ============================================================
-    - name: Write .gitignore & README
-      run: |
-        cat > .gitignore <<'EOF'
-        *.iml
-        .gradle/
-        .idea/
-        local.properties
-        .DS_Store
-        build/
-        captures/
-        .externalNativeBuild/
-        .cxx/
-        *.apk
-        *.aab
-        android/app/build/
-        android/build/
-        android/app/.cxx/
-        *.log
-        EOF
-        cat > README.md <<'EOF'
-        # ImStudio Android
-        Native Android port of Raais/ImStudio with Jetpack Compose UI.
-
-        ## Features
-        - Import a folder of C++ files (.cpp/.h/etc.) — merges all ImGui widgets across files
-        - Detailed per-file report: widgets found, unrecognized ImGui calls, non-ImGui lines, duplicate labels
-        - Import single .cpp file
-        - Save/Load project as JSON
-        - Crash logs: `/storage/emulated/0/Android/data/com.raais.imstudio/files/crashes/`
-        EOF
-
-    - name: Commit and push
+    - name: Commit fix
       run: |
         git config user.name "ImStudio Sync Bot"
         git config user.email "bot@imstudio.local"
         git add -A
-        if git diff --staged --quiet; then echo "Nothing to commit"; else
-          git commit -m "feat(android): folder import with per-file diagnostics (sync @ ${UPSTREAM_SHA})"
+        if git diff --staged --quiet; then
+          echo "Nothing to commit"
+        else
+          git commit -m "fix(android): add missing Code icon import + rewrite EditorScreen [skip ci]"
           git push
         fi
       env:
@@ -1793,26 +329,33 @@ jobs:
 
     - name: Set up JDK 17
       uses: actions/setup-java@v4
-      with: { distribution: 'temurin', java-version: '17' }
+      with:
+        distribution: 'temurin'
+        java-version: '17'
+
     - name: Set up Android SDK
       uses: android-actions/setup-android@v3
       with:
         packages: 'platforms;android-34 build-tools;34.0.0'
         accept-android-sdk-licenses: true
-    - name: Install NDK
+
+    - name: Install Android NDK
       run: |
         echo "y" | sdkmanager --install "ndk;26.1.10909125"
         echo "ANDROID_NDK_HOME=$ANDROID_HOME/ndk/26.1.10909125" >> $GITHUB_ENV
+
     - name: Set up Gradle
       uses: gradle/actions/setup-gradle@v3
+
     - name: Build APK
       run: |
         cd android
         gradle wrapper --gradle-version 8.4
         ./gradlew assembleDebug --no-daemon
+
     - name: Upload APK
       uses: actions/upload-artifact@v4
       with:
-        name: ImStudio-Android-${{ env.UPSTREAM_SHA }}
+        name: ImStudio-Android-fixed
         path: android/app/build/outputs/apk/debug/*.apk
         if-no-files-found: error
