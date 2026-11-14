@@ -34,8 +34,6 @@ jobs:
       run: |
         cat > /tmp/write_if_missing <<'HELPER_EOF'
         #!/bin/bash
-        # Usage: write_if_missing <path>
-        # Reads stdin, writes to file only if it doesn't exist. Drains stdin otherwise.
         path="$1"
         if [ ! -f "$path" ]; then
             mkdir -p "$(dirname "$path")"
@@ -77,6 +75,11 @@ jobs:
         cp -f /tmp/ImStudio/src/third-party/imgui/imstb_*.h      $VD/imgui/ 2>/dev/null || true
         [ -f /tmp/ImStudio/src/third-party/imgui/LICENSE.txt ] && cp -f /tmp/ImStudio/src/third-party/imgui/LICENSE.txt $VD/imgui/ || true
 
+        echo "→ Copying ImGui misc/cpp (imgui_stdlib)..."
+        mkdir -p $VD/imgui/misc/cpp
+        cp -f /tmp/ImStudio/src/third-party/imgui/misc/cpp/imgui_stdlib.h   $VD/imgui/misc/cpp/ 2>/dev/null || true
+        cp -f /tmp/ImStudio/src/third-party/imgui/misc/cpp/imgui_stdlib.cpp $VD/imgui/misc/cpp/ 2>/dev/null || true
+
         echo "→ Copying fmt (header-only)..."
         if [ -d /tmp/ImStudio/src/third-party/fmt/include/fmt ]; then
             mkdir -p $VD/fmt/include/fmt
@@ -98,7 +101,6 @@ jobs:
       run: |
         write_if_missing android/app/src/main/cpp/include/jni_bridge.h <<'EOF'
         #pragma once
-        // Public C++ API consumed by jni_bridge.cpp.
         #include <string>
 
         namespace imstudio::engine {
@@ -171,12 +173,12 @@ jobs:
 
         write_if_missing android/app/src/main/cpp/src/engine/buffer_accessor.cpp <<'EOF'
         #include "engine/buffer_accessor.h"
-        #include "vendor/imstudio/ims_buffer.h"
-        #include "vendor/imstudio/ims_object.h"
+        #include "ims_buffer.h"
+        #include "ims_object.h"
 
         namespace imstudio::engine {
 
-        static ImStudio::BufferWindow g_Buffer;
+        ImStudio::BufferWindow g_Buffer;  // non-static so code_generator.cpp can extern it
 
         static ImStudio::Object* get_obj(int id) {
             return g_Buffer.getobj(id);
@@ -257,9 +259,9 @@ jobs:
 
         write_if_missing android/app/src/main/cpp/src/engine/code_generator.cpp <<'EOF'
         #include "engine/code_generator.h"
-        #include "vendor/imstudio/ims_buffer.h"
-        #include "vendor/imstudio/ims_generator.h"
-        #include "vendor/imstudio/ims_object.h"
+        #include "ims_buffer.h"
+        #include "ims_generator.h"
+        #include "ims_object.h"
         #include <sstream>
 
         extern ImStudio::BufferWindow g_Buffer;
@@ -419,8 +421,12 @@ jobs:
             vendor/imgui/imgui_draw.cpp
             vendor/imgui/imgui_tables.cpp
             vendor/imgui/imgui_widgets.cpp
+            vendor/imgui/misc/cpp/imgui_stdlib.cpp
         )
-        target_include_directories(imgui PUBLIC vendor/imgui)
+        target_include_directories(imgui PUBLIC
+            vendor/imgui
+            vendor/imgui/misc/cpp
+        )
 
         add_library(fmt INTERFACE)
         target_include_directories(fmt INTERFACE vendor/fmt/include)
@@ -446,12 +452,90 @@ jobs:
             src
             vendor/imstudio
             vendor/imgui
+            vendor/imgui/misc/cpp
         )
 
         find_library(log-lib log)
         target_link_libraries(imstudio_core imgui fmt ${log-lib})
         EOF
       shell: bash
+
+    # ============================================================
+    # 3.5. Patch known compilation issues (failsafe for existing repos)
+    # ============================================================
+    - name: Patch compilation issues
+      run: |
+        VD=android/app/src/main/cpp/vendor
+        SRC=android/app/src/main/cpp/src
+        CPP=android/app/src/main/cpp
+
+        echo "→ Fix 1: imgui_stdlib from misc/cpp/"
+        mkdir -p $VD/imgui/misc/cpp
+        cp -f /tmp/ImStudio/src/third-party/imgui/misc/cpp/imgui_stdlib.h   $VD/imgui/misc/cpp/
+        cp -f /tmp/ImStudio/src/third-party/imgui/misc/cpp/imgui_stdlib.cpp $VD/imgui/misc/cpp/
+        # Also flatten copies into imgui root so both include styles resolve
+        cp -f $VD/imgui/misc/cpp/imgui_stdlib.h   $VD/imgui/
+        cp -f $VD/imgui/misc/cpp/imgui_stdlib.cpp $VD/imgui/
+
+        echo "→ Fix 2: wrong include paths (vendor/imstudio/X → X)"
+        sed -i -E 's|#include "vendor/imstudio/([^"]+)"|#include "\1"|g' \
+            $SRC/engine/buffer_accessor.cpp \
+            $SRC/engine/code_generator.cpp
+
+        echo "→ Fix 3: static g_Buffer blocks extern in code_generator.cpp"
+        sed -i -E 's|^static ImStudio::BufferWindow g_Buffer;|ImStudio::BufferWindow g_Buffer;|' \
+            $SRC/engine/buffer_accessor.cpp
+
+        echo "→ Fix 4: force-update CMakeLists (imgui_stdlib + misc/cpp in -I)"
+        cat > $CPP/CMakeLists.txt <<'CMAKE'
+        cmake_minimum_required(VERSION 3.22)
+        project(imstudio_core)
+        set(CMAKE_CXX_STANDARD 17)
+
+        add_library(imgui STATIC
+            vendor/imgui/imgui.cpp
+            vendor/imgui/imgui_draw.cpp
+            vendor/imgui/imgui_tables.cpp
+            vendor/imgui/imgui_widgets.cpp
+            vendor/imgui/misc/cpp/imgui_stdlib.cpp
+        )
+        target_include_directories(imgui PUBLIC
+            vendor/imgui
+            vendor/imgui/misc/cpp
+        )
+
+        add_library(fmt INTERFACE)
+        target_include_directories(fmt INTERFACE vendor/fmt/include)
+        target_compile_definitions(fmt INTERFACE FMT_HEADER_ONLY=1)
+
+        set(IMS_SOURCES
+            vendor/imstudio/ims_generator.cpp
+            vendor/imstudio/ims_buffer.cpp
+        )
+        if(EXISTS ${CMAKE_CURRENT_SOURCE_DIR}/vendor/imstudio/ims_utils.cpp)
+            list(APPEND IMS_SOURCES vendor/imstudio/ims_utils.cpp)
+        endif()
+
+        add_library(imstudio_core SHARED
+            src/jni_bridge.cpp
+            src/engine/buffer_accessor.cpp
+            src/engine/code_generator.cpp
+            ${IMS_SOURCES}
+        )
+        target_compile_definitions(imstudio_core PRIVATE FMT_HEADER_ONLY=1)
+        target_include_directories(imstudio_core PRIVATE
+            include
+            src
+            vendor/imstudio
+            vendor/imgui
+            vendor/imgui/misc/cpp
+        )
+
+        find_library(log-lib log)
+        target_link_libraries(imstudio_core imgui fmt ${log-lib})
+        CMAKE
+
+        echo "✓ Patch applied"
 
     # ============================================================
     # 4. Gradle & Manifest
@@ -1262,6 +1346,10 @@ jobs:
         cp -f "$TMP"/ImStudio/src/third-party/imgui/imconfig.h "$VD/imgui/" 2>/dev/null || true
         cp -f "$TMP"/ImStudio/src/third-party/imgui/imstb_*.h  "$VD/imgui/" 2>/dev/null || true
 
+        mkdir -p "$VD/imgui/misc/cpp"
+        cp -f "$TMP"/ImStudio/src/third-party/imgui/misc/cpp/imgui_stdlib.h   "$VD/imgui/misc/cpp/" 2>/dev/null || true
+        cp -f "$TMP"/ImStudio/src/third-party/imgui/misc/cpp/imgui_stdlib.cpp "$VD/imgui/misc/cpp/" 2>/dev/null || true
+
         if [ -d "$TMP"/ImStudio/src/third-party/fmt/include/fmt ]; then
             mkdir -p "$VD/fmt/include/fmt"
             cp -f "$TMP"/ImStudio/src/third-party/fmt/include/fmt/*.h "$VD/fmt/include/fmt/"
@@ -1299,7 +1387,7 @@ jobs:
         GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
 
     # ============================================================
-    # 9. Build APK (اصلاح‌شده)
+    # 9. Build APK
     # ============================================================
     - name: Set up JDK 17
       uses: actions/setup-java@v4
@@ -1307,7 +1395,6 @@ jobs:
         distribution: 'temurin'
         java-version: '17'
 
-    # ★ اصلاح: حذف ndk-version و بستهٔ tools، و نصب NDK با sdkmanager
     - name: Set up Android SDK (without NDK)
       uses: android-actions/setup-android@v3
       with:
