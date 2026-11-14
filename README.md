@@ -1,3 +1,3 @@
 # ImStudio Android
 Native Android port of Raais/ImStudio with Jetpack Compose UI.
-Crash logs are saved to: `/storage/emulated/0/Android/data/com.raais.imstudio/files/crashes/`
+Crash logs: `/storage/emulated/0/Android/data/com.raais.imstudio/files/crashes/`

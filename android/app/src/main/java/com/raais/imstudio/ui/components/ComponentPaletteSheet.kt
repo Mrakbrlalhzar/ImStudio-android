@@ -15,12 +15,18 @@ import com.raais.imstudio.model.WidgetType
         LazyColumn(modifier = Modifier.fillMaxWidth().padding(horizontal = 16.dp),
             verticalArrangement = Arrangement.spacedBy(4.dp)) {
             WidgetCategory.entries.forEach { cat ->
-                item { Text(cat.displayName, style = MaterialTheme.typography.titleSmall,
-                    modifier = Modifier.padding(vertical = 8.dp)) }
-                items(WidgetType.entries.filter { it.category == cat }) { t ->
-                    ListItem(headlineContent = { Text(t.displayName) },
+                item(key = "hdr_${cat.name}") {
+                    Text(cat.displayName, style = MaterialTheme.typography.titleSmall,
+                        modifier = Modifier.padding(vertical = 8.dp))
+                }
+                items(WidgetType.entries.filter { it.category == cat },
+                    key = { "t_${it.name}" }) { t ->
+                    ListItem(
+                        headlineContent = { Text(t.displayName) },
                         supportingContent = { Text(t.nativeName) },
-                        trailingContent = { TextButton(onClick = { onSelect(t) }) { Text("افزودن") } })
+                        trailingContent = {
+                            TextButton(onClick = { onSelect(t) }) { Text("افزودن") }
+                        })
                 }
             }
         }

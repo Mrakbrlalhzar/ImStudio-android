@@ -1,5 +1,4 @@
 package com.raais.imstudio.engine
-
 import android.util.Log
 import androidx.compose.runtime.mutableStateListOf
 import androidx.compose.runtime.mutableStateOf
@@ -14,7 +13,7 @@ class ImStudioState {
 
     init {
         if (!NativeBridge.isLoaded) {
-            nativeError.value = "Native lib load failed: ${NativeBridge.loadError}"
+            nativeError.value = "Native lib not loaded: ${NativeBridge.loadError}"
             Log.e(TAG, nativeError.value!!)
         } else {
             try {
@@ -59,9 +58,5 @@ class ImStudioState {
     fun setValueS(id: Int, v: String) { runCatching { NativeBridge.setWidgetValueS(id, v) }; refresh() }
     fun generateCode(): String = try { NativeBridge.generateCode() } catch (t: Throwable) { "// error: ${t.message}" }
     fun selected(): Widget? = widgets.find { it.id == selectedId.value }
-
-    fun dispose() {
-        if (!NativeBridge.isLoaded) return
-        runCatching { NativeBridge.shutdown() }
-    }
+    fun dispose() { if (NativeBridge.isLoaded) runCatching { NativeBridge.shutdown() } }
 }

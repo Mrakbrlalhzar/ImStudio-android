@@ -1,6 +1,5 @@
 package com.raais.imstudio.model
 import androidx.compose.runtime.Immutable
-
 @Immutable
 data class Widget(
     val id: Int, val type: String, val label: String, val valueS: String,

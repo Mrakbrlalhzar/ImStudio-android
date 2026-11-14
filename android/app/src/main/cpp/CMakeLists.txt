@@ -2,12 +2,9 @@ cmake_minimum_required(VERSION 3.22)
 project(imstudio_core)
 set(CMAKE_CXX_STANDARD 17)
 
-# ★ Fix: define IM_ASSERT via a prepended header, not via -D (CMake drops function-style -D)
 set(IMASSERT_HDR "${CMAKE_CURRENT_BINARY_DIR}/imassert_override.h")
 file(WRITE "${IMASSERT_HDR}"
-    "#pragma once\n"
-    "#undef IM_ASSERT\n"
-    "#define IM_ASSERT(_EXPR) ((void)0)\n")
+    "#pragma once\n#undef IM_ASSERT\n#define IM_ASSERT(_EXPR) ((void)0)\n")
 
 add_library(imgui STATIC
     vendor/imgui/imgui.cpp

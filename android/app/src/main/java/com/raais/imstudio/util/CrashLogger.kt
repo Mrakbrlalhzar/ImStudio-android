@@ -1,5 +1,4 @@
 package com.raais.imstudio.util
-
 import android.content.Context
 import android.util.Log
 import com.raais.imstudio.NativeBridge
@@ -12,16 +11,12 @@ import java.util.Locale
 
 object CrashLogger {
     private const val TAG = "ImStudioCrash"
-
     fun crashDir(context: Context): File {
         val ext = context.getExternalFilesDir(null) ?: context.filesDir
         return File(ext, "crashes").apply { mkdirs() }
     }
-
     fun install(context: Context) {
         val dir = crashDir(context)
-
-        // 1) Java/Kotlin uncaught exceptions
         val def = Thread.getDefaultUncaughtExceptionHandler()
         Thread.setDefaultUncaughtExceptionHandler { thread, throwable ->
             try {
@@ -31,22 +26,16 @@ object CrashLogger {
                 throwable.printStackTrace(PrintWriter(sw))
                 f.writeText("Thread: ${thread.name}\nTime: ${Date()}\n\n$sw")
                 Log.e(TAG, "Java crash written: ${f.absolutePath}", throwable)
-            } catch (t: Throwable) {
-                Log.e(TAG, "Failed to write Java crash", t)
-            }
+            } catch (_: Throwable) {}
             def?.uncaughtException(thread, throwable)
         }
-
-        // 2) Native crashes (SIGSEGV, SIGABRT, ...) via JNI
         try {
             NativeBridge.initCrashHandler(dir.absolutePath)
-            Log.i(TAG, "Native crash handler installed. dir=${dir.absolutePath}")
+            Log.i(TAG, "Native crash handler installed: ${dir.absolutePath}")
         } catch (t: Throwable) {
-            Log.e(TAG, "Failed to install native crash handler", t)
+            Log.e(TAG, "native crash handler failed", t)
         }
     }
-
-    fun listCrashFiles(context: Context): List<File> {
-        return crashDir(context).listFiles()?.sortedByDescending { it.lastModified() } ?: emptyList()
-    }
+    fun listCrashFiles(context: Context): List<File> =
+        crashDir(context).listFiles()?.sortedByDescending { it.lastModified() } ?: emptyList()
 }
