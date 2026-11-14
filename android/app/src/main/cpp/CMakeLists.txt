@@ -1,51 +1,58 @@
 cmake_minimum_required(VERSION 3.22)
-project(imstudio_core)
+project(imgui_editor)
 set(CMAKE_CXX_STANDARD 17)
 
-set(IMASSERT_HDR "${CMAKE_CURRENT_BINARY_DIR}/imassert_override.h")
-file(WRITE "${IMASSERT_HDR}"
-    "#pragma once\n#undef IM_ASSERT\n#define IM_ASSERT(_EXPR) ((void)0)\n")
+# ---- Locate native_app_glue ----
+set(NATIVE_APP_GLUE_DIR "")
+foreach(candidate
+        "${ANDROID_NDK}/sources/android/native_app_glue"
+        "${CMAKE_ANDROID_NDK}/sources/android/native_app_glue"
+        "${ANDROID_NDK_ROOT}/sources/android/native_app_glue")
+    if(EXISTS "${candidate}/android_native_app_glue.c")
+        set(NATIVE_APP_GLUE_DIR "${candidate}")
+        message(STATUS "native_app_glue at ${candidate}")
+        break()
+    endif()
+endforeach()
+if(NOT NATIVE_APP_GLUE_DIR)
+    message(FATAL_ERROR "native_app_glue not found in NDK")
+endif()
+
+# ---- ImGui core + backends ----
+set(IMGUI_DIR "${CMAKE_CURRENT_SOURCE_DIR}/vendor/imgui")
 
 add_library(imgui STATIC
-    vendor/imgui/imgui.cpp
-    vendor/imgui/imgui_draw.cpp
-    vendor/imgui/imgui_tables.cpp
-    vendor/imgui/imgui_widgets.cpp
-    vendor/imgui/imgui_demo.cpp
-    vendor/imgui/misc/cpp/imgui_stdlib.cpp
+    ${IMGUI_DIR}/imgui.cpp
+    ${IMGUI_DIR}/imgui_draw.cpp
+    ${IMGUI_DIR}/imgui_tables.cpp
+    ${IMGUI_DIR}/imgui_widgets.cpp
+    ${IMGUI_DIR}/backends/imgui_impl_android.cpp
+    ${IMGUI_DIR}/backends/imgui_impl_opengl3.cpp
 )
-target_include_directories(imgui PUBLIC vendor/imgui vendor/imgui/misc/cpp)
-target_compile_options(imgui PUBLIC "-include" "${IMASSERT_HDR}")
-
-add_library(fmt INTERFACE)
-target_include_directories(fmt INTERFACE vendor/fmt/include)
-target_compile_definitions(fmt INTERFACE FMT_HEADER_ONLY=1)
-
-set(IMS_SOURCES
-    vendor/imstudio/ims_generator.cpp
-    vendor/imstudio/ims_buffer.cpp
-    vendor/imstudio/ims_object.cpp
+target_include_directories(imgui PUBLIC
+    ${IMGUI_DIR}
+    ${IMGUI_DIR}/backends
 )
-if(EXISTS ${CMAKE_CURRENT_SOURCE_DIR}/vendor/imstudio/ims_object_draw.cpp)
-    list(APPEND IMS_SOURCES vendor/imstudio/ims_object_draw.cpp)
-endif()
-if(EXISTS ${CMAKE_CURRENT_SOURCE_DIR}/vendor/imstudio/ims_utils.cpp)
-    list(APPEND IMS_SOURCES vendor/imstudio/ims_utils.cpp)
-endif()
 
-add_library(imstudio_core SHARED
-    src/jni_bridge.cpp
-    src/engine/buffer_accessor.cpp
-    src/engine/code_generator.cpp
-    src/engine/crash_handler.cpp
-    ${IMS_SOURCES}
+# ---- Our editor app ----
+add_library(imgui_editor SHARED
+    android_main.cpp
+    widget_model.cpp
+    ${NATIVE_APP_GLUE_DIR}/android_native_app_glue.c
 )
-target_compile_definitions(imstudio_core PRIVATE FMT_HEADER_ONLY=1)
-target_compile_options(imstudio_core PRIVATE "-include" "${IMASSERT_HDR}")
-target_include_directories(imstudio_core PRIVATE
-    include src
-    vendor/imstudio vendor/imgui vendor/imgui/misc/cpp
-    vendor/json)
+target_include_directories(imgui_editor PRIVATE
+    ${CMAKE_CURRENT_SOURCE_DIR}
+    ${NATIVE_APP_GLUE_DIR}
+)
 
 find_library(log-lib log)
-target_link_libraries(imstudio_core imgui fmt ${log-lib} dl)
+target_link_libraries(imgui_editor
+    imgui
+    android
+    EGL
+    GLESv3
+    ${log-lib}
+)
+
+# Force-keep ANativeActivity_onCreate
+target_link_options(imgui_editor PRIVATE "-u" "ANativeActivity_onCreate")

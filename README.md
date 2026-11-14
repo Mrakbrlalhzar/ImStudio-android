@@ -1,9 +1,15 @@
-# ImStudio Android
-Native Android port of Raais/ImStudio with Jetpack Compose UI.
+# ImGui Native Editor (Android)
 
-## Features
-- Import a folder of C++ files (.cpp/.h/etc.) — merges all ImGui widgets across files
-- Detailed per-file report: widgets found, unrecognized ImGui calls, non-ImGui lines, duplicate labels
-- Import single .cpp file
-- Save/Load project as JSON
-- Crash logs: `/storage/emulated/0/Android/data/com.raais.imstudio/files/crashes/`
+Stage 1+2: Native ImGui rendering on Android via NativeActivity + EGL.
+
+- Renders real ImGui widgets (100% accurate layout and appearance)
+- WidgetModel drives the rendering (not hardcoded)
+- Click any widget to select it
+- Inspector panel (built with ImGui itself) edits values live
+- Drag in Edit Mode to move widgets
+
+## Future stages
+- Stage 3: Import C++ files → populate WidgetModel
+- Stage 4: Full drag/select with handles
+- Stage 5: Inspector with all property types
+- Stage 6: Export back to C++ code
