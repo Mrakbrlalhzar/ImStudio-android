@@ -7,6 +7,7 @@ add_library(imgui STATIC
     vendor/imgui/imgui_draw.cpp
     vendor/imgui/imgui_tables.cpp
     vendor/imgui/imgui_widgets.cpp
+    vendor/imgui/imgui_demo.cpp
     vendor/imgui/misc/cpp/imgui_stdlib.cpp
 )
 target_include_directories(imgui PUBLIC
@@ -22,6 +23,9 @@ set(IMS_SOURCES
     vendor/imstudio/ims_generator.cpp
     vendor/imstudio/ims_buffer.cpp
 )
+if(EXISTS ${CMAKE_CURRENT_SOURCE_DIR}/vendor/imstudio/ims_object.cpp)
+    list(APPEND IMS_SOURCES vendor/imstudio/ims_object.cpp)
+endif()
 if(EXISTS ${CMAKE_CURRENT_SOURCE_DIR}/vendor/imstudio/ims_utils.cpp)
     list(APPEND IMS_SOURCES vendor/imstudio/ims_utils.cpp)
 endif()

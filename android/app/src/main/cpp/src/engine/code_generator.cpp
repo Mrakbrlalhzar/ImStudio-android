@@ -4,7 +4,7 @@
 #include "ims_object.h"
 #include <sstream>
 
-extern ImStudio::BufferWindow g_Buffer;  // defined in buffer_accessor.cpp
+namespace imstudio::engine { extern ImStudio::BufferWindow g_Buffer; }  // defined in buffer_accessor.cpp
 
 namespace imstudio::engine {
 
