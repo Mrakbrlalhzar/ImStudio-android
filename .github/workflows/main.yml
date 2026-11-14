@@ -1,0 +1,1111 @@
+name: Build ImStudio Android (Full Native Compose UI)
+
+on:
+  push:
+    branches: [ main ]
+  workflow_dispatch:
+
+jobs:
+  build-apk:
+    runs-on: ubuntu-latest
+    steps:
+    # ============================================================
+    # 1. Checkout ImStudio
+    # ============================================================
+    - name: Checkout ImStudio (real repository)
+      uses: actions/checkout@v4
+      with:
+        repository: Raais/ImStudio
+        path: ImStudio
+        submodules: recursive
+
+    - name: Set up JDK 17
+      uses: actions/setup-java@v4
+      with:
+        distribution: 'temurin'
+        java-version: '17'
+
+    - name: Set up Android SDK & NDK
+      uses: android-actions/setup-android@v3
+      with:
+        ndk-version: '26.1.10909125'
+
+    - name: Set up Gradle
+      uses: gradle/actions/setup-gradle@v3
+
+    # ============================================================
+    # 2. Gradle + Manifest
+    # ============================================================
+    - name: Create Gradle and Manifest files
+      run: |
+        mkdir -p android/app/src/main/java/com/raais/imstudio/{model,engine,ui}
+        mkdir -p android/app/src/main/cpp/ims
+
+        cat > android/settings.gradle.kts <<'EOF'
+        pluginManagement {
+            repositories { google(); mavenCentral(); gradlePluginPortal() }
+        }
+        dependencyResolutionManagement {
+            repositoriesMode.set(RepositoriesMode.FAIL_ON_PROJECT_REPOS)
+            repositories { google(); mavenCentral() }
+        }
+        rootProject.name = "ImStudioAndroid"
+        include(":app")
+        EOF
+
+        cat > android/build.gradle.kts <<'EOF'
+        plugins {
+            id("com.android.application") version "8.2.0" apply false
+            id("org.jetbrains.kotlin.android") version "1.9.22" apply false
+        }
+        EOF
+
+        cat > android/app/build.gradle.kts <<'EOF'
+        plugins {
+            id("com.android.application")
+            id("org.jetbrains.kotlin.android")
+        }
+
+        android {
+            namespace = "com.raais.imstudio"
+            compileSdk = 34
+            ndkVersion = "26.1.10909125"
+
+            defaultConfig {
+                applicationId = "com.raais.imstudio"
+                minSdk = 24
+                targetSdk = 34
+                versionCode = 1
+                versionName = "1.0"
+                externalNativeBuild {
+                    cmake {
+                        cppFlags += "-std=c++17 -fexceptions"
+                        arguments += "-DANDROID_STL=c++_shared"
+                    }
+                }
+                ndk { abiFilters += listOf("arm64-v8a", "armeabi-v7a") }
+            }
+            externalNativeBuild { cmake { path = file("src/main/cpp/CMakeLists.txt") } }
+            buildFeatures { compose = true }
+            composeOptions { kotlinCompilerExtensionVersion = "1.5.8" }
+            kotlinOptions { jvmTarget = "1.8" }
+            compileOptions {
+                sourceCompatibility = JavaVersion.VERSION_1_8
+                targetCompatibility = JavaVersion.VERSION_1_8
+            }
+        }
+
+        dependencies {
+            implementation(platform("androidx.compose:compose-bom:2024.02.00"))
+            implementation("androidx.compose.ui:ui")
+            implementation("androidx.compose.ui:ui-graphics")
+            implementation("androidx.compose.ui:ui-tooling-preview")
+            implementation("androidx.compose.material3:material3")
+            implementation("androidx.compose.material:material-icons-extended")
+            implementation("androidx.activity:activity-compose:1.8.2")
+            implementation("androidx.lifecycle:lifecycle-viewmodel-compose:2.7.0")
+            implementation("androidx.lifecycle:lifecycle-runtime-compose:2.7.0")
+        }
+        EOF
+
+        echo "android.useAndroidX=true" > android/gradle.properties
+        echo "android.nonTransitiveRClass=true" >> android/gradle.properties
+
+        cat > android/app/src/main/AndroidManifest.xml <<'EOF'
+        <?xml version="1.0" encoding="utf-8"?>
+        <manifest xmlns:android="http://schemas.android.com/apk/res/android">
+            <application
+                android:label="ImStudio"
+                android:theme="@android:style/Theme.Material.NoActionBar">
+                <activity
+                    android:name=".ui.MainActivity"
+                    android:exported="true"
+                    android:configChanges="orientation|keyboardHidden|screenSize">
+                    <intent-filter>
+                        <action android:name="android.intent.action.MAIN" />
+                        <category android:name="android.intent.category.LAUNCHER" />
+                    </intent-filter>
+                </activity>
+            </application>
+        </manifest>
+        EOF
+      shell: bash
+
+    # ============================================================
+    # 3. Copy real C++ sources + JNI + CMake
+    # ============================================================
+    - name: Copy real ImStudio sources and create JNI bridge
+      run: |
+        cp ImStudio/src/sources/ims_generator.cpp android/app/src/main/cpp/ims/
+        cp ImStudio/src/sources/ims_generator.h   android/app/src/main/cpp/ims/
+        cp ImStudio/src/sources/ims_buffer.cpp    android/app/src/main/cpp/ims/
+        cp ImStudio/src/sources/ims_buffer.h      android/app/src/main/cpp/ims/
+        cp ImStudio/src/sources/ims_object.h      android/app/src/main/cpp/ims/
+        cp ImStudio/src/utils/ims_utils.cpp       android/app/src/main/cpp/ims/ 2>/dev/null || true
+        cp ImStudio/src/utils/ims_utils.h         android/app/src/main/cpp/ims/ 2>/dev/null || true
+
+        cat > android/app/src/main/cpp/jni_bridge.cpp <<'EOF'
+        #include <jni.h>
+        #include <string>
+        #include <vector>
+        #include <android/log.h>
+        #include "ims/ims_buffer.h"
+        #include "ims/ims_generator.h"
+        #include "ims/ims_object.h"
+
+        #define LOG_TAG "ImStudioJNI"
+
+        static ImStudio::BufferWindow g_Buffer;
+
+        // Helper: find object by id
+        static ImStudio::Object* find_obj(int id) {
+            return g_Buffer.getobj(id);
+        }
+
+        extern "C" {
+
+        JNIEXPORT void JNICALL
+        Java_com_raais_imstudio_NativeBridge_initBuffer(JNIEnv*, jobject) {
+            g_Buffer.objects.clear();
+            g_Buffer.idgen = 0;
+            g_Buffer.selected_obj_id = -1;
+            g_Buffer.staticlayout = false;
+            g_Buffer.objects.reserve(2048);
+            __android_log_print(ANDROID_LOG_INFO, LOG_TAG, "Buffer initialized");
+        }
+
+        JNIEXPORT jint JNICALL
+        Java_com_raais_imstudio_NativeBridge_createWidget(
+            JNIEnv* env, jobject, jstring type) {
+            const char* cType = env->GetStringUTFChars(type, nullptr);
+            g_Buffer.create(std::string(cType), false);
+            env->ReleaseStringUTFChars(type, cType);
+            return g_Buffer.objects.empty() ? -1 : g_Buffer.objects.back().id;
+        }
+
+        JNIEXPORT void JNICALL
+        Java_com_raais_imstudio_NativeBridge_deleteWidget(JNIEnv*, jobject, jint id) {
+            ImStudio::Object* obj = find_obj(id);
+            if (obj) obj->del();
+        }
+
+        JNIEXPORT jint JNICALL
+        Java_com_raais_imstudio_NativeBridge_getWidgetCount(JNIEnv*, jobject) {
+            return (jint)g_Buffer.objects.size();
+        }
+
+        JNIEXPORT jint JNICALL
+        Java_com_raais_imstudio_NativeBridge_getWidgetId(JNIEnv*, jobject, jint index) {
+            if (index < 0 || index >= (int)g_Buffer.objects.size()) return -1;
+            return g_Buffer.objects[index].id;
+        }
+
+        JNIEXPORT jstring JNICALL
+        Java_com_raais_imstudio_NativeBridge_getWidgetType(JNIEnv* env, jobject, jint id) {
+            ImStudio::Object* obj = find_obj(id);
+            return env->NewStringUTF(obj ? obj->type.c_str() : "");
+        }
+
+        JNIEXPORT jstring JNICALL
+        Java_com_raais_imstudio_NativeBridge_getWidgetLabel(JNIEnv* env, jobject, jint id) {
+            ImStudio::Object* obj = find_obj(id);
+            return env->NewStringUTF(obj ? obj->label.c_str() : "");
+        }
+
+        JNIEXPORT jstring JNICALL
+        Java_com_raais_imstudio_NativeBridge_getWidgetValueS(JNIEnv* env, jobject, jint id) {
+            ImStudio::Object* obj = find_obj(id);
+            return env->NewStringUTF(obj ? obj->value_s.c_str() : "");
+        }
+
+        JNIEXPORT jfloat JNICALL
+        Java_com_raais_imstudio_NativeBridge_getWidgetX(JNIEnv*, jobject, jint id) {
+            ImStudio::Object* obj = find_obj(id);
+            return obj ? obj->pos.x : 0.0f;
+        }
+
+        JNIEXPORT jfloat JNICALL
+        Java_com_raais_imstudio_NativeBridge_getWidgetY(JNIEnv*, jobject, jint id) {
+            ImStudio::Object* obj = find_obj(id);
+            return obj ? obj->pos.y : 0.0f;
+        }
+
+        JNIEXPORT jfloat JNICALL
+        Java_com_raais_imstudio_NativeBridge_getWidgetSizeX(JNIEnv*, jobject, jint id) {
+            ImStudio::Object* obj = find_obj(id);
+            return obj ? obj->size.x : 0.0f;
+        }
+
+        JNIEXPORT jfloat JNICALL
+        Java_com_raais_imstudio_NativeBridge_getWidgetSizeY(JNIEnv*, jobject, jint id) {
+            ImStudio::Object* obj = find_obj(id);
+            return obj ? obj->size.y : 0.0f;
+        }
+
+        JNIEXPORT jfloat JNICALL
+        Java_com_raais_imstudio_NativeBridge_getWidgetWidth(JNIEnv*, jobject, jint id) {
+            ImStudio::Object* obj = find_obj(id);
+            return obj ? obj->width : 0.0f;
+        }
+
+        JNIEXPORT void JNICALL
+        Java_com_raais_imstudio_NativeBridge_setWidgetLabel(
+            JNIEnv* env, jobject, jint id, jstring value) {
+            ImStudio::Object* obj = find_obj(id);
+            if (!obj) return;
+            const char* cVal = env->GetStringUTFChars(value, nullptr);
+            obj->label = std::string(cVal);
+            env->ReleaseStringUTFChars(value, cVal);
+        }
+
+        JNIEXPORT void JNICALL
+        Java_com_raais_imstudio_NativeBridge_setWidgetValueS(
+            JNIEnv* env, jobject, jint id, jstring value) {
+            ImStudio::Object* obj = find_obj(id);
+            if (!obj) return;
+            const char* cVal = env->GetStringUTFChars(value, nullptr);
+            obj->value_s = std::string(cVal);
+            env->ReleaseStringUTFChars(value, cVal);
+        }
+
+        JNIEXPORT void JNICALL
+        Java_com_raais_imstudio_NativeBridge_moveWidget(
+            JNIEnv*, jobject, jint id, jfloat x, jfloat y) {
+            ImStudio::Object* obj = find_obj(id);
+            if (obj) { obj->pos.x = x; obj->pos.y = y; }
+        }
+
+        JNIEXPORT void JNICALL
+        Java_com_raais_imstudio_NativeBridge_resizeWidget(
+            JNIEnv*, jobject, jint id, jfloat sx, jfloat sy) {
+            ImStudio::Object* obj = find_obj(id);
+            if (obj) { obj->size.x = sx; obj->size.y = sy; }
+        }
+
+        JNIEXPORT void JNICALL
+        Java_com_raais_imstudio_NativeBridge_setWidgetWidth(
+            JNIEnv*, jobject, jint id, jfloat width) {
+            ImStudio::Object* obj = find_obj(id);
+            if (obj) obj->width = width;
+        }
+
+        JNIEXPORT jstring JNICALL
+        Java_com_raais_imstudio_NativeBridge_generateCode(JNIEnv* env, jobject) {
+            std::string fullCode;
+            fullCode += "// Generated by ImStudio (Android)\n";
+            fullCode += "// DO NOT EDIT — regenerate with ImStudio\n\n";
+            fullCode += "#include \"imgui.h\"\n\n";
+
+            // Forward-declare per-widget static state (checkbox, radio, combo, etc.)
+            for (auto& obj : g_Buffer.objects) {
+                if (obj.type == "checkbox") {
+                    fullCode += "static bool c1" + std::to_string(obj.id) + " = false;\n";
+                } else if (obj.type == "radio") {
+                    fullCode += "static bool r1" + std::to_string(obj.id) + " = false;\n";
+                } else if (obj.type == "combo" || obj.type == "listbox") {
+                    fullCode += "static const char* items" + std::to_string(obj.id) +
+                                "[] = { \"Item 1\", \"Item 2\", \"Item 3\" };\n";
+                } else if (obj.type == "sliderfloat" || obj.type == "dragfloat") {
+                    fullCode += "static float f1" + std::to_string(obj.id) + " = 0.0f;\n";
+                } else if (obj.type == "sliderint" || obj.type == "dragint") {
+                    fullCode += "static int i1" + std::to_string(obj.id) + " = 0;\n";
+                } else if (obj.type == "textinput") {
+                    fullCode += "static char buf" + std::to_string(obj.id) + "[128] = \"\";\n";
+                } else if (obj.type == "inputint") {
+                    fullCode += "static int in1" + std::to_string(obj.id) + " = 0;\n";
+                } else if (obj.type == "inputfloat") {
+                    fullCode += "static float inf1" + std::to_string(obj.id) + " = 0.0f;\n";
+                }
+            }
+            fullCode += "\nvoid RenderUI() {\n";
+
+            for (auto& obj : g_Buffer.objects) {
+                std::string snippet;
+                ImStudio::Recreate(obj, &snippet, g_Buffer.staticlayout);
+                fullCode += snippet;
+            }
+
+            fullCode += "}\n";
+            __android_log_print(ANDROID_LOG_INFO, LOG_TAG,
+                                "Generated %d widgets -> %zu bytes",
+                                (int)g_Buffer.objects.size(), fullCode.size());
+            return env->NewStringUTF(fullCode.c_str());
+        }
+
+        } // extern "C"
+        EOF
+
+        cat > android/app/src/main/cpp/CMakeLists.txt <<'EOF'
+        cmake_minimum_required(VERSION 3.22)
+        project(imstudio_core)
+        set(CMAKE_CXX_STANDARD 17)
+
+        set(IMSTUDIO_ROOT "${CMAKE_CURRENT_SOURCE_DIR}/../../../../ImStudio")
+        set(IMGUI_DIR "${IMSTUDIO_ROOT}/src/third-party/imgui")
+
+        # ---- ImGui core (no backends) ----
+        add_library(imgui_core STATIC
+            ${IMGUI_DIR}/imgui.cpp
+            ${IMGUI_DIR}/imgui_draw.cpp
+            ${IMGUI_DIR}/imgui_tables.cpp
+            ${IMGUI_DIR}/imgui_widgets.cpp
+        )
+        target_include_directories(imgui_core PUBLIC ${IMGUI_DIR})
+
+        # ---- fmt (header-only) ----
+        add_library(fmt INTERFACE)
+        target_include_directories(fmt INTERFACE ${IMSTUDIO_ROOT}/src/third-party/fmt/include)
+        target_compile_definitions(fmt INTERFACE FMT_HEADER_ONLY=1)
+
+        # ---- ImStudio core ----
+        add_library(imstudio_core SHARED
+            ims/ims_generator.cpp
+            ims/ims_buffer.cpp
+            jni_bridge.cpp
+        )
+        if(EXISTS ${CMAKE_CURRENT_SOURCE_DIR}/ims/ims_utils.cpp)
+            target_sources(imstudio_core PRIVATE ims/ims_utils.cpp)
+        endif()
+
+        target_compile_definitions(imstudio_core PRIVATE FMT_HEADER_ONLY=1)
+        target_include_directories(imstudio_core PRIVATE
+            ${CMAKE_CURRENT_SOURCE_DIR}
+            ${IMSTUDIO_ROOT}/src
+            ${IMSTUDIO_ROOT}/src/sources
+            ${IMSTUDIO_ROOT}/src/utils
+            ${IMGUI_DIR}
+        )
+
+        find_library(log-lib log)
+        target_link_libraries(imstudio_core imgui_core fmt ${log-lib})
+        EOF
+      shell: bash
+
+    # ============================================================
+    # 4. Kotlin models + NativeBridge
+    # ============================================================
+    - name: Create Kotlin models and native bridge
+      run: |
+        cat > android/app/src/main/java/com/raais/imstudio/NativeBridge.kt <<'EOF'
+        package com.raais.imstudio
+
+        object NativeBridge {
+            init { System.loadLibrary("imstudio_core") }
+
+            external fun initBuffer()
+            external fun createWidget(type: String): Int
+            external fun deleteWidget(id: Int)
+            external fun getWidgetCount(): Int
+            external fun getWidgetId(index: Int): Int
+            external fun getWidgetType(id: Int): String
+            external fun getWidgetLabel(id: Int): String
+            external fun getWidgetValueS(id: Int): String
+            external fun getWidgetX(id: Int): Float
+            external fun getWidgetY(id: Int): Float
+            external fun getWidgetSizeX(id: Int): Float
+            external fun getWidgetSizeY(id: Int): Float
+            external fun getWidgetWidth(id: Int): Float
+            external fun setWidgetLabel(id: Int, value: String)
+            external fun setWidgetValueS(id: Int, value: String)
+            external fun moveWidget(id: Int, x: Float, y: Float)
+            external fun resizeWidget(id: Int, sx: Float, sy: Float)
+            external fun setWidgetWidth(id: Int, width: Float)
+            external fun generateCode(): String
+        }
+        EOF
+
+        cat > android/app/src/main/java/com/raais/imstudio/model/Widget.kt <<'EOF'
+        package com.raais.imstudio.model
+
+        import androidx.compose.runtime.Immutable
+
+        @Immutable
+        data class Widget(
+            val id: Int,
+            val type: String,
+            val label: String,
+            val valueS: String,
+            val x: Float,
+            val y: Float,
+            val sizeX: Float,
+            val sizeY: Float,
+            val width: Float
+        ) {
+            val displayText: String
+                get() = when {
+                    valueS.isNotBlank() -> valueS
+                    label.isNotBlank() -> label
+                    else -> type
+                }
+        }
+        EOF
+
+        cat > android/app/src/main/java/com/raais/imstudio/model/WidgetType.kt <<'EOF'
+        package com.raais.imstudio.model
+
+        enum class WidgetCategory(val displayName: String) {
+            Primitives("ابزارهای پایه"),
+            DataInputs("ورودی داده"),
+            Layout("چیدمان")
+        }
+
+        enum class WidgetType(
+            val displayName: String,
+            val nativeName: String,
+            val category: WidgetCategory
+        ) {
+            Button("دکمه", "button", WidgetCategory.Primitives),
+            Radio("رادیو", "radio", WidgetCategory.Primitives),
+            Checkbox("چک‌باکس", "checkbox", WidgetCategory.Primitives),
+            Text("متن", "text", WidgetCategory.Primitives),
+            Combo("کمبوباکس", "combo", WidgetCategory.Primitives),
+            ListBox("لیست‌باکس", "listbox", WidgetCategory.Primitives),
+
+            TextInput("ورودی متنی", "textinput", WidgetCategory.DataInputs),
+            InputInt("ورودی صحیح", "inputint", WidgetCategory.DataInputs),
+            InputFloat("ورودی اعشاری", "inputfloat", WidgetCategory.DataInputs),
+            DragFloat("درگ اعشاری", "dragfloat", WidgetCategory.DataInputs),
+            SliderFloat("اسلایدر اعشاری", "sliderfloat", WidgetCategory.DataInputs),
+
+            Separator("جداکننده", "separator", WidgetCategory.Layout),
+            Spacing("فاصله", "spacing", WidgetCategory.Layout)
+        }
+        EOF
+      shell: bash
+
+    # ============================================================
+    # 5. State + ViewModel
+    # ============================================================
+    - name: Create state and ViewModel
+      run: |
+        cat > android/app/src/main/java/com/raais/imstudio/engine/ImStudioState.kt <<'EOF'
+        package com.raais.imstudio.engine
+
+        import androidx.compose.runtime.mutableStateListOf
+        import androidx.compose.runtime.mutableStateOf
+        import com.raais.imstudio.NativeBridge
+        import com.raais.imstudio.model.Widget
+
+        class ImStudioState {
+            val widgets = mutableStateListOf<Widget>()
+            val selectedId = mutableStateOf<Int?>(null)
+
+            init { NativeBridge.initBuffer() }
+
+            fun refresh() {
+                val count = NativeBridge.getWidgetCount()
+                val list = ArrayList<Widget>(count)
+                for (i in 0 until count) {
+                    val id = NativeBridge.getWidgetId(i)
+                    if (id < 0) continue
+                    list.add(
+                        Widget(
+                            id = id,
+                            type = NativeBridge.getWidgetType(id),
+                            label = NativeBridge.getWidgetLabel(id),
+                            valueS = NativeBridge.getWidgetValueS(id),
+                            x = NativeBridge.getWidgetX(id),
+                            y = NativeBridge.getWidgetY(id),
+                            sizeX = NativeBridge.getWidgetSizeX(id),
+                            sizeY = NativeBridge.getWidgetSizeY(id),
+                            width = NativeBridge.getWidgetWidth(id)
+                        )
+                    )
+                }
+                widgets.clear()
+                widgets.addAll(list)
+                if (selectedId.value != null && widgets.none { it.id == selectedId.value }) {
+                    selectedId.value = null
+                }
+            }
+
+            fun addWidget(nativeName: String) {
+                val id = NativeBridge.createWidget(nativeName)
+                refresh()
+                if (id >= 0) selectedId.value = id
+            }
+
+            fun deleteWidget(id: Int) {
+                NativeBridge.deleteWidget(id)
+                refresh()
+                if (selectedId.value == id) selectedId.value = null
+            }
+
+            fun moveWidget(id: Int, x: Float, y: Float) {
+                NativeBridge.moveWidget(id, x, y)
+                refresh()
+            }
+
+            fun resizeWidget(id: Int, sx: Float, sy: Float) {
+                NativeBridge.resizeWidget(id, sx, sy)
+                refresh()
+            }
+
+            fun setLabel(id: Int, v: String) {
+                NativeBridge.setWidgetLabel(id, v)
+                refresh()
+            }
+
+            fun setValueS(id: Int, v: String) {
+                NativeBridge.setWidgetValueS(id, v)
+                refresh()
+            }
+
+            fun generateCode(): String = NativeBridge.generateCode()
+
+            fun selected(): Widget? = widgets.find { it.id == selectedId.value }
+        }
+        EOF
+
+        cat > android/app/src/main/java/com/raais/imstudio/engine/EditorViewModel.kt <<'EOF'
+        package com.raais.imstudio.engine
+
+        import androidx.lifecycle.ViewModel
+        import com.raais.imstudio.model.WidgetType
+
+        class EditorViewModel : ViewModel() {
+            val state = ImStudioState()
+
+            fun refresh() = state.refresh()
+            fun select(id: Int?) { state.selectedId.value = id }
+            fun addWidget(type: WidgetType) = state.addWidget(type.nativeName)
+            fun deleteSelected() { state.selectedId.value?.let { state.deleteWidget(it) } }
+            fun generateCode(): String = state.generateCode()
+        }
+        EOF
+      shell: bash
+
+    # ============================================================
+    # 6. Compose UI (کامل)
+    # ============================================================
+    - name: Create full Compose UI
+      run: |
+        cat > android/app/src/main/java/com/raais/imstudio/ui/MainActivity.kt <<'EOF'
+        package com.raais.imstudio.ui
+
+        import android.os.Bundle
+        import androidx.activity.ComponentActivity
+        import androidx.activity.compose.setContent
+        import androidx.activity.viewModels
+        import com.raais.imstudio.engine.EditorViewModel
+
+        class MainActivity : ComponentActivity() {
+            private val vm: EditorViewModel by viewModels()
+            override fun onCreate(savedInstanceState: Bundle?) {
+                super.onCreate(savedInstanceState)
+                setContent { ImStudioTheme { EditorScreen(vm) } }
+            }
+        }
+        EOF
+
+        cat > android/app/src/main/java/com/raais/imstudio/ui/Theme.kt <<'EOF'
+        package com.raais.imstudio.ui
+
+        import androidx.compose.material3.MaterialTheme
+        import androidx.compose.material3.darkColorScheme
+        import androidx.compose.runtime.Composable
+        import androidx.compose.ui.graphics.Color
+
+        private val DarkColors = darkColorScheme(
+            primary = Color(0xFF4A90D9),
+            onPrimary = Color.White,
+            secondary = Color(0xFF6DB3F2),
+            background = Color(0xFF121212),
+            surface = Color(0xFF1E1E1E),
+            surfaceVariant = Color(0xFF2C2C2C),
+            onSurface = Color(0xFFE0E0E0),
+            onSurfaceVariant = Color(0xFFB0B0B0),
+            error = Color(0xFFCF6679)
+        )
+
+        @Composable
+        fun ImStudioTheme(content: @Composable () -> Unit) {
+            MaterialTheme(colorScheme = DarkColors, content = content)
+        }
+        EOF
+
+        cat > android/app/src/main/java/com/raais/imstudio/ui/EditorScreen.kt <<'EOF'
+        package com.raais.imstudio.ui
+
+        import androidx.compose.foundation.layout.*
+        import androidx.compose.material3.*
+        import androidx.compose.runtime.*
+        import androidx.compose.ui.Modifier
+        import androidx.compose.ui.unit.dp
+        import com.raais.imstudio.engine.EditorViewModel
+        import com.raais.imstudio.model.WidgetType
+
+        @OptIn(ExperimentalMaterial3Api::class)
+        @Composable
+        fun EditorScreen(vm: EditorViewModel) {
+            val state = vm.state
+            var showCode by remember { mutableStateOf(false) }
+            var showPalette by remember { mutableStateOf(false) }
+            var pendingDelete by remember { mutableStateOf<Int?>(null) }
+
+            LaunchedEffect(Unit) { vm.refresh() }
+
+            Scaffold(
+                topBar = {
+                    TopAppBar(
+                        title = { Text("ImStudio") },
+                        actions = {
+                            IconButton(onClick = { showCode = true }) {
+                                Icon(
+                                    androidx.compose.material.icons.Icons.Default.Code,
+                                    contentDescription = "تولید کد"
+                                )
+                            }
+                        }
+                    )
+                },
+                floatingActionButton = {
+                    FloatingActionButton(onClick = { showPalette = true }) {
+                        Icon(
+                            androidx.compose.material.icons.Icons.Default.Add,
+                            contentDescription = "افزودن ویجت"
+                        )
+                    }
+                }
+            ) { padding ->
+                Row(modifier = Modifier.padding(padding).fillMaxSize()) {
+                    Box(modifier = Modifier.weight(0.62f).fillMaxHeight()) {
+                        DesignCanvas(
+                            state = state,
+                            onSelect = { vm.select(it) },
+                            onLongPress = { pendingDelete = it }
+                        )
+                    }
+                    Box(modifier = Modifier.weight(0.38f).fillMaxHeight()) {
+                        PropertiesPanel(state = state, vm = vm)
+                    }
+                }
+            }
+
+            if (showPalette) {
+                ComponentPaletteSheet(
+                    onSelect = { type: WidgetType ->
+                        vm.addWidget(type)
+                        showPalette = false
+                    },
+                    onDismiss = { showPalette = false }
+                )
+            }
+
+            if (showCode) {
+                CodeDialog(code = vm.generateCode(), onDismiss = { showCode = false })
+            }
+
+            pendingDelete?.let { id ->
+                AlertDialog(
+                    onDismissRequest = { pendingDelete = null },
+                    title = { Text("حذف ویجت") },
+                    text = { Text("آیا از حذف ویجت ${id} مطمئن هستید؟") },
+                    confirmButton = {
+                        TextButton(onClick = {
+                            state.deleteWidget(id)
+                            pendingDelete = null
+                        }) { Text("حذف") }
+                    },
+                    dismissButton = {
+                        TextButton(onClick = { pendingDelete = null }) { Text("لغو") }
+                    }
+                )
+            }
+        }
+        EOF
+
+        cat > android/app/src/main/java/com/raais/imstudio/ui/DesignCanvas.kt <<'EOF'
+        package com.raais.imstudio.ui
+
+        import androidx.compose.foundation.background
+        import androidx.compose.foundation.gestures.detectDragGestures
+        import androidx.compose.foundation.gestures.detectTapGestures
+        import androidx.compose.foundation.layout.*
+        import androidx.compose.foundation.shape.RoundedCornerShape
+        import androidx.compose.material3.Text
+        import androidx.compose.runtime.*
+        import androidx.compose.ui.Alignment
+        import androidx.compose.ui.Modifier
+        import androidx.compose.ui.draw.clip
+        import androidx.compose.ui.geometry.Offset
+        import androidx.compose.ui.geometry.Size
+        import androidx.compose.ui.graphics.Color
+        import androidx.compose.ui.graphics.drawscope.DrawScope
+        import androidx.compose.ui.graphics.drawscope.Stroke
+        import androidx.compose.ui.input.pointer.pointerInput
+        import androidx.compose.ui.text.style.TextOverflow
+        import androidx.compose.ui.unit.dp
+        import com.raais.imstudio.engine.ImStudioState
+        import com.raais.imstudio.model.Widget
+
+        @Composable
+        fun DesignCanvas(
+            state: ImStudioState,
+            onSelect: (Int?) -> Unit,
+            onLongPress: (Int) -> Unit
+        ) {
+            Box(
+                modifier = Modifier
+                    .fillMaxSize()
+                    .background(Color(0xFF121212))
+                    .pointerInput(Unit) {
+                        detectTapGestures(onTap = { onSelect(null) })
+                    }
+            ) {
+                // Grid background
+                androidx.compose.foundation.Canvas(modifier = Modifier.fillMaxSize()) {
+                    drawGrid(Color(0xFF1F1F1F), 24f)
+                }
+
+                state.widgets.forEach { widget ->
+                    WidgetItem(
+                        widget = widget,
+                        isSelected = state.selectedId.value == widget.id,
+                        onSelect = { onSelect(widget.id) },
+                        onLongPress = { onLongPress(widget.id) },
+                        onMove = { dx, dy ->
+                            state.moveWidget(widget.id, widget.x + dx, widget.y + dy)
+                        }
+                    )
+                }
+            }
+        }
+
+        private fun DrawScope.drawGrid(color: Color, step: Float) {
+            var x = 0f
+            while (x < size.width) {
+                drawLine(color, Offset(x, 0f), Offset(x, size.height), strokeWidth = 1f)
+                x += step
+            }
+            var y = 0f
+            while (y < size.height) {
+                drawLine(color, Offset(0f, y), Offset(size.width, y), strokeWidth = 1f)
+                y += step
+            }
+        }
+
+        @Composable
+        private fun WidgetItem(
+            widget: Widget,
+            isSelected: Boolean,
+            onSelect: () -> Unit,
+            onLongPress: () -> Unit,
+            onMove: (Float, Float) -> Unit
+        ) {
+            var dragOffset by remember(widget.id) { mutableStateOf(Offset.Zero) }
+            val w = if (widget.sizeX > 0f) widget.sizeX.dp else widget.width.dp
+            val h = if (widget.sizeY > 0f) widget.sizeY.dp else 36.dp
+
+            Box(
+                modifier = Modifier
+                    .offset(
+                        x = (widget.x + dragOffset.x).dp,
+                        y = (widget.y + dragOffset.y).dp
+                    )
+                    .size(width = w, height = h)
+                    .clip(RoundedCornerShape(6.dp))
+                    .background(
+                        if (isSelected) Color(0xFF4A90D9) else Color(0xFF2C2C2C)
+                    )
+                    .pointerInput(widget.id) {
+                        detectDragGestures(
+                            onDragStart = { onSelect() },
+                            onDrag = { change, drag ->
+                                change.consume()
+                                dragOffset += drag
+                            },
+                            onDragEnd = {
+                                onMove(dragOffset.x, dragOffset.y)
+                                dragOffset = Offset.Zero
+                            }
+                        )
+                    }
+                    .pointerInput(widget.id) {
+                        detectTapGestures(onLongPress = { onLongPress() })
+                    },
+                contentAlignment = Alignment.Center
+            ) {
+                Text(
+                    text = widget.displayText,
+                    color = Color(0xFFE0E0E0),
+                    maxLines = 1,
+                    overflow = TextOverflow.Ellipsis,
+                    modifier = Modifier.padding(horizontal = 8.dp)
+                )
+
+                if (isSelected) {
+                    androidx.compose.foundation.Canvas(
+                        modifier = Modifier.matchParentSize()
+                    ) {
+                        drawRect(
+                            color = Color(0xFF6DB3F2),
+                            size = Size(size.width, size.height),
+                            style = Stroke(width = 3f)
+                        )
+                    }
+                }
+            }
+        }
+        EOF
+
+        cat > android/app/src/main/java/com/raais/imstudio/ui/PropertiesPanel.kt <<'EOF'
+        package com.raais.imstudio.ui
+
+        import androidx.compose.foundation.background
+        import androidx.compose.foundation.layout.*
+        import androidx.compose.foundation.rememberScrollState
+        import androidx.compose.foundation.verticalScroll
+        import androidx.compose.material3.*
+        import androidx.compose.runtime.Composable
+        import androidx.compose.ui.Modifier
+        import androidx.compose.ui.unit.dp
+        import com.raais.imstudio.engine.EditorViewModel
+        import com.raais.imstudio.engine.ImStudioState
+
+        @Composable
+        fun PropertiesPanel(state: ImStudioState, vm: EditorViewModel) {
+            val selected = state.selected()
+
+            Column(
+                modifier = Modifier
+                    .fillMaxHeight()
+                    .background(MaterialTheme.colorScheme.surface)
+                    .verticalScroll(rememberScrollState())
+                    .padding(16.dp),
+                verticalArrangement = Arrangement.spacedBy(12.dp)
+            ) {
+                Text("ویژگی‌ها", style = MaterialTheme.typography.titleMedium)
+
+                if (selected == null) {
+                    Text(
+                        "یک ویجت را روی بوم انتخاب کنید",
+                        color = MaterialTheme.colorScheme.onSurfaceVariant
+                    )
+                    return
+                }
+
+                OutlinedTextField(
+                    value = selected.label,
+                    onValueChange = { state.setLabel(selected.id, it) },
+                    label = { Text("Label") },
+                    modifier = Modifier.fillMaxWidth(),
+                    singleLine = true
+                )
+
+                OutlinedTextField(
+                    value = selected.valueS,
+                    onValueChange = { state.setValueS(selected.id, it) },
+                    label = { Text("Value (value_s)") },
+                    modifier = Modifier.fillMaxWidth(),
+                    singleLine = true
+                )
+
+                Row(horizontalArrangement = Arrangement.spacedBy(8.dp)) {
+                    NumField(
+                        value = selected.x,
+                        label = "X",
+                        onChange = { state.moveWidget(selected.id, it, selected.y) },
+                        modifier = Modifier.weight(1f)
+                    )
+                    NumField(
+                        value = selected.y,
+                        label = "Y",
+                        onChange = { state.moveWidget(selected.id, selected.x, it) },
+                        modifier = Modifier.weight(1f)
+                    )
+                }
+
+                Row(horizontalArrangement = Arrangement.spacedBy(8.dp)) {
+                    NumField(
+                        value = selected.sizeX,
+                        label = "Size X",
+                        onChange = { state.resizeWidget(selected.id, it, selected.sizeY) },
+                        modifier = Modifier.weight(1f)
+                    )
+                    NumField(
+                        value = selected.sizeY,
+                        label = "Size Y",
+                        onChange = { state.resizeWidget(selected.id, selected.sizeX, it) },
+                        modifier = Modifier.weight(1f)
+                    )
+                }
+
+                OutlinedTextField(
+                    value = selected.type,
+                    onValueChange = {},
+                    enabled = false,
+                    label = { Text("Type") },
+                    modifier = Modifier.fillMaxWidth()
+                )
+
+                HorizontalDivider()
+
+                Button(
+                    onClick = { state.deleteWidget(selected.id) },
+                    colors = ButtonDefaults.buttonColors(
+                        containerColor = MaterialTheme.colorScheme.error
+                    ),
+                    modifier = Modifier.fillMaxWidth()
+                ) {
+                    Text("حذف ویجت")
+                }
+            }
+        }
+
+        @Composable
+        private fun NumField(
+            value: Float,
+            label: String,
+            onChange: (Float) -> Unit,
+            modifier: Modifier = Modifier
+        ) {
+            OutlinedTextField(
+                value = value.toString(),
+                onValueChange = { it.toFloatOrNull()?.let(onChange) },
+                label = { Text(label) },
+                modifier = modifier,
+                singleLine = true
+            )
+        }
+        EOF
+
+        cat > android/app/src/main/java/com/raais/imstudio/ui/ComponentPaletteSheet.kt <<'EOF'
+        package com.raais.imstudio.ui
+
+        import androidx.compose.foundation.layout.*
+        import androidx.compose.foundation.lazy.LazyColumn
+        import androidx.compose.foundation.lazy.items
+        import androidx.compose.material3.*
+        import androidx.compose.runtime.Composable
+        import androidx.compose.ui.Modifier
+        import androidx.compose.ui.unit.dp
+        import com.raais.imstudio.model.WidgetCategory
+        import com.raais.imstudio.model.WidgetType
+
+        @OptIn(ExperimentalMaterial3Api::class)
+        @Composable
+        fun ComponentPaletteSheet(
+            onSelect: (WidgetType) -> Unit,
+            onDismiss: () -> Unit
+        ) {
+            ModalBottomSheet(onDismissRequest = onDismiss) {
+                LazyColumn(
+                    modifier = Modifier
+                        .fillMaxWidth()
+                        .padding(horizontal = 16.dp),
+                    verticalArrangement = Arrangement.spacedBy(4.dp)
+                ) {
+                    WidgetCategory.entries.forEach { category ->
+                        item {
+                            Text(
+                                category.displayName,
+                                style = MaterialTheme.typography.titleSmall,
+                                modifier = Modifier.padding(vertical = 8.dp)
+                            )
+                        }
+                        val typesInCategory = WidgetType.entries.filter { it.category == category }
+                        items(typesInCategory) { type ->
+                            ListItem(
+                                headlineContent = { Text(type.displayName) },
+                                supportingContent = { Text(type.nativeName) },
+                                modifier = Modifier.fillMaxWidth(),
+                                colors = ListItemDefaults.colors()
+                            ) {
+                                TextButton(onClick = { onSelect(type) }) { Text("افزودن") }
+                            }
+                        }
+                    }
+                }
+            }
+        }
+        EOF
+
+        cat > android/app/src/main/java/com/raais/imstudio/ui/CodeDialog.kt <<'EOF'
+        package com.raais.imstudio.ui
+
+        import android.content.ClipData
+        import android.content.ClipboardManager
+        import android.content.Context
+        import androidx.compose.foundation.horizontalScroll
+        import androidx.compose.foundation.layout.*
+        import androidx.compose.foundation.rememberScrollState
+        import androidx.compose.foundation.verticalScroll
+        import androidx.compose.material.icons.Icons
+        import androidx.compose.material.icons.filled.ContentCopy
+        import androidx.compose.material3.*
+        import androidx.compose.runtime.Composable
+        import androidx.compose.ui.Modifier
+        import androidx.compose.ui.platform.LocalContext
+        import androidx.compose.ui.text.font.FontFamily
+        import androidx.compose.ui.unit.dp
+        import androidx.compose.ui.unit.sp
+        import androidx.compose.ui.window.Dialog
+
+        @Composable
+        fun CodeDialog(code: String, onDismiss: () -> Unit) {
+            val ctx = LocalContext.current
+            Dialog(onDismissRequest = onDismiss) {
+                Surface(
+                    shape = MaterialTheme.shapes.large,
+                    color = MaterialTheme.colorScheme.surface
+                ) {
+                    Column(modifier = Modifier.padding(16.dp)) {
+                        Text("کد تولیدشده", style = MaterialTheme.typography.titleLarge)
+
+                        Spacer(Modifier.height(12.dp))
+
+                        Box(
+                            modifier = Modifier
+                                .weight(1f, fill = false)
+                                .heightIn(max = 420.dp)
+                                .horizontalScroll(rememberScrollState())
+                                .verticalScroll(rememberScrollState())
+                        ) {
+                            Text(
+                                text = code,
+                                fontFamily = FontFamily.Monospace,
+                                fontSize = 12.sp,
+                                color = MaterialTheme.colorScheme.onSurface
+                            )
+                        }
+
+                        Spacer(Modifier.height(12.dp))
+
+                        Row(
+                            horizontalArrangement = Arrangement.End,
+                            modifier = Modifier.fillMaxWidth()
+                        ) {
+                            TextButton(onClick = {
+                                val cm = ctx.getSystemService(Context.CLIPBOARD_SERVICE) as ClipboardManager
+                                cm.setPrimaryClip(ClipData.newPlainText("ImStudio code", code))
+                            }) {
+                                Icon(Icons.Default.ContentCopy, contentDescription = null)
+                                Spacer(Modifier.width(4.dp))
+                                Text("کپی")
+                            }
+                            Spacer(Modifier.width(8.dp))
+                            TextButton(onClick = onDismiss) { Text("بستن") }
+                        }
+                    }
+                }
+            }
+        }
+        EOF
+      shell: bash
+
+    # ============================================================
+    # 7. Build APK
+    # ============================================================
+    - name: Build APK
+      run: |
+        cd android
+        gradle wrapper --gradle-version 8.4
+        ./gradlew assembleDebug --no-daemon
+
+    - name: Upload APK
+      uses: actions/upload-artifact@v4
+      with:
+        name: ImStudio-Android-full-compose
+        path: android/app/build/outputs/apk/debug/*.apk
+        if-no-files-found: error
