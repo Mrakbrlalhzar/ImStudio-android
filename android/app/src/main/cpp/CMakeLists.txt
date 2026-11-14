@@ -14,6 +14,7 @@ target_include_directories(imgui PUBLIC
     vendor/imgui
     vendor/imgui/misc/cpp
 )
+target_compile_definitions(imgui PUBLIC "IM_ASSERT(_EXPR)=((void)0)")
 
 add_library(fmt INTERFACE)
 target_include_directories(fmt INTERFACE vendor/fmt/include)
