@@ -8,7 +8,6 @@ import java.io.StringWriter
 import java.text.SimpleDateFormat
 import java.util.Date
 import java.util.Locale
-
 object CrashLogger {
     private const val TAG = "ImStudioCrash"
     fun crashDir(context: Context): File {
@@ -22,19 +21,12 @@ object CrashLogger {
             try {
                 val ts = SimpleDateFormat("yyyyMMdd_HHmmss", Locale.US).format(Date())
                 val f = File(dir, "java_crash_${ts}.log")
-                val sw = StringWriter()
-                throwable.printStackTrace(PrintWriter(sw))
+                val sw = StringWriter(); throwable.printStackTrace(PrintWriter(sw))
                 f.writeText("Thread: ${thread.name}\nTime: ${Date()}\n\n$sw")
-                Log.e(TAG, "Java crash written: ${f.absolutePath}", throwable)
             } catch (_: Throwable) {}
             def?.uncaughtException(thread, throwable)
         }
-        try {
-            NativeBridge.initCrashHandler(dir.absolutePath)
-            Log.i(TAG, "Native crash handler installed: ${dir.absolutePath}")
-        } catch (t: Throwable) {
-            Log.e(TAG, "native crash handler failed", t)
-        }
+        try { NativeBridge.initCrashHandler(dir.absolutePath) } catch (_: Throwable) {}
     }
     fun listCrashFiles(context: Context): List<File> =
         crashDir(context).listFiles()?.sortedByDescending { it.lastModified() } ?: emptyList()

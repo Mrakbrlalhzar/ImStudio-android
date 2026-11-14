@@ -25,20 +25,44 @@ static void throw_runtime(JNIEnv* env, const char* msg) {
 
 extern "C" {
 JNIEXPORT jint JNI_OnLoad(JavaVM*, void*) {
-    LOGI("========== JNI_OnLoad ==========");
-    try { imstudio::engine::init(); LOGI("JNI_OnLoad init OK"); }
-    catch (const std::exception& e) { LOGE("JNI_OnLoad init FAILED: %s", e.what()); }
-    catch (...) { LOGE("JNI_OnLoad init FAILED (unknown)"); }
+    try { imstudio::engine::init(); } catch (...) {}
     return JNI_VERSION_1_6;
 }
 JNIEXPORT void JNI_OnUnload(JavaVM*, void*) {
     try { imstudio::engine::shutdown(); } catch (...) {}
 }
 JNIEXPORT void JNICALL Java_com_raais_imstudio_NativeBridge_initBuffer(JNIEnv* env, jobject) {
-    LOGI("[JNI] initBuffer"); TRY imstudio::engine::init(); CATCH(env)
+    TRY imstudio::engine::init(); CATCH(env)
 }
 JNIEXPORT void JNICALL Java_com_raais_imstudio_NativeBridge_shutdown(JNIEnv* env, jobject) {
     TRY imstudio::engine::shutdown(); CATCH(env)
+}
+JNIEXPORT void JNICALL Java_com_raais_imstudio_NativeBridge_clearAll(JNIEnv* env, jobject) {
+    TRY clear_all(); CATCH(env)
+}
+JNIEXPORT jboolean JNICALL Java_com_raais_imstudio_NativeBridge_loadFromText(JNIEnv* env, jobject, jstring text) {
+    TRY return load_from_text(from_jstring(env, text)) ? JNI_TRUE : JNI_FALSE; CATCH(env) return JNI_FALSE;
+}
+JNIEXPORT jboolean JNICALL Java_com_raais_imstudio_NativeBridge_importFromCpp(JNIEnv* env, jobject, jstring code) {
+    TRY return import_from_cpp(from_jstring(env, code)) ? JNI_TRUE : JNI_FALSE; CATCH(env) return JNI_FALSE;
+}
+// ★ NEW: multi-file import
+JNIEXPORT void JNICALL Java_com_raais_imstudio_NativeBridge_importBegin(JNIEnv* env, jobject) {
+    TRY imstudio::engine::import_begin(); CATCH(env)
+}
+JNIEXPORT void JNICALL Java_com_raais_imstudio_NativeBridge_importFile(JNIEnv* env, jobject, jstring path, jstring content) {
+    TRY {
+        std::string p = from_jstring(env, path);
+        std::string c = from_jstring(env, content);
+        imstudio::engine::import_file(p, c);
+    } CATCH(env)
+}
+JNIEXPORT jstring JNICALL Java_com_raais_imstudio_NativeBridge_importEnd(JNIEnv* env, jobject) {
+    TRY return to_jstring(env, imstudio::engine::import_end());
+    CATCH(env) return env->NewStringUTF("{}");
+}
+JNIEXPORT jstring JNICALL Java_com_raais_imstudio_NativeBridge_dumpToJson(JNIEnv* env, jobject) {
+    TRY return to_jstring(env, dump_to_json()); CATCH(env) return env->NewStringUTF("{\"version\":1,\"objects\":[]}");
 }
 JNIEXPORT jint JNICALL Java_com_raais_imstudio_NativeBridge_createWidget(JNIEnv* env, jobject, jstring t) {
     TRY return add_widget(from_jstring(env, t)); CATCH(env) return -1;

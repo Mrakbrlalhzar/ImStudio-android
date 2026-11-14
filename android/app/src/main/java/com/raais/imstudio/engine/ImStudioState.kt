@@ -3,23 +3,26 @@ import android.util.Log
 import androidx.compose.runtime.mutableStateListOf
 import androidx.compose.runtime.mutableStateOf
 import com.raais.imstudio.NativeBridge
+import com.raais.imstudio.model.ImportReport
 import com.raais.imstudio.model.Widget
+import kotlinx.serialization.json.Json
 
 class ImStudioState {
     private val TAG = "ImStudioState"
+    private val json = Json { ignoreUnknownKeys = true }
     val widgets = mutableStateListOf<Widget>()
     val selectedId = mutableStateOf<Int?>(null)
     val nativeError = mutableStateOf<String?>(null)
+    val lastMessage = mutableStateOf<String?>(null)
+    val lastImportReport = mutableStateOf<ImportReport?>(null)
 
     init {
         if (!NativeBridge.isLoaded) {
             nativeError.value = "Native lib not loaded: ${NativeBridge.loadError}"
             Log.e(TAG, nativeError.value!!)
         } else {
-            try {
-                NativeBridge.initBuffer()
-                Log.i(TAG, "initBuffer OK")
-            } catch (t: Throwable) {
+            try { NativeBridge.initBuffer(); Log.i(TAG, "initBuffer OK") }
+            catch (t: Throwable) {
                 nativeError.value = "initBuffer: ${t.javaClass.simpleName}: ${t.message}"
                 Log.e(TAG, nativeError.value!!, t)
             }
@@ -58,5 +61,57 @@ class ImStudioState {
     fun setValueS(id: Int, v: String) { runCatching { NativeBridge.setWidgetValueS(id, v) }; refresh() }
     fun generateCode(): String = try { NativeBridge.generateCode() } catch (t: Throwable) { "// error: ${t.message}" }
     fun selected(): Widget? = widgets.find { it.id == selectedId.value }
+
+    fun clearAll(): Boolean {
+        if (!NativeBridge.isLoaded) return false
+        val ok = runCatching { NativeBridge.clearAll(); true }.getOrDefault(false)
+        refresh()
+        lastMessage.value = if (ok) "همه ویجت‌ها پاک شدند" else "پاک‌سازی ناموفق"
+        return ok
+    }
+
+    fun loadFromText(text: String): Boolean {
+        if (!NativeBridge.isLoaded) return false
+        val ok = try { NativeBridge.loadFromText(text) } catch (t: Throwable) { Log.e(TAG, "loadFromText", t); false }
+        refresh()
+        lastMessage.value = if (ok) "پروژه بارگذاری شد (${widgets.size} ویجت)" else "فرمت پشتیبانی نمی‌شود"
+        return ok
+    }
+
+    fun importFromCpp(code: String): Boolean {
+        if (!NativeBridge.isLoaded) return false
+        val ok = try { NativeBridge.importFromCpp(code) } catch (t: Throwable) { Log.e(TAG, "importFromCpp", t); false }
+        refresh()
+        lastMessage.value = if (ok) "کد C++ ایمپورت شد (${widgets.size} ویجت)"
+            else "هیچ ویجت ImGui شناخته‌شده‌ای پیدا نشد"
+        return ok
+    }
+
+    /** ★ Folder import — accepts list of (path, content) pairs sorted by caller */
+    fun importFromFiles(files: List<Pair<String, String>>): ImportReport? {
+        if (!NativeBridge.isLoaded) return null
+        try {
+            NativeBridge.importBegin()
+            for ((path, content) in files) {
+                NativeBridge.importFile(path, content)
+            }
+            val reportJson = NativeBridge.importEnd()
+            val report = try { json.decodeFromString<ImportReport>(reportJson) }
+                catch (t: Throwable) { Log.e(TAG, "report decode failed: $reportJson", t); ImportReport() }
+            lastImportReport.value = report
+            refresh()
+            lastMessage.value = "ایمپورت: ${report.session.totalWidgets} ویجت از ${report.session.totalFiles} فایل"
+            return report
+        } catch (t: Throwable) {
+            Log.e(TAG, "importFromFiles", t)
+            lastMessage.value = "ایمپورت ناموفق: ${t.message}"
+            return null
+        }
+    }
+
+    fun dumpToJson(): String =
+        if (!NativeBridge.isLoaded) "{\"version\":1,\"objects\":[]}"
+        else try { NativeBridge.dumpToJson() } catch (t: Throwable) { "{\"version\":1,\"objects\":[]}" }
+
     fun dispose() { if (NativeBridge.isLoaded) runCatching { NativeBridge.shutdown() } }
 }

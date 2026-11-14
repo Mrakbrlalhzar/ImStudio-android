@@ -43,7 +43,9 @@ add_library(imstudio_core SHARED
 target_compile_definitions(imstudio_core PRIVATE FMT_HEADER_ONLY=1)
 target_compile_options(imstudio_core PRIVATE "-include" "${IMASSERT_HDR}")
 target_include_directories(imstudio_core PRIVATE
-    include src vendor/imstudio vendor/imgui vendor/imgui/misc/cpp)
+    include src
+    vendor/imstudio vendor/imgui vendor/imgui/misc/cpp
+    vendor/json)
 
 find_library(log-lib log)
 target_link_libraries(imstudio_core imgui fmt ${log-lib} dl)

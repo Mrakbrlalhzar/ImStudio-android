@@ -1,23 +1,24 @@
 package com.raais.imstudio
 import android.util.Log
-
 object NativeBridge {
     private const val TAG = "ImStudioNativeBridge"
     @Volatile var loadError: String? = null; private set
     @Volatile var isLoaded: Boolean = false; private set
     init {
-        try {
-            System.loadLibrary("imstudio_core")
-            isLoaded = true
-            Log.i(TAG, "lib loaded")
-        } catch (t: Throwable) {
-            loadError = "${t.javaClass.simpleName}: ${t.message}"
-            Log.e(TAG, "load failed", t)
-        }
+        try { System.loadLibrary("imstudio_core"); isLoaded = true; Log.i(TAG, "lib loaded") }
+        catch (t: Throwable) { loadError = "${t.javaClass.simpleName}: ${t.message}"; Log.e(TAG, "load failed", t) }
     }
     external fun initCrashHandler(dir: String)
     external fun initBuffer()
     external fun shutdown()
+    external fun clearAll()
+    external fun loadFromText(text: String): Boolean
+    external fun importFromCpp(code: String): Boolean
+    // ★ NEW: multi-file import
+    external fun importBegin()
+    external fun importFile(path: String, content: String)
+    external fun importEnd(): String
+    external fun dumpToJson(): String
     external fun createWidget(type: String): Int
     external fun deleteWidget(id: Int): Boolean
     external fun getWidgetCount(): Int

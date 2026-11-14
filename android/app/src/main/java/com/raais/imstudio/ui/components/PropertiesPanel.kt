@@ -9,24 +9,17 @@ import androidx.compose.ui.Modifier
 import androidx.compose.ui.unit.dp
 import com.raais.imstudio.engine.ImStudioState
 import com.raais.imstudio.model.Widget
-
-@Composable
-fun PropertiesPanel(state: ImStudioState) {
+@Composable fun PropertiesPanel(state: ImStudioState) {
     val sel: Widget? = state.selected()
-    Column(modifier = Modifier.fillMaxHeight()
-        .background(MaterialTheme.colorScheme.surface)
+    Column(modifier = Modifier.fillMaxHeight().background(MaterialTheme.colorScheme.surface)
         .verticalScroll(rememberScrollState()).padding(16.dp),
         verticalArrangement = Arrangement.spacedBy(12.dp)) {
         Text("ویژگی‌ها", style = MaterialTheme.typography.titleMedium)
         if (sel != null) {
-            OutlinedTextField(value = sel.label,
-                onValueChange = { state.setLabel(sel.id, it) },
-                label = { Text("Label") }, singleLine = true,
-                modifier = Modifier.fillMaxWidth())
-            OutlinedTextField(value = sel.valueS,
-                onValueChange = { state.setValueS(sel.id, it) },
-                label = { Text("Value") }, singleLine = true,
-                modifier = Modifier.fillMaxWidth())
+            OutlinedTextField(value = sel.label, onValueChange = { state.setLabel(sel.id, it) },
+                label = { Text("Label") }, singleLine = true, modifier = Modifier.fillMaxWidth())
+            OutlinedTextField(value = sel.valueS, onValueChange = { state.setValueS(sel.id, it) },
+                label = { Text("Value") }, singleLine = true, modifier = Modifier.fillMaxWidth())
             Row(horizontalArrangement = Arrangement.spacedBy(8.dp)) {
                 Num("X", sel.x) { state.moveWidget(sel.id, it, sel.y) }
                 Num("Y", sel.y) { state.moveWidget(sel.id, sel.x, it) }
@@ -39,18 +32,14 @@ fun PropertiesPanel(state: ImStudioState) {
                 label = { Text("Type") }, modifier = Modifier.fillMaxWidth())
             HorizontalDivider()
             Button(onClick = { state.deleteWidget(sel.id) },
-                colors = ButtonDefaults.buttonColors(
-                    containerColor = MaterialTheme.colorScheme.error),
+                colors = ButtonDefaults.buttonColors(containerColor = MaterialTheme.colorScheme.error),
                 modifier = Modifier.fillMaxWidth()) { Text("حذف ویجت") }
         } else {
-            Text("یک ویجت انتخاب کنید",
-                color = MaterialTheme.colorScheme.onSurfaceVariant)
+            Text("یک ویجت انتخاب کنید", color = MaterialTheme.colorScheme.onSurfaceVariant)
         }
     }
 }
-
-@Composable private fun RowScope.Num(label: String, value: Float, onChange: (Float) -> Unit) {
-    OutlinedTextField(value = value.toString(),
-        onValueChange = { it.toFloatOrNull()?.let(onChange) },
-        label = { Text(label) }, singleLine = true, modifier = Modifier.weight(1f))
+@Composable private fun RowScope.Num(lbl: String, v: Float, onChange: (Float) -> Unit) {
+    OutlinedTextField(value = v.toString(), onValueChange = { it.toFloatOrNull()?.let(onChange) },
+        label = { Text(lbl) }, singleLine = true, modifier = Modifier.weight(1f))
 }

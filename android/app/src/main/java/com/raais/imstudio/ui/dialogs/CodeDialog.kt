@@ -14,7 +14,6 @@ import androidx.compose.ui.unit.dp
 import androidx.compose.ui.unit.sp
 import androidx.compose.ui.window.Dialog
 import com.raais.imstudio.util.copyToClipboard
-
 @Composable fun CodeDialog(code: String, onDismiss: () -> Unit) {
     val ctx = LocalContext.current
     Dialog(onDismissRequest = onDismiss) {
