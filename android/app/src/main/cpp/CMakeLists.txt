@@ -22,9 +22,10 @@ target_compile_definitions(fmt INTERFACE FMT_HEADER_ONLY=1)
 set(IMS_SOURCES
     vendor/imstudio/ims_generator.cpp
     vendor/imstudio/ims_buffer.cpp
+    vendor/imstudio/ims_object.cpp
 )
-if(EXISTS ${CMAKE_CURRENT_SOURCE_DIR}/vendor/imstudio/ims_object.cpp)
-    list(APPEND IMS_SOURCES vendor/imstudio/ims_object.cpp)
+if(EXISTS ${CMAKE_CURRENT_SOURCE_DIR}/vendor/imstudio/ims_object_draw.cpp)
+    list(APPEND IMS_SOURCES vendor/imstudio/ims_object_draw.cpp)
 endif()
 if(EXISTS ${CMAKE_CURRENT_SOURCE_DIR}/vendor/imstudio/ims_utils.cpp)
     list(APPEND IMS_SOURCES vendor/imstudio/ims_utils.cpp)
