@@ -6,15 +6,19 @@ set(CMAKE_CXX_STANDARD 17)
 set(GLUE_DIR "")
 foreach(c "${ANDROID_NDK}/sources/android/native_app_glue"
           "${CMAKE_ANDROID_NDK}/sources/android/native_app_glue")
-    if(EXISTS "${c}/android_native_app_glue.c") set(GLUE_DIR "${c}"); break(); endif()
+    if(EXISTS "${c}/android_native_app_glue.c")
+        set(GLUE_DIR "${c}")
+        break()
+    endif()
 endforeach()
+
 if(NOT GLUE_DIR)
     message(FATAL_ERROR "native_app_glue not found in NDK")
 endif()
 
 set(IMGUI_DIR "${CMAKE_CURRENT_SOURCE_DIR}/vendor/imgui")
 
-# --- ImGui core + backends (no GLFW!) ---
+# --- ImGui core + backends ---
 add_library(imgui STATIC
     ${IMGUI_DIR}/imgui.cpp
     ${IMGUI_DIR}/imgui_draw.cpp
