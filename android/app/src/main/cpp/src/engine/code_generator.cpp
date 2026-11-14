@@ -1,7 +1,7 @@
 #include "engine/code_generator.h"
-#include "vendor/imstudio/ims_buffer.h"
-#include "vendor/imstudio/ims_generator.h"
-#include "vendor/imstudio/ims_object.h"
+#include "ims_buffer.h"
+#include "ims_generator.h"
+#include "ims_object.h"
 #include <sstream>
 
 extern ImStudio::BufferWindow g_Buffer;  // defined in buffer_accessor.cpp

@@ -1,10 +1,10 @@
 #include "engine/buffer_accessor.h"
-#include "vendor/imstudio/ims_buffer.h"
-#include "vendor/imstudio/ims_object.h"
+#include "ims_buffer.h"
+#include "ims_object.h"
 
 namespace imstudio::engine {
 
-static ImStudio::BufferWindow g_Buffer;
+ImStudio::BufferWindow g_Buffer;
 
 static ImStudio::Object* get_obj(int id) {
     return g_Buffer.getobj(id);
