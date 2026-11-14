@@ -45,11 +45,11 @@ jobs:
         chmod +x /tmp/write_if_missing
         echo "/tmp" >> $GITHUB_PATH
 
-    - name: Clean CMake build cache (force fresh config)
+    - name: Clean stale build cache
       run: rm -rf android/app/.cxx android/app/build/intermediates/cxx 2>/dev/null || true
 
     # ============================================================
-    # 2. Copy vendor (always overwrite)
+    # 2. Copy vendor
     # ============================================================
     - name: Copy upstream vendor sources
       run: |
@@ -80,32 +80,23 @@ jobs:
         echo "$UPSTREAM_SHA" > .upstream-commit
 
     # ============================================================
-    # 3. Force-update ALL C++ bridge files (cat > always overwrites)
+    # 3. C++ bridge (لاجیک کامل، بدون ساده‌سازی)
     # ============================================================
-    - name: Force-write C++ sources
+    - name: Write C++ sources
       run: |
-        mkdir -p android/app/src/main/cpp/include
-        mkdir -p android/app/src/main/cpp/src/util
-        mkdir -p android/app/src/main/cpp/src/engine
+        mkdir -p android/app/src/main/cpp/{include,src/util,src/engine}
 
         cat > android/app/src/main/cpp/include/jni_bridge.h <<'EOF'
         #pragma once
         #include <string>
         namespace imstudio::engine {
-            void init();
-            void shutdown();
+            void init(); void shutdown();
             int  add_widget(const std::string& type);
             bool delete_widget(int id);
-            int  get_count();
-            int  get_id_at(int index);
-            std::string get_type(int id);
-            std::string get_label(int id);
-            std::string get_value_s(int id);
-            float get_x(int id);
-            float get_y(int id);
-            float get_size_x(int id);
-            float get_size_y(int id);
-            float get_width(int id);
+            int  get_count(); int  get_id_at(int index);
+            std::string get_type(int id); std::string get_label(int id); std::string get_value_s(int id);
+            float get_x(int id); float get_y(int id);
+            float get_size_x(int id); float get_size_y(int id); float get_width(int id);
             bool set_label(int id, const std::string& v);
             bool set_value_s(int id, const std::string& v);
             bool move(int id, float x, float y);
@@ -176,7 +167,7 @@ jobs:
                 IMGUI_CHECKVERSION();
                 ImGui::CreateContext();
                 if (ImGui::GetCurrentContext() == nullptr) {
-                    LOGE("[ensure] FAILED: null ImGui context");
+                    LOGE("[ensure] FAILED: null context");
                     return false;
                 }
                 LOGI("[ensure] ImGui context at %p", (void*)ImGui::GetCurrentContext());
@@ -184,10 +175,7 @@ jobs:
             if (g_BufferPtr == nullptr) {
                 LOGI("[ensure] Allocating BufferWindow...");
                 g_BufferPtr = new (std::nothrow) ImStudio::BufferWindow();
-                if (g_BufferPtr == nullptr) {
-                    LOGE("[ensure] FAILED: null BufferWindow");
-                    return false;
-                }
+                if (!g_BufferPtr) { LOGE("[ensure] FAILED alloc"); return false; }
                 LOGI("[ensure] BufferWindow at %p", (void*)g_BufferPtr);
             }
             return true;
@@ -195,7 +183,7 @@ jobs:
 
         static ImStudio::BufferWindow& buf() {
             std::lock_guard<std::mutex> lock(g_Mutex);
-            if (!ensure_locked()) throw std::runtime_error("ImStudio engine not initialized");
+            if (!ensure_locked()) throw std::runtime_error("engine not initialized");
             return *g_BufferPtr;
         }
 
@@ -209,48 +197,41 @@ jobs:
             b.selected_obj_id = -1;
             b.staticlayout = false;
             b.objects.reserve(2048);
-            LOGI("[init] done, objects.size=%zu", b.objects.size());
+            LOGI("[init] done size=%zu", b.objects.size());
         }
 
         void shutdown() {
-            LOGI("[shutdown] entering");
+            LOGI("[shutdown]");
             std::lock_guard<std::mutex> lock(g_Mutex);
             if (g_BufferPtr) { delete g_BufferPtr; g_BufferPtr = nullptr; }
-            if (ImGui::GetCurrentContext() != nullptr) ImGui::DestroyContext();
-            LOGI("[shutdown] done");
+            if (ImGui::GetCurrentContext()) ImGui::DestroyContext();
         }
 
         static ImStudio::Object* get_obj(int id) { return buf().getobj(id); }
 
         int add_widget(const std::string& type) {
-            LOGI("[add_widget] type=%s", type.c_str());
+            LOGI("[add_widget] %s", type.c_str());
             auto& b = buf();
             b.create(type, false);
-            int id = b.objects.empty() ? -1 : b.objects.back().id;
-            LOGI("[add_widget] -> id=%d", id);
-            return id;
+            return b.objects.empty() ? -1 : b.objects.back().id;
         }
         bool delete_widget(int id) { if (auto* o = get_obj(id)) { o->del(); return true; } return false; }
         int get_count() { return (int)buf().objects.size(); }
-        int get_id_at(int index) {
-            auto& b = buf();
-            if (index < 0 || index >= (int)b.objects.size()) return -1;
-            return b.objects[index].id;
+        int get_id_at(int i) { auto& b = buf(); if (i<0||i>=(int)b.objects.size()) return -1; return b.objects[i].id; }
+        std::string get_type(int id)    { auto* o=get_obj(id); return o?o->type:""; }
+        std::string get_label(int id)   { auto* o=get_obj(id); return o?o->label:""; }
+        std::string get_value_s(int id) { auto* o=get_obj(id); return o?o->value_s:""; }
+        float get_x(int id)      { auto* o=get_obj(id); return o?o->pos.x:0.f; }
+        float get_y(int id)      { auto* o=get_obj(id); return o?o->pos.y:0.f; }
+        float get_size_x(int id) { auto* o=get_obj(id); return o?o->size.x:0.f; }
+        float get_size_y(int id) { auto* o=get_obj(id); return o?o->size.y:0.f; }
+        float get_width(int id)  { auto* o=get_obj(id); return o?o->width:0.f; }
+        bool set_label(int id, const std::string& v)   { auto* o=get_obj(id); if(!o)return false; o->label=v; return true; }
+        bool set_value_s(int id, const std::string& v) { auto* o=get_obj(id); if(!o)return false; o->value_s=v; return true; }
+        bool move(int id, float x, float y)            { auto* o=get_obj(id); if(!o)return false; o->pos.x=x; o->pos.y=y; return true; }
+        bool resize(int id, float sx, float sy)        { auto* o=get_obj(id); if(!o)return false; o->size.x=sx; o->size.y=sy; return true; }
+        bool set_width(int id, float w)                { auto* o=get_obj(id); if(!o)return false; o->width=w; return true; }
         }
-        std::string get_type(int id)    { auto* o = get_obj(id); return o ? o->type : ""; }
-        std::string get_label(int id)   { auto* o = get_obj(id); return o ? o->label : ""; }
-        std::string get_value_s(int id) { auto* o = get_obj(id); return o ? o->value_s : ""; }
-        float get_x(int id)             { auto* o = get_obj(id); return o ? o->pos.x : 0.f; }
-        float get_y(int id)             { auto* o = get_obj(id); return o ? o->pos.y : 0.f; }
-        float get_size_x(int id)        { auto* o = get_obj(id); return o ? o->size.x : 0.f; }
-        float get_size_y(int id)        { auto* o = get_obj(id); return o ? o->size.y : 0.f; }
-        float get_width(int id)         { auto* o = get_obj(id); return o ? o->width : 0.f; }
-        bool set_label(int id, const std::string& v)   { auto* o = get_obj(id); if (!o) return false; o->label = v; return true; }
-        bool set_value_s(int id, const std::string& v) { auto* o = get_obj(id); if (!o) return false; o->value_s = v; return true; }
-        bool move(int id, float x, float y)            { auto* o = get_obj(id); if (!o) return false; o->pos.x = x; o->pos.y = y; return true; }
-        bool resize(int id, float sx, float sy)        { auto* o = get_obj(id); if (!o) return false; o->size.x = sx; o->size.y = sy; return true; }
-        bool set_width(int id, float w)                { auto* o = get_obj(id); if (!o) return false; o->width = w; return true; }
-        } // namespace
         EOF
 
         cat > android/app/src/main/cpp/src/engine/code_generator.h <<'EOF'
@@ -259,7 +240,6 @@ jobs:
         namespace imstudio::engine { std::string generate_full_code(); }
         EOF
 
-        # ★ FORCE-OVERWRITE code_generator.cpp — این همون فایلی بود که قبلاً بازنویسی نشده بود
         cat > android/app/src/main/cpp/src/engine/code_generator.cpp <<'EOF'
         #include "engine/code_generator.h"
         #include "ims_buffer.h"
@@ -267,7 +247,6 @@ jobs:
         #include "ims_object.h"
         #include <sstream>
         #include <android/log.h>
-
         #define LOG_TAG "ImStudioCore"
         #define LOGI(...) __android_log_print(ANDROID_LOG_INFO, LOG_TAG, __VA_ARGS__)
 
@@ -275,39 +254,36 @@ jobs:
 
         namespace imstudio::engine {
         std::string generate_full_code() {
-            LOGI("[generate_full_code] entering");
-            auto& g_Buffer = get_buffer();
+            LOGI("[gen] entering");
+            auto& g = get_buffer();
             std::ostringstream out;
             out << "// Generated by ImStudio (Android)\n#include \"imgui.h\"\n\n";
-            for (auto& obj : g_Buffer.objects) {
-                if (obj.type == "checkbox")         out << "static bool c1" << obj.id << " = false;\n";
-                else if (obj.type == "radio")       out << "static bool r1" << obj.id << " = false;\n";
-                else if (obj.type == "combo" || obj.type == "listbox")
-                    out << "static const char* items" << obj.id << "[] = { \"Item 1\", \"Item 2\" };\n";
-                else if (obj.type == "sliderfloat" || obj.type == "dragfloat")
-                    out << "static float f1" << obj.id << " = 0.0f;\n";
-                else if (obj.type == "sliderint" || obj.type == "dragint")
-                    out << "static int i1" << obj.id << " = 0;\n";
-                else if (obj.type == "textinput")   out << "static char buf" << obj.id << "[128] = \"\";\n";
-                else if (obj.type == "inputint")    out << "static int in1" << obj.id << " = 0;\n";
-                else if (obj.type == "inputfloat")  out << "static float inf1" << obj.id << " = 0.0f;\n";
+            for (auto& o : g.objects) {
+                if (o.type=="checkbox")     out << "static bool c1" << o.id << " = false;\n";
+                else if (o.type=="radio")   out << "static bool r1" << o.id << " = false;\n";
+                else if (o.type=="combo"||o.type=="listbox")
+                    out << "static const char* items" << o.id << "[] = { \"Item 1\", \"Item 2\" };\n";
+                else if (o.type=="sliderfloat"||o.type=="dragfloat")
+                    out << "static float f1" << o.id << " = 0.0f;\n";
+                else if (o.type=="sliderint"||o.type=="dragint")
+                    out << "static int i1" << o.id << " = 0;\n";
+                else if (o.type=="textinput")  out << "static char buf" << o.id << "[128] = \"\";\n";
+                else if (o.type=="inputint")   out << "static int in1" << o.id << " = 0;\n";
+                else if (o.type=="inputfloat") out << "static float inf1" << o.id << " = 0.0f;\n";
             }
             out << "\nvoid RenderUI() {\n";
-            for (auto& obj : g_Buffer.objects) {
-                std::string snippet;
-                ImStudio::Recreate(obj, &snippet, g_Buffer.staticlayout);
-                out << snippet;
+            for (auto& o : g.objects) {
+                std::string s;
+                ImStudio::Recreate(o, &s, g.staticlayout);
+                out << s;
             }
             out << "}\n";
-            LOGI("[generate_full_code] %zu bytes", out.str().size());
+            LOGI("[gen] %zu bytes", out.str().size());
             return out.str();
         }
-        } // namespace
+        }
         EOF
 
-        # ============================================================
-        # ★★★ NEW: crash_handler.cpp — native signal handler writing to file
-        # ============================================================
         cat > android/app/src/main/cpp/src/engine/crash_handler.cpp <<'EOF'
         #include <jni.h>
         #include <signal.h>
@@ -321,97 +297,66 @@ jobs:
         #include <dlfcn.h>
         #include <cxxabi.h>
         #include <android/log.h>
-
         #define LOG_TAG "ImStudioCrash"
         #define LOGI(...) __android_log_print(ANDROID_LOG_INFO, LOG_TAG, __VA_ARGS__)
 
         static char g_CrashDir[512] = {0};
 
         struct BtState { void** current; void** end; };
-
         static _Unwind_Reason_Code unwind_cb(struct _Unwind_Context* ctx, void* arg) {
             BtState* s = static_cast<BtState*>(arg);
             uintptr_t pc = _Unwind_GetIP(ctx);
-            if (pc) {
-                if (s->current == s->end) return _URC_END_OF_STACK;
-                *s->current++ = reinterpret_cast<void*>(pc);
-            }
+            if (pc) { if (s->current==s->end) return _URC_END_OF_STACK; *s->current++ = reinterpret_cast<void*>(pc); }
             return _URC_NO_REASON;
         }
+        static int capture_bt(void** b, int max) { BtState s = {b, b+max}; _Unwind_Backtrace(unwind_cb, &s); return (int)(s.current - b); }
 
-        static int capture_bt(void** buf, int max) {
-            BtState s = { buf, buf + max };
-            _Unwind_Backtrace(unwind_cb, &s);
-            return (int)(s.current - buf);
-        }
-
-        // Async-signal-safe writer: only open/write/close/snprintf on stack buffers
-        static void write_crash(int sig, siginfo_t* info, void* /*uc*/) {
-            if (g_CrashDir[0] == 0) return;
-            char path[700];
-            time_t now = time(nullptr);
-            snprintf(path, sizeof(path), "%s/native_crash_%ld_sig%d.log",
-                     g_CrashDir, (long)now, sig);
-            int fd = open(path, O_WRONLY | O_CREAT | O_TRUNC, 0644);
+        static void write_crash(int sig, siginfo_t* info, void*) {
+            if (g_CrashDir[0]==0) return;
+            char path[700]; time_t now = time(nullptr);
+            snprintf(path, sizeof(path), "%s/native_crash_%ld_sig%d.log", g_CrashDir, (long)now, sig);
+            int fd = open(path, O_WRONLY|O_CREAT|O_TRUNC, 0644);
             if (fd < 0) return;
-
             char buf[512];
-            int n = snprintf(buf, sizeof(buf),
-                "=== Native crash ===\nSignal: %d (%s)\nInfo addr: %p\nTime: %ld\n\n",
-                sig, strsignal(sig), info ? info->si_addr : nullptr, (long)now);
+            int n = snprintf(buf, sizeof(buf), "=== Native crash ===\nSignal: %d (%s)\nTime: %ld\n\n",
+                             sig, strsignal(sig), (long)now);
             write(fd, buf, n);
-
-            void* frames[64];
-            int count = capture_bt(frames, 64);
-            n = snprintf(buf, sizeof(buf), "Backtrace (%d frames):\n", count);
-            write(fd, buf, n);
-
+            void* frames[64]; int count = capture_bt(frames, 64);
+            n = snprintf(buf, sizeof(buf), "Backtrace (%d frames):\n", count); write(fd, buf, n);
             for (int i = 0; i < count; i++) {
                 Dl_info dl;
                 if (dladdr(frames[i], &dl) && dl.dli_sname) {
-                    int status = 0;
-                    char* demangled = abi::__cxa_demangle(dl.dli_sname, nullptr, nullptr, &status);
-                    const char* name = (status == 0 && demangled) ? demangled : dl.dli_sname;
-                    long off = (long)((char*)frames[i] - (char*)dl.dli_saddr);
-                    n = snprintf(buf, sizeof(buf), "  #%02d %p %s+0x%lx (%s)\n",
-                                 i, frames[i], name, off, dl.dli_fname ? dl.dli_fname : "?");
-                    if (demangled) free(demangled);
-                } else {
-                    n = snprintf(buf, sizeof(buf), "  #%02d %p\n", i, frames[i]);
-                }
+                    int status=0;
+                    char* dm = abi::__cxa_demangle(dl.dli_sname, nullptr, nullptr, &status);
+                    const char* name = (status==0 && dm) ? dm : dl.dli_sname;
+                    n = snprintf(buf, sizeof(buf), "  #%02d %p %s (%s)\n", i, frames[i], name, dl.dli_fname?dl.dli_fname:"?");
+                    if (dm) free(dm);
+                } else n = snprintf(buf, sizeof(buf), "  #%02d %p\n", i, frames[i]);
                 write(fd, buf, n);
             }
             close(fd);
         }
-
         static void handler(int sig, siginfo_t* info, void* uc) {
             write_crash(sig, info, uc);
             signal(sig, SIG_DFL);
             raise(sig);
         }
-
         extern "C" JNIEXPORT void JNICALL
         Java_com_raais_imstudio_NativeBridge_initCrashHandler(JNIEnv* env, jobject, jstring dir) {
-            if (dir == nullptr) { LOGI("initCrashHandler: null dir"); return; }
-            const char* cdir = env->GetStringUTFChars(dir, nullptr);
-            strncpy(g_CrashDir, cdir, sizeof(g_CrashDir) - 1);
-            g_CrashDir[sizeof(g_CrashDir) - 1] = 0;
-            env->ReleaseStringUTFChars(dir, cdir);
-
-            // altstack for stack-overflow safety
-            static char altstack[64 * 1024];
-            stack_t ss; ss.ss_sp = altstack; ss.ss_size = sizeof(altstack); ss.ss_flags = 0;
+            if (!dir) return;
+            const char* c = env->GetStringUTFChars(dir, nullptr);
+            strncpy(g_CrashDir, c, sizeof(g_CrashDir)-1);
+            g_CrashDir[sizeof(g_CrashDir)-1] = 0;
+            env->ReleaseStringUTFChars(dir, c);
+            static char alt[64*1024];
+            stack_t ss; ss.ss_sp = alt; ss.ss_size = sizeof(alt); ss.ss_flags = 0;
             sigaltstack(&ss, nullptr);
-
-            struct sigaction sa;
-            memset(&sa, 0, sizeof(sa));
-            sa.sa_sigaction = handler;
-            sa.sa_flags = SA_SIGINFO | SA_ONSTACK;
+            struct sigaction sa; memset(&sa, 0, sizeof(sa));
+            sa.sa_sigaction = handler; sa.sa_flags = SA_SIGINFO | SA_ONSTACK;
             sigemptyset(&sa.sa_mask);
-
-            int sigs[] = { SIGSEGV, SIGABRT, SIGFPE, SIGILL, SIGBUS, SIGTRAP };
+            int sigs[] = {SIGSEGV, SIGABRT, SIGFPE, SIGILL, SIGBUS, SIGTRAP};
             for (int s : sigs) sigaction(s, &sa, nullptr);
-            LOGI("Crash handler installed, dir=%s", g_CrashDir);
+            LOGI("Crash handler installed: %s", g_CrashDir);
         }
         EOF
 
@@ -424,135 +369,99 @@ jobs:
         #include <android/log.h>
         #include <exception>
         #include <stdexcept>
-
         #define LOG_TAG "ImStudioJNI"
         #define LOGI(...) __android_log_print(ANDROID_LOG_INFO,  LOG_TAG, __VA_ARGS__)
         #define LOGE(...) __android_log_print(ANDROID_LOG_ERROR, LOG_TAG, __VA_ARGS__)
-
         using namespace imstudio::engine;
         using imstudio::util::from_jstring;
         using imstudio::util::to_jstring;
 
         static void throw_runtime(JNIEnv* env, const char* msg) {
             if (env->ExceptionCheck()) return;
-            jclass cls = env->FindClass("java/lang/RuntimeException");
-            if (cls) env->ThrowNew(cls, msg);
+            jclass c = env->FindClass("java/lang/RuntimeException");
+            if (c) env->ThrowNew(c, msg);
         }
-
-        #define TRY  try {
+        #define TRY try {
         #define CATCH(env) } catch (const std::exception& e) { \
-            LOGE("C++ exception: %s", e.what()); throw_runtime((env), e.what()); \
-        } catch (...) { LOGE("Unknown C++ exception"); \
-            throw_runtime((env), "Unknown C++ exception"); }
+            LOGE("C++ ex: %s", e.what()); throw_runtime((env), e.what()); \
+        } catch (...) { throw_runtime((env), "Unknown C++ exception"); }
 
         extern "C" {
-
-        JNIEXPORT jint JNI_OnLoad(JavaVM* /*vm*/, void* /*reserved*/) {
+        JNIEXPORT jint JNI_OnLoad(JavaVM*, void*) {
             LOGI("========== JNI_OnLoad ==========");
-            try {
-                imstudio::engine::init();
-                LOGI("========== JNI_OnLoad init OK ==========");
-            } catch (const std::exception& e) {
-                LOGE("JNI_OnLoad init FAILED: %s", e.what());
-            } catch (...) {
-                LOGE("JNI_OnLoad init FAILED (unknown)");
-            }
+            try { imstudio::engine::init(); LOGI("JNI_OnLoad init OK"); }
+            catch (const std::exception& e) { LOGE("JNI_OnLoad init FAILED: %s", e.what()); }
+            catch (...) { LOGE("JNI_OnLoad init FAILED (unknown)"); }
             return JNI_VERSION_1_6;
         }
-
-        JNIEXPORT void JNI_OnUnload(JavaVM* /*vm*/, void* /*reserved*/) {
+        JNIEXPORT void JNI_OnUnload(JavaVM*, void*) {
             try { imstudio::engine::shutdown(); } catch (...) {}
         }
-
-        JNIEXPORT void JNICALL
-        Java_com_raais_imstudio_NativeBridge_initBuffer(JNIEnv* env, jobject) {
-            LOGI("[JNI] initBuffer"); TRY
-                imstudio::engine::init();
-            CATCH(env)
+        JNIEXPORT void JNICALL Java_com_raais_imstudio_NativeBridge_initBuffer(JNIEnv* env, jobject) {
+            LOGI("[JNI] initBuffer"); TRY imstudio::engine::init(); CATCH(env)
         }
-
-        JNIEXPORT void JNICALL
-        Java_com_raais_imstudio_NativeBridge_shutdown(JNIEnv* env, jobject) {
+        JNIEXPORT void JNICALL Java_com_raais_imstudio_NativeBridge_shutdown(JNIEnv* env, jobject) {
             TRY imstudio::engine::shutdown(); CATCH(env)
         }
-
-        JNIEXPORT jint JNICALL
-        Java_com_raais_imstudio_NativeBridge_createWidget(JNIEnv* env, jobject, jstring type) {
-            TRY return add_widget(from_jstring(env, type)); CATCH(env) return -1;
+        JNIEXPORT jint JNICALL Java_com_raais_imstudio_NativeBridge_createWidget(JNIEnv* env, jobject, jstring t) {
+            TRY return add_widget(from_jstring(env, t)); CATCH(env) return -1;
         }
-        JNIEXPORT jboolean JNICALL
-        Java_com_raais_imstudio_NativeBridge_deleteWidget(JNIEnv* env, jobject, jint id) {
+        JNIEXPORT jboolean JNICALL Java_com_raais_imstudio_NativeBridge_deleteWidget(JNIEnv* env, jobject, jint id) {
             TRY return delete_widget(id) ? JNI_TRUE : JNI_FALSE; CATCH(env) return JNI_FALSE;
         }
-        JNIEXPORT jint JNICALL
-        Java_com_raais_imstudio_NativeBridge_getWidgetCount(JNIEnv* env, jobject) {
+        JNIEXPORT jint JNICALL Java_com_raais_imstudio_NativeBridge_getWidgetCount(JNIEnv* env, jobject) {
             TRY return get_count(); CATCH(env) return 0;
         }
-        JNIEXPORT jint JNICALL
-        Java_com_raais_imstudio_NativeBridge_getWidgetId(JNIEnv* env, jobject, jint i) {
+        JNIEXPORT jint JNICALL Java_com_raais_imstudio_NativeBridge_getWidgetId(JNIEnv* env, jobject, jint i) {
             TRY return get_id_at(i); CATCH(env) return -1;
         }
-        JNIEXPORT jstring JNICALL
-        Java_com_raais_imstudio_NativeBridge_getWidgetType(JNIEnv* env, jobject, jint id) {
+        JNIEXPORT jstring JNICALL Java_com_raais_imstudio_NativeBridge_getWidgetType(JNIEnv* env, jobject, jint id) {
             TRY return to_jstring(env, get_type(id)); CATCH(env) return env->NewStringUTF("");
         }
-        JNIEXPORT jstring JNICALL
-        Java_com_raais_imstudio_NativeBridge_getWidgetLabel(JNIEnv* env, jobject, jint id) {
+        JNIEXPORT jstring JNICALL Java_com_raais_imstudio_NativeBridge_getWidgetLabel(JNIEnv* env, jobject, jint id) {
             TRY return to_jstring(env, get_label(id)); CATCH(env) return env->NewStringUTF("");
         }
-        JNIEXPORT jstring JNICALL
-        Java_com_raais_imstudio_NativeBridge_getWidgetValueS(JNIEnv* env, jobject, jint id) {
+        JNIEXPORT jstring JNICALL Java_com_raais_imstudio_NativeBridge_getWidgetValueS(JNIEnv* env, jobject, jint id) {
             TRY return to_jstring(env, get_value_s(id)); CATCH(env) return env->NewStringUTF("");
         }
-        JNIEXPORT jfloat JNICALL
-        Java_com_raais_imstudio_NativeBridge_getWidgetX(JNIEnv* env, jobject, jint id) {
+        JNIEXPORT jfloat JNICALL Java_com_raais_imstudio_NativeBridge_getWidgetX(JNIEnv* env, jobject, jint id) {
             TRY return get_x(id); CATCH(env) return 0.f;
         }
-        JNIEXPORT jfloat JNICALL
-        Java_com_raais_imstudio_NativeBridge_getWidgetY(JNIEnv* env, jobject, jint id) {
+        JNIEXPORT jfloat JNICALL Java_com_raais_imstudio_NativeBridge_getWidgetY(JNIEnv* env, jobject, jint id) {
             TRY return get_y(id); CATCH(env) return 0.f;
         }
-        JNIEXPORT jfloat JNICALL
-        Java_com_raais_imstudio_NativeBridge_getWidgetSizeX(JNIEnv* env, jobject, jint id) {
+        JNIEXPORT jfloat JNICALL Java_com_raais_imstudio_NativeBridge_getWidgetSizeX(JNIEnv* env, jobject, jint id) {
             TRY return get_size_x(id); CATCH(env) return 0.f;
         }
-        JNIEXPORT jfloat JNICALL
-        Java_com_raais_imstudio_NativeBridge_getWidgetSizeY(JNIEnv* env, jobject, jint id) {
+        JNIEXPORT jfloat JNICALL Java_com_raais_imstudio_NativeBridge_getWidgetSizeY(JNIEnv* env, jobject, jint id) {
             TRY return get_size_y(id); CATCH(env) return 0.f;
         }
-        JNIEXPORT jfloat JNICALL
-        Java_com_raais_imstudio_NativeBridge_getWidgetWidth(JNIEnv* env, jobject, jint id) {
+        JNIEXPORT jfloat JNICALL Java_com_raais_imstudio_NativeBridge_getWidgetWidth(JNIEnv* env, jobject, jint id) {
             TRY return get_width(id); CATCH(env) return 0.f;
         }
-        JNIEXPORT jboolean JNICALL
-        Java_com_raais_imstudio_NativeBridge_setWidgetLabel(JNIEnv* env, jobject, jint id, jstring v) {
+        JNIEXPORT jboolean JNICALL Java_com_raais_imstudio_NativeBridge_setWidgetLabel(JNIEnv* env, jobject, jint id, jstring v) {
             TRY return set_label(id, from_jstring(env, v)) ? JNI_TRUE : JNI_FALSE; CATCH(env) return JNI_FALSE;
         }
-        JNIEXPORT jboolean JNICALL
-        Java_com_raais_imstudio_NativeBridge_setWidgetValueS(JNIEnv* env, jobject, jint id, jstring v) {
+        JNIEXPORT jboolean JNICALL Java_com_raais_imstudio_NativeBridge_setWidgetValueS(JNIEnv* env, jobject, jint id, jstring v) {
             TRY return set_value_s(id, from_jstring(env, v)) ? JNI_TRUE : JNI_FALSE; CATCH(env) return JNI_FALSE;
         }
-        JNIEXPORT jboolean JNICALL
-        Java_com_raais_imstudio_NativeBridge_moveWidget(JNIEnv* env, jobject, jint id, jfloat x, jfloat y) {
+        JNIEXPORT jboolean JNICALL Java_com_raais_imstudio_NativeBridge_moveWidget(JNIEnv* env, jobject, jint id, jfloat x, jfloat y) {
             TRY return move(id, x, y) ? JNI_TRUE : JNI_FALSE; CATCH(env) return JNI_FALSE;
         }
-        JNIEXPORT jboolean JNICALL
-        Java_com_raais_imstudio_NativeBridge_resizeWidget(JNIEnv* env, jobject, jint id, jfloat sx, jfloat sy) {
+        JNIEXPORT jboolean JNICALL Java_com_raais_imstudio_NativeBridge_resizeWidget(JNIEnv* env, jobject, jint id, jfloat sx, jfloat sy) {
             TRY return resize(id, sx, sy) ? JNI_TRUE : JNI_FALSE; CATCH(env) return JNI_FALSE;
         }
-        JNIEXPORT jboolean JNICALL
-        Java_com_raais_imstudio_NativeBridge_setWidgetWidth(JNIEnv* env, jobject, jint id, jfloat w) {
+        JNIEXPORT jboolean JNICALL Java_com_raais_imstudio_NativeBridge_setWidgetWidth(JNIEnv* env, jobject, jint id, jfloat w) {
             TRY return set_width(id, w) ? JNI_TRUE : JNI_FALSE; CATCH(env) return JNI_FALSE;
         }
-        JNIEXPORT jstring JNICALL
-        Java_com_raais_imstudio_NativeBridge_generateCode(JNIEnv* env, jobject) {
+        JNIEXPORT jstring JNICALL Java_com_raais_imstudio_NativeBridge_generateCode(JNIEnv* env, jobject) {
             TRY return to_jstring(env, generate_full_code()); CATCH(env) return env->NewStringUTF("// error");
         }
-        } // extern "C"
+        }
         EOF
 
     # ============================================================
-    # 4. CMakeLists — IM_ASSERT via -include (safe, not -D)
+    # 4. CMakeLists (IM_ASSERT via -include)
     # ============================================================
     - name: Write CMakeLists.txt
       run: |
@@ -561,12 +470,9 @@ jobs:
         project(imstudio_core)
         set(CMAKE_CXX_STANDARD 17)
 
-        # ★ Fix: define IM_ASSERT via a prepended header, not via -D (CMake drops function-style -D)
         set(IMASSERT_HDR "${CMAKE_CURRENT_BINARY_DIR}/imassert_override.h")
         file(WRITE "${IMASSERT_HDR}"
-            "#pragma once\n"
-            "#undef IM_ASSERT\n"
-            "#define IM_ASSERT(_EXPR) ((void)0)\n")
+            "#pragma once\n#undef IM_ASSERT\n#define IM_ASSERT(_EXPR) ((void)0)\n")
 
         add_library(imgui STATIC
             vendor/imgui/imgui.cpp
@@ -614,7 +520,7 @@ jobs:
     # ============================================================
     # 5. Gradle & Manifest
     # ============================================================
-    - name: Write Gradle and manifest files
+    - name: Write Gradle files
       run: |
         cat > android/settings.gradle.kts <<'EOF'
         pluginManagement { repositories { google(); mavenCentral(); gradlePluginPortal() } }
@@ -637,10 +543,7 @@ jobs:
         org.gradle.jvmargs=-Xmx4g -Dfile.encoding=UTF-8
         EOF
         cat > android/app/build.gradle.kts <<'EOF'
-        plugins {
-            id("com.android.application")
-            id("org.jetbrains.kotlin.android")
-        }
+        plugins { id("com.android.application"); id("org.jetbrains.kotlin.android") }
         android {
             namespace = "com.raais.imstudio"
             compileSdk = 34
@@ -699,7 +602,7 @@ jobs:
         EOF
 
     # ============================================================
-    # 6. Kotlin core — NativeBridge, CrashLogger, state, model
+    # 6. Kotlin core (all files rewritten with fixes)
     # ============================================================
     - name: Write Kotlin core
       run: |
@@ -707,26 +610,22 @@ jobs:
 
         cat > android/app/src/main/java/com/raais/imstudio/NativeBridge.kt <<'EOF'
         package com.raais.imstudio
-
         import android.util.Log
 
         object NativeBridge {
             private const val TAG = "ImStudioNativeBridge"
-
             @Volatile var loadError: String? = null; private set
             @Volatile var isLoaded: Boolean = false; private set
-
             init {
                 try {
                     System.loadLibrary("imstudio_core")
                     isLoaded = true
-                    Log.i(TAG, "libimstudio_core.so loaded")
+                    Log.i(TAG, "lib loaded")
                 } catch (t: Throwable) {
                     loadError = "${t.javaClass.simpleName}: ${t.message}"
                     Log.e(TAG, "load failed", t)
                 }
             }
-
             external fun initCrashHandler(dir: String)
             external fun initBuffer()
             external fun shutdown()
@@ -753,7 +652,6 @@ jobs:
 
         cat > android/app/src/main/java/com/raais/imstudio/util/CrashLogger.kt <<'EOF'
         package com.raais.imstudio.util
-
         import android.content.Context
         import android.util.Log
         import com.raais.imstudio.NativeBridge
@@ -766,16 +664,12 @@ jobs:
 
         object CrashLogger {
             private const val TAG = "ImStudioCrash"
-
             fun crashDir(context: Context): File {
                 val ext = context.getExternalFilesDir(null) ?: context.filesDir
                 return File(ext, "crashes").apply { mkdirs() }
             }
-
             fun install(context: Context) {
                 val dir = crashDir(context)
-
-                // 1) Java/Kotlin uncaught exceptions
                 val def = Thread.getDefaultUncaughtExceptionHandler()
                 Thread.setDefaultUncaughtExceptionHandler { thread, throwable ->
                     try {
@@ -785,31 +679,24 @@ jobs:
                         throwable.printStackTrace(PrintWriter(sw))
                         f.writeText("Thread: ${thread.name}\nTime: ${Date()}\n\n$sw")
                         Log.e(TAG, "Java crash written: ${f.absolutePath}", throwable)
-                    } catch (t: Throwable) {
-                        Log.e(TAG, "Failed to write Java crash", t)
-                    }
+                    } catch (_: Throwable) {}
                     def?.uncaughtException(thread, throwable)
                 }
-
-                // 2) Native crashes (SIGSEGV, SIGABRT, ...) via JNI
                 try {
                     NativeBridge.initCrashHandler(dir.absolutePath)
-                    Log.i(TAG, "Native crash handler installed. dir=${dir.absolutePath}")
+                    Log.i(TAG, "Native crash handler installed: ${dir.absolutePath}")
                 } catch (t: Throwable) {
-                    Log.e(TAG, "Failed to install native crash handler", t)
+                    Log.e(TAG, "native crash handler failed", t)
                 }
             }
-
-            fun listCrashFiles(context: Context): List<File> {
-                return crashDir(context).listFiles()?.sortedByDescending { it.lastModified() } ?: emptyList()
-            }
+            fun listCrashFiles(context: Context): List<File> =
+                crashDir(context).listFiles()?.sortedByDescending { it.lastModified() } ?: emptyList()
         }
         EOF
 
         cat > android/app/src/main/java/com/raais/imstudio/model/Widget.kt <<'EOF'
         package com.raais.imstudio.model
         import androidx.compose.runtime.Immutable
-
         @Immutable
         data class Widget(
             val id: Int, val type: String, val label: String, val valueS: String,
@@ -845,7 +732,6 @@ jobs:
 
         cat > android/app/src/main/java/com/raais/imstudio/engine/ImStudioState.kt <<'EOF'
         package com.raais.imstudio.engine
-
         import android.util.Log
         import androidx.compose.runtime.mutableStateListOf
         import androidx.compose.runtime.mutableStateOf
@@ -860,7 +746,7 @@ jobs:
 
             init {
                 if (!NativeBridge.isLoaded) {
-                    nativeError.value = "Native lib load failed: ${NativeBridge.loadError}"
+                    nativeError.value = "Native lib not loaded: ${NativeBridge.loadError}"
                     Log.e(TAG, nativeError.value!!)
                 } else {
                     try {
@@ -905,11 +791,7 @@ jobs:
             fun setValueS(id: Int, v: String) { runCatching { NativeBridge.setWidgetValueS(id, v) }; refresh() }
             fun generateCode(): String = try { NativeBridge.generateCode() } catch (t: Throwable) { "// error: ${t.message}" }
             fun selected(): Widget? = widgets.find { it.id == selectedId.value }
-
-            fun dispose() {
-                if (!NativeBridge.isLoaded) return
-                runCatching { NativeBridge.shutdown() }
-            }
+            fun dispose() { if (NativeBridge.isLoaded) runCatching { NativeBridge.shutdown() } }
         }
         EOF
 
@@ -917,7 +799,6 @@ jobs:
         package com.raais.imstudio.engine
         import androidx.lifecycle.ViewModel
         import com.raais.imstudio.model.WidgetType
-
         class EditorViewModel : ViewModel() {
             val state = ImStudioState()
             fun refresh() = state.refresh()
@@ -940,30 +821,38 @@ jobs:
         EOF
 
     # ============================================================
-    # 7. Compose UI (with crash-files banner)
+    # 7. Compose UI — the FIXED version
     # ============================================================
-    - name: Write Compose UI
+    - name: Write Compose UI (fixed)
       run: |
+        # ★ MainActivity: ViewModel creation BEFORE composition
         cat > android/app/src/main/java/com/raais/imstudio/ui/MainActivity.kt <<'EOF'
         package com.raais.imstudio.ui
+
         import android.os.Bundle
         import androidx.activity.ComponentActivity
         import androidx.activity.compose.setContent
-        import androidx.activity.viewModels
+        import androidx.lifecycle.ViewModelProvider
         import com.raais.imstudio.engine.EditorViewModel
         import com.raais.imstudio.ui.screens.EditorScreen
         import com.raais.imstudio.ui.theme.ImStudioTheme
         import com.raais.imstudio.util.CrashLogger
 
         class MainActivity : ComponentActivity() {
-            private val vm: EditorViewModel by viewModels()
             override fun onCreate(savedInstanceState: Bundle?) {
                 super.onCreate(savedInstanceState)
                 CrashLogger.install(applicationContext)
+
+                // ★ CRITICAL FIX: Create ViewModel BEFORE setContent.
+                // Doing this during composition modifies state (nativeError.value)
+                // mid-composition, which corrupts Compose's slot table.
+                val vm = ViewModelProvider(this)[EditorViewModel::class.java]
+
                 setContent { ImStudioTheme { EditorScreen(vm) } }
             }
         }
         EOF
+
         cat > android/app/src/main/java/com/raais/imstudio/ui/theme/Color.kt <<'EOF'
         package com.raais.imstudio.ui.theme
         import androidx.compose.ui.graphics.Color
@@ -997,6 +886,7 @@ jobs:
         }
         EOF
 
+        # ★ EditorScreen — Restructured to avoid state modification during composition
         cat > android/app/src/main/java/com/raais/imstudio/ui/screens/EditorScreen.kt <<'EOF'
         package com.raais.imstudio.ui.screens
 
@@ -1014,55 +904,72 @@ jobs:
         import com.raais.imstudio.ui.dialogs.CodeDialog
         import com.raais.imstudio.ui.dialogs.ConfirmDeleteDialog
         import com.raais.imstudio.util.CrashLogger
+        import java.io.File
 
         @OptIn(ExperimentalMaterial3Api::class)
         @Composable
         fun EditorScreen(vm: EditorViewModel) {
             val state = vm.state
             val ctx = LocalContext.current
+
+            // Read Compose state ONCE at the top — avoids repeated reads that could
+            // trigger mid-composition snapshot invalidation.
+            val nativeError = state.nativeError.value
+            val crashFiles: List<File> = remember {
+                try { CrashLogger.listCrashFiles(ctx) } catch (_: Throwable) { emptyList() }
+            }
+
             var showCode by remember { mutableStateOf(false) }
             var showPalette by remember { mutableStateOf(false) }
             var pendingDelete by remember { mutableStateOf<Int?>(null) }
-            val crashFiles = remember { CrashLogger.listCrashFiles(ctx) }
 
             LaunchedEffect(Unit) { vm.refresh() }
 
             Scaffold(
                 topBar = { EditorToolbar(onShowCode = { showCode = true }) },
                 floatingActionButton = {
-                    if (state.nativeError.value == null) {
-                        FloatingActionButton(onClick = { showPalette = true }) {
-                            Icon(Icons.Default.Add, contentDescription = "افزودن")
-                        }
+                    // ★ Always render FAB. Conditional rendering inside
+                    // Scaffold's FAB slot has caused slot-table issues.
+                    FloatingActionButton(onClick = {
+                        if (nativeError == null) showPalette = true
+                    }) {
+                        Icon(Icons.Default.Add, contentDescription = "افزودن")
                     }
                 }
             ) { padding ->
                 Column(modifier = Modifier.padding(padding).fillMaxSize()) {
-                    state.nativeError.value?.let { err ->
-                        Surface(color = MaterialTheme.colorScheme.errorContainer) {
-                            Column(modifier = Modifier.fillMaxWidth().padding(16.dp)) {
-                                Text("خطای native", style = MaterialTheme.typography.titleMedium,
+                    if (nativeError != null) {
+                        Surface(color = MaterialTheme.colorScheme.errorContainer,
+                                modifier = Modifier.fillMaxWidth()) {
+                            Column(modifier = Modifier.padding(16.dp)) {
+                                Text("خطای native",
+                                    style = MaterialTheme.typography.titleMedium,
                                     color = MaterialTheme.colorScheme.onErrorContainer)
-                                Text(err, style = MaterialTheme.typography.bodySmall,
+                                Text(nativeError,
+                                    style = MaterialTheme.typography.bodySmall,
                                     color = MaterialTheme.colorScheme.onErrorContainer)
                             }
                         }
                     }
                     if (crashFiles.isNotEmpty()) {
-                        Surface(color = MaterialTheme.colorScheme.tertiaryContainer) {
-                            Column(modifier = Modifier.fillMaxWidth().padding(12.dp)) {
+                        Surface(color = MaterialTheme.colorScheme.tertiaryContainer,
+                                modifier = Modifier.fillMaxWidth()) {
+                            Column(modifier = Modifier.padding(12.dp)) {
                                 Text("${crashFiles.size} فایل کرش ذخیره‌شده",
                                     style = MaterialTheme.typography.titleSmall,
                                     color = MaterialTheme.colorScheme.onTertiaryContainer)
-                                Text("مسیر: ${crashFiles.first().parentFile?.absolutePath}",
+                                Text("مسیر: ${crashFiles.first().parentFile?.absolutePath ?: ""}",
                                     style = MaterialTheme.typography.bodySmall,
                                     color = MaterialTheme.colorScheme.onTertiaryContainer)
                             }
                         }
                     }
-                    Row(modifier = Modifier.fillMaxSize()) {
+                    // ★ Use weight(1f) instead of fillMaxSize — the latter conflicts
+                    // with the Column's other children and confuses SubcomposeLayout.
+                    Row(modifier = Modifier.weight(1f).fillMaxWidth()) {
                         Box(modifier = Modifier.weight(0.62f).fillMaxHeight()) {
-                            DesignCanvas(state, onSelect = { vm.select(it) }, onLongPress = { pendingDelete = it })
+                            DesignCanvas(state, onSelect = { vm.select(it) },
+                                onLongPress = { pendingDelete = it })
                         }
                         Box(modifier = Modifier.weight(0.38f).fillMaxHeight()) {
                             PropertiesPanel(state)
@@ -1070,15 +977,23 @@ jobs:
                     }
                 }
             }
-            if (showPalette) ComponentPaletteSheet(
-                onSelect = { t: WidgetType -> vm.addWidget(t); showPalette = false },
-                onDismiss = { showPalette = false }
-            )
-            if (showCode) CodeDialog(code = vm.generateCode(), onDismiss = { showCode = false })
-            pendingDelete?.let { id ->
-                ConfirmDeleteDialog(widgetId = id,
+
+            if (showPalette) {
+                ComponentPaletteSheet(
+                    onSelect = { t: WidgetType -> vm.addWidget(t); showPalette = false },
+                    onDismiss = { showPalette = false }
+                )
+            }
+            if (showCode) {
+                CodeDialog(code = vm.generateCode(), onDismiss = { showCode = false })
+            }
+            if (pendingDelete != null) {
+                val id = pendingDelete!!
+                ConfirmDeleteDialog(
+                    widgetId = id,
                     onConfirm = { state.deleteWidget(id); pendingDelete = null },
-                    onDismiss = { pendingDelete = null })
+                    onDismiss = { pendingDelete = null }
+                )
             }
         }
         EOF
@@ -1097,6 +1012,7 @@ jobs:
         }
         EOF
 
+        # ★ DesignCanvas — key() in forEach
         cat > android/app/src/main/java/com/raais/imstudio/ui/components/DesignCanvas.kt <<'EOF'
         package com.raais.imstudio.ui.components
 
@@ -1119,45 +1035,72 @@ jobs:
         import com.raais.imstudio.model.Widget
 
         @Composable
-        fun DesignCanvas(state: ImStudioState, onSelect: (Int?) -> Unit, onLongPress: (Int) -> Unit) {
+        fun DesignCanvas(
+            state: ImStudioState,
+            onSelect: (Int?) -> Unit,
+            onLongPress: (Int) -> Unit
+        ) {
             Box(modifier = Modifier.fillMaxSize().background(Color(0xFF121212))
                 .pointerInput(Unit) { detectTapGestures(onTap = { onSelect(null) }) }) {
                 Canvas(modifier = Modifier.fillMaxSize()) { drawGrid() }
+
+                // ★ Use key() to give each widget a stable identity.
+                // Without key(), Compose's slot table can get corrupted when
+                // items are added/removed.
                 state.widgets.forEach { w ->
-                    WidgetItem(w, state.selectedId.value == w.id,
-                        onSelect = { onSelect(w.id) }, onLongPress = { onLongPress(w.id) },
-                        onMove = { dx, dy -> state.moveWidget(w.id, w.x + dx, w.y + dy) })
+                    key(w.id) {
+                        WidgetItem(
+                            widget = w,
+                            isSelected = state.selectedId.value == w.id,
+                            onSelect = { onSelect(w.id) },
+                            onLongPress = { onLongPress(w.id) },
+                            onMove = { dx, dy -> state.moveWidget(w.id, w.x + dx, w.y + dy) }
+                        )
+                    }
                 }
             }
         }
+
         private fun DrawScope.drawGrid() {
             val c = Color(0xFF1F1F1F); val s = 24f
-            var x = 0f; while (x < size.width) { drawLine(c, Offset(x, 0f), Offset(x, size.height), 1f); x += s }
-            var y = 0f; while (y < size.height) { drawLine(c, Offset(0f, y), Offset(size.width, y), 1f); y += s }
+            var x = 0f
+            while (x < size.width) { drawLine(c, Offset(x, 0f), Offset(x, size.height), 1f); x += s }
+            var y = 0f
+            while (y < size.height) { drawLine(c, Offset(0f, y), Offset(size.width, y), 1f); y += s }
         }
+
         @Composable
-        private fun WidgetItem(w: Widget, isSel: Boolean, onSelect: () -> Unit,
-                               onLongPress: () -> Unit, onMove: (Float, Float) -> Unit) {
-            var drag by remember(w.id) { mutableStateOf(Offset.Zero) }
-            val dw = if (w.sizeX > 0f) w.sizeX.dp else w.width.dp
-            val dh = if (w.sizeY > 0f) w.sizeY.dp else 36.dp
+        private fun WidgetItem(
+            widget: Widget,
+            isSelected: Boolean,
+            onSelect: () -> Unit,
+            onLongPress: () -> Unit,
+            onMove: (Float, Float) -> Unit
+        ) {
+            var drag by remember(widget.id) { mutableStateOf(Offset.Zero) }
+            val w = if (widget.sizeX > 0f) widget.sizeX.dp else widget.width.dp
+            val h = if (widget.sizeY > 0f) widget.sizeY.dp else 36.dp
+
             Box(modifier = Modifier
-                .offset(x = (w.x + drag.x).dp, y = (w.y + drag.y).dp)
-                .size(width = dw, height = dh)
-                .background(if (isSel) Color(0xFF4A90D9) else Color(0xFF2C2C2C))
-                .pointerInput(w.id) { detectDragGestures(
-                    onDragStart = { onSelect() },
-                    onDrag = { ch, d -> ch.consume(); drag += d },
-                    onDragEnd = { onMove(drag.x, drag.y); drag = Offset.Zero }
-                )}
-                .pointerInput(w.id) { detectTapGestures(onLongPress = { onLongPress() }) },
+                .offset(x = (widget.x + drag.x).dp, y = (widget.y + drag.y).dp)
+                .size(width = w, height = h)
+                .background(if (isSelected) Color(0xFF4A90D9) else Color(0xFF2C2C2C))
+                .pointerInput(widget.id) {
+                    detectDragGestures(
+                        onDragStart = { onSelect() },
+                        onDrag = { ch, d -> ch.consume(); drag += d },
+                        onDragEnd = { onMove(drag.x, drag.y); drag = Offset.Zero }
+                    )
+                }
+                .pointerInput(widget.id) { detectTapGestures(onLongPress = { onLongPress() }) },
                 contentAlignment = Alignment.Center) {
-                Text(w.displayText, color = Color(0xFFE0E0E0), maxLines = 1,
+                Text(widget.displayText, color = Color(0xFFE0E0E0), maxLines = 1,
                     overflow = TextOverflow.Ellipsis)
             }
         }
         EOF
 
+        # ★ PropertiesPanel — no return@Column
         cat > android/app/src/main/java/com/raais/imstudio/ui/components/PropertiesPanel.kt <<'EOF'
         package com.raais.imstudio.ui.components
         import androidx.compose.foundation.background
@@ -1169,38 +1112,51 @@ jobs:
         import androidx.compose.ui.Modifier
         import androidx.compose.ui.unit.dp
         import com.raais.imstudio.engine.ImStudioState
+        import com.raais.imstudio.model.Widget
 
-        @Composable fun PropertiesPanel(state: ImStudioState) {
-            val sel = state.selected()
+        @Composable
+        fun PropertiesPanel(state: ImStudioState) {
+            val sel: Widget? = state.selected()
             Column(modifier = Modifier.fillMaxHeight()
                 .background(MaterialTheme.colorScheme.surface)
                 .verticalScroll(rememberScrollState()).padding(16.dp),
                 verticalArrangement = Arrangement.spacedBy(12.dp)) {
                 Text("ویژگی‌ها", style = MaterialTheme.typography.titleMedium)
-                if (sel == null) { Text("یک ویجت انتخاب کنید", color = MaterialTheme.colorScheme.onSurfaceVariant); return@Column }
-                OutlinedTextField(value = sel.label, onValueChange = { state.setLabel(sel.id, it) },
-                    label = { Text("Label") }, singleLine = true, modifier = Modifier.fillMaxWidth())
-                OutlinedTextField(value = sel.valueS, onValueChange = { state.setValueS(sel.id, it) },
-                    label = { Text("Value") }, singleLine = true, modifier = Modifier.fillMaxWidth())
-                Row(horizontalArrangement = Arrangement.spacedBy(8.dp)) {
-                    Num("X", sel.x) { state.moveWidget(sel.id, it, sel.y) }
-                    Num("Y", sel.y) { state.moveWidget(sel.id, sel.x, it) }
+                if (sel != null) {
+                    OutlinedTextField(value = sel.label,
+                        onValueChange = { state.setLabel(sel.id, it) },
+                        label = { Text("Label") }, singleLine = true,
+                        modifier = Modifier.fillMaxWidth())
+                    OutlinedTextField(value = sel.valueS,
+                        onValueChange = { state.setValueS(sel.id, it) },
+                        label = { Text("Value") }, singleLine = true,
+                        modifier = Modifier.fillMaxWidth())
+                    Row(horizontalArrangement = Arrangement.spacedBy(8.dp)) {
+                        Num("X", sel.x) { state.moveWidget(sel.id, it, sel.y) }
+                        Num("Y", sel.y) { state.moveWidget(sel.id, sel.x, it) }
+                    }
+                    Row(horizontalArrangement = Arrangement.spacedBy(8.dp)) {
+                        Num("Size X", sel.sizeX) { state.resizeWidget(sel.id, it, sel.sizeY) }
+                        Num("Size Y", sel.sizeY) { state.resizeWidget(sel.id, sel.sizeX, it) }
+                    }
+                    OutlinedTextField(value = sel.type, onValueChange = {}, enabled = false,
+                        label = { Text("Type") }, modifier = Modifier.fillMaxWidth())
+                    HorizontalDivider()
+                    Button(onClick = { state.deleteWidget(sel.id) },
+                        colors = ButtonDefaults.buttonColors(
+                            containerColor = MaterialTheme.colorScheme.error),
+                        modifier = Modifier.fillMaxWidth()) { Text("حذف ویجت") }
+                } else {
+                    Text("یک ویجت انتخاب کنید",
+                        color = MaterialTheme.colorScheme.onSurfaceVariant)
                 }
-                Row(horizontalArrangement = Arrangement.spacedBy(8.dp)) {
-                    Num("Size X", sel.sizeX) { state.resizeWidget(sel.id, it, sel.sizeY) }
-                    Num("Size Y", sel.sizeY) { state.resizeWidget(sel.id, sel.sizeX, it) }
-                }
-                OutlinedTextField(value = sel.type, onValueChange = {}, enabled = false,
-                    label = { Text("Type") }, modifier = Modifier.fillMaxWidth())
-                HorizontalDivider()
-                Button(onClick = { state.deleteWidget(sel.id) },
-                    colors = ButtonDefaults.buttonColors(containerColor = MaterialTheme.colorScheme.error),
-                    modifier = Modifier.fillMaxWidth()) { Text("حذف ویجت") }
             }
         }
-        @Composable private fun RowScope.Num(lbl: String, v: Float, onChange: (Float) -> Unit) {
-            OutlinedTextField(value = v.toString(), onValueChange = { it.toFloatOrNull()?.let(onChange) },
-                label = { Text(lbl) }, singleLine = true, modifier = Modifier.weight(1f))
+
+        @Composable private fun RowScope.Num(label: String, value: Float, onChange: (Float) -> Unit) {
+            OutlinedTextField(value = value.toString(),
+                onValueChange = { it.toFloatOrNull()?.let(onChange) },
+                label = { Text(label) }, singleLine = true, modifier = Modifier.weight(1f))
         }
         EOF
 
@@ -1222,12 +1178,18 @@ jobs:
                 LazyColumn(modifier = Modifier.fillMaxWidth().padding(horizontal = 16.dp),
                     verticalArrangement = Arrangement.spacedBy(4.dp)) {
                     WidgetCategory.entries.forEach { cat ->
-                        item { Text(cat.displayName, style = MaterialTheme.typography.titleSmall,
-                            modifier = Modifier.padding(vertical = 8.dp)) }
-                        items(WidgetType.entries.filter { it.category == cat }) { t ->
-                            ListItem(headlineContent = { Text(t.displayName) },
+                        item(key = "hdr_${cat.name}") {
+                            Text(cat.displayName, style = MaterialTheme.typography.titleSmall,
+                                modifier = Modifier.padding(vertical = 8.dp))
+                        }
+                        items(WidgetType.entries.filter { it.category == cat },
+                            key = { "t_${it.name}" }) { t ->
+                            ListItem(
+                                headlineContent = { Text(t.displayName) },
                                 supportingContent = { Text(t.nativeName) },
-                                trailingContent = { TextButton(onClick = { onSelect(t) }) { Text("افزودن") } })
+                                trailingContent = {
+                                    TextButton(onClick = { onSelect(t) }) { Text("افزودن") }
+                                })
                         }
                     }
                 }
@@ -1295,7 +1257,7 @@ jobs:
         EOF
 
     # ============================================================
-    # 8. .gitignore, README
+    # 8. gitignore, README
     # ============================================================
     - name: Write .gitignore & README
       run: |
@@ -1319,7 +1281,7 @@ jobs:
         cat > README.md <<'EOF'
         # ImStudio Android
         Native Android port of Raais/ImStudio with Jetpack Compose UI.
-        Crash logs are saved to: `/storage/emulated/0/Android/data/com.raais.imstudio/files/crashes/`
+        Crash logs: `/storage/emulated/0/Android/data/com.raais.imstudio/files/crashes/`
         EOF
 
     # ============================================================
@@ -1331,7 +1293,7 @@ jobs:
         git config user.email "bot@imstudio.local"
         git add -A
         if git diff --staged --quiet; then echo "Nothing to commit"; else
-          git commit -m "fix(android): correct code_generator + IM_ASSERT via -include + crash logger (sync @ ${UPSTREAM_SHA})"
+          git commit -m "fix(android): slot-table corruption — VM before composition + key() + Row weight (sync @ ${UPSTREAM_SHA})"
           git push
         fi
       env:
