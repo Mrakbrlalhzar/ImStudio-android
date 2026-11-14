@@ -1,4 +1,4 @@
-name: Fix Code Icon Import & Build
+name: Native ImGui Editor (Stage 1+2)
 
 on:
   push:
@@ -9,319 +9,915 @@ permissions:
   contents: write
 
 jobs:
-  fix-and-build:
+  build-native-imgui:
     runs-on: ubuntu-latest
     steps:
-    - name: Checkout
+    - name: Checkout target repo
       uses: actions/checkout@v4
       with:
         fetch-depth: 0
         persist-credentials: true
 
-    - name: Rewrite EditorScreen.kt with correct import
+    - name: Clone upstream ImStudio (source of ImGui)
       run: |
-        mkdir -p android/app/src/main/java/com/raais/imstudio/ui/screens
-        cat > android/app/src/main/java/com/raais/imstudio/ui/screens/EditorScreen.kt <<'EOF'
-        package com.raais.imstudio.ui.screens
+        git clone --depth 1 https://github.com/Raais/ImStudio /tmp/ImStudio
+        echo "IMSTUDIO_SHA=$(cd /tmp/ImStudio && git rev-parse --short HEAD)" >> $GITHUB_ENV
 
-        import android.content.Intent
-        import android.net.Uri
-        import android.util.Log
-        import android.widget.Toast
-        import androidx.activity.compose.rememberLauncherForActivityResult
-        import androidx.activity.result.contract.ActivityResultContracts
-        import androidx.compose.foundation.layout.*
-        import androidx.compose.material.icons.Icons
-        import androidx.compose.material.icons.filled.Add
-        import androidx.compose.material.icons.filled.Code
-        import androidx.compose.material.icons.filled.Delete
-        import androidx.compose.material.icons.filled.Folder
-        import androidx.compose.material.icons.filled.FolderOpen
-        import androidx.compose.material.icons.filled.Input
-        import androidx.compose.material.icons.filled.Save
-        import androidx.compose.material3.*
-        import androidx.compose.runtime.*
-        import androidx.compose.ui.Modifier
-        import androidx.compose.ui.platform.LocalContext
-        import androidx.compose.ui.unit.dp
-        import androidx.documentfile.provider.DocumentFile
-        import com.raais.imstudio.engine.EditorViewModel
-        import com.raais.imstudio.model.WidgetType
-        import com.raais.imstudio.ui.components.ComponentPaletteSheet
-        import com.raais.imstudio.ui.components.DesignCanvas
-        import com.raais.imstudio.ui.components.PropertiesPanel
-        import com.raais.imstudio.ui.dialogs.CodeDialog
-        import com.raais.imstudio.ui.dialogs.ConfirmDeleteDialog
-        import com.raais.imstudio.ui.dialogs.ImportReportDialog
-        import com.raais.imstudio.util.CrashLogger
-        import kotlinx.coroutines.Dispatchers
-        import kotlinx.coroutines.launch
-        import kotlinx.coroutines.withContext
-        import java.io.File
+    - name: Clean old native imgui project
+      run: rm -rf android/app/src/main/cpp/vendor/imgui 2>/dev/null || true
 
-        @OptIn(ExperimentalMaterial3Api::class)
-        @Composable
-        fun EditorScreen(vm: EditorViewModel) {
-            val state = vm.state
-            val ctx = LocalContext.current
-            val scope = rememberCoroutineScope()
-            val nativeError = state.nativeError.value
-            val lastMessage = state.lastMessage.value
-            val lastReport = state.lastImportReport.value
-            val crashFiles: List<File> = remember {
-                try { CrashLogger.listCrashFiles(ctx) } catch (_: Throwable) { emptyList() }
-            }
-            var showCode by remember { mutableStateOf(false) }
-            var showPalette by remember { mutableStateOf(false) }
-            var showReport by remember { mutableStateOf(false) }
-            var pendingDelete by remember { mutableStateOf<Int?>(null) }
-            var pendingClear by remember { mutableStateOf(false) }
-            var importRunning by remember { mutableStateOf(false) }
+    - name: Copy ImGui sources
+      run: |
+        SRC=/tmp/ImStudio/src/third-party/imgui
+        DST=android/app/src/main/cpp/vendor/imgui
+        mkdir -p $DST/backends $DST/misc/cpp
 
-            val loadLauncher = rememberLauncherForActivityResult(
-                ActivityResultContracts.OpenDocument()
-            ) { uri: Uri? ->
-                uri ?: return@rememberLauncherForActivityResult
-                try {
-                    val text = ctx.contentResolver.openInputStream(uri)
-                        ?.use { it.bufferedReader().readText() } ?: ""
-                    val ok = vm.loadFromText(text)
-                    Toast.makeText(ctx,
-                        if (ok) "JSON بارگذاری شد" else "فرمت JSON نامعتبر",
-                        Toast.LENGTH_LONG).show()
-                } catch (t: Throwable) {
-                    Toast.makeText(ctx, "خطا: ${t.message}", Toast.LENGTH_LONG).show()
-                }
-            }
+        for f in imgui.cpp imgui_draw.cpp imgui_tables.cpp imgui_widgets.cpp \
+                 imgui.h imgui_internal.h imconfig.h \
+                 imstb_rectpack.h imstb_textedit.h imstb_truetype.h; do
+            [ -f "$SRC/$f" ] && cp "$SRC/$f" "$DST/"
+        done
 
-            val saveLauncher = rememberLauncherForActivityResult(
-                ActivityResultContracts.CreateDocument("application/json")
-            ) { uri: Uri? ->
-                uri ?: return@rememberLauncherForActivityResult
-                try {
-                    val json = vm.dumpToJson()
-                    ctx.contentResolver.openOutputStream(uri)
-                        ?.use { it.write(json.toByteArray()) }
-                    Toast.makeText(ctx, "ذخیره شد", Toast.LENGTH_SHORT).show()
-                } catch (t: Throwable) {
-                    Toast.makeText(ctx, "خطا: ${t.message}", Toast.LENGTH_LONG).show()
-                }
-            }
+        for f in imgui_impl_android.cpp imgui_impl_android.h \
+                 imgui_impl_opengl3.cpp imgui_impl_opengl3.h \
+                 imgui_impl_opengl3_loader.h; do
+            [ -f "$SRC/backends/$f" ] && cp "$SRC/backends/$f" "$DST/backends/"
+        done
 
-            val importCppLauncher = rememberLauncherForActivityResult(
-                ActivityResultContracts.OpenDocument()
-            ) { uri: Uri? ->
-                uri ?: return@rememberLauncherForActivityResult
-                try {
-                    val text = ctx.contentResolver.openInputStream(uri)
-                        ?.use { it.bufferedReader().readText() } ?: ""
-                    val ok = vm.importFromCpp(text)
-                    Toast.makeText(ctx,
-                        if (ok) "کد ایمپورت شد" else "ویجت ImGui پیدا نشد",
-                        Toast.LENGTH_LONG).show()
-                } catch (t: Throwable) {
-                    Toast.makeText(ctx, "خطا: ${t.message}", Toast.LENGTH_LONG).show()
-                }
-            }
+        # Sanity check
+        if [ ! -f "$DST/backends/imgui_impl_android.cpp" ]; then
+            echo "ERROR: imgui_impl_android.cpp not found in ImStudio vendored imgui"
+            echo "Falling back to official imgui repository..."
+            git clone --depth 1 --branch v1.90.9 https://github.com/ocornut/imgui /tmp/imgui-official
+            cp /tmp/imgui-official/imgui.cpp /tmp/imgui-official/imgui_draw.cpp \
+               /tmp/imgui-official/imgui_tables.cpp /tmp/imgui-official/imgui_widgets.cpp \
+               /tmp/imgui-official/imgui.h /tmp/imgui-official/imgui_internal.h \
+               /tmp/imgui-official/imconfig.h \
+               /tmp/imgui-official/imstb_rectpack.h /tmp/imgui-official/imstb_textedit.h \
+               /tmp/imgui-official/imstb_truetype.h "$DST/"
+            cp /tmp/imgui-official/backends/imgui_impl_android.cpp \
+               /tmp/imgui-official/backends/imgui_impl_android.h \
+               /tmp/imgui-official/backends/imgui_impl_opengl3.cpp \
+               /tmp/imgui-official/backends/imgui_impl_opengl3.h \
+               /tmp/imgui-official/backends/imgui_impl_opengl3_loader.h "$DST/backends/"
+        fi
 
-            val folderLauncher = rememberLauncherForActivityResult(
-                ActivityResultContracts.OpenDocumentTree()
-            ) { uri: Uri? ->
-                uri ?: return@rememberLauncherForActivityResult
-                try {
-                    ctx.contentResolver.takePersistableUriPermission(
-                        uri, Intent.FLAG_GRANT_READ_URI_PERMISSION)
-                } catch (_: Throwable) {}
-                importRunning = true
-                scope.launch {
-                    val result = withContext(Dispatchers.IO) {
-                        try {
-                            val tree = DocumentFile.fromTreeUri(ctx, uri)
-                                ?: return@withContext null
-                            val out = mutableListOf<Pair<String, String>>()
-                            tree.listFiles().forEach { f ->
-                                if (!f.isFile) return@forEach
-                                val name = f.name ?: return@forEach
-                                val lower = name.lowercase()
-                                val ok = lower.endsWith(".cpp") || lower.endsWith(".cc") ||
-                                        lower.endsWith(".cxx") || lower.endsWith(".h") ||
-                                        lower.endsWith(".hpp") || lower.endsWith(".inl")
-                                if (!ok) return@forEach
-                                try {
-                                    val content = ctx.contentResolver.openInputStream(f.uri)
-                                        ?.use { it.bufferedReader().readText() } ?: ""
-                                    out.add(name to content)
-                                } catch (t: Throwable) {
-                                    Log.w("FolderImport", "read $name failed", t)
-                                }
-                            }
-                            out.sortWith(compareBy(
-                                { pair ->
-                                    val n = pair.first.lowercase()
-                                    when {
-                                        n.endsWith(".cpp") || n.endsWith(".cc") ||
-                                            n.endsWith(".cxx") -> 0
-                                        n.endsWith(".hpp") || n.endsWith(".h") ||
-                                            n.endsWith(".inl") -> 1
-                                        else -> 2
-                                    }
-                                },
-                                { it.first.lowercase() }
-                            ))
-                            out
-                        } catch (t: Throwable) {
-                            Log.e("FolderImport", "read failed", t)
-                            null
-                        }
-                    }
-                    if (result.isNullOrEmpty()) {
-                        importRunning = false
-                        Toast.makeText(ctx, "فایلی پیدا نشد", Toast.LENGTH_LONG).show()
-                    } else {
-                        val report = vm.importFromFiles(result)
-                        importRunning = false
-                        if (report != null) showReport = true
-                        else Toast.makeText(ctx, "ایمپورت ناموفق", Toast.LENGTH_LONG).show()
+        ls -la $DST/ $DST/backends/
+
+    - name: Write Android project skeleton
+      run: |
+        mkdir -p android/app/src/main/java/com/example/imguieditor
+        mkdir -p android/app/src/main/cpp
+        mkdir -p android/app/src/main/res/values
+
+        cat > android/settings.gradle.kts <<'EOF'
+        pluginManagement {
+            repositories { google(); mavenCentral(); gradlePluginPortal() }
+        }
+        dependencyResolutionManagement {
+            repositoriesMode.set(RepositoriesMode.FAIL_ON_PROJECT_REPOS)
+            repositories { google(); mavenCentral() }
+        }
+        rootProject.name = "ImGuiNativeEditor"
+        include(":app")
+        EOF
+
+        cat > android/build.gradle.kts <<'EOF'
+        plugins {
+            id("com.android.application") version "8.2.0" apply false
+            id("org.jetbrains.kotlin.android") version "1.9.22" apply false
+        }
+        EOF
+
+        cat > android/gradle.properties <<'EOF'
+        android.useAndroidX=true
+        android.nonTransitiveRClass=true
+        org.gradle.jvmargs=-Xmx4g -Dfile.encoding=UTF-8
+        EOF
+
+        cat > android/app/build.gradle.kts <<'EOF'
+        plugins {
+            id("com.android.application")
+            id("org.jetbrains.kotlin.android")
+        }
+        android {
+            namespace = "com.example.imguieditor"
+            compileSdk = 34
+            ndkVersion = "26.1.10909125"
+
+            defaultConfig {
+                applicationId = "com.example.imguieditor"
+                minSdk = 24
+                targetSdk = 34
+                versionCode = 1
+                versionName = "1.0"
+                externalNativeBuild {
+                    cmake {
+                        cppFlags += "-std=c++17 -fexceptions"
+                        arguments += "-DANDROID_STL=c++_shared"
                     }
                 }
+                ndk { abiFilters += listOf("arm64-v8a", "armeabi-v7a") }
             }
-
-            LaunchedEffect(Unit) { vm.refresh() }
-
-            Scaffold(
-                topBar = {
-                    TopAppBar(
-                        title = { Text(if (importRunning) "در حال ایمپورت..." else "ImStudio") },
-                        actions = {
-                            if (!importRunning) {
-                                IconButton(onClick = { folderLauncher.launch(null) }) {
-                                    Icon(Icons.Default.Folder, contentDescription = "ایمپورت فولدر")
-                                }
-                                IconButton(onClick = { importCppLauncher.launch(arrayOf("*/*")) }) {
-                                    Icon(Icons.Default.Input, contentDescription = "ایمپورت فایل C++")
-                                }
-                                IconButton(onClick = { loadLauncher.launch(arrayOf("*/*")) }) {
-                                    Icon(Icons.Default.FolderOpen, contentDescription = "بارگذاری JSON")
-                                }
-                                IconButton(onClick = { saveLauncher.launch("imstudio_project.json") }) {
-                                    Icon(Icons.Default.Save, contentDescription = "ذخیره")
-                                }
-                                IconButton(onClick = { showCode = true }) {
-                                    Icon(Icons.Default.Code, contentDescription = "کد")
-                                }
-                                IconButton(onClick = { pendingClear = true }) {
-                                    Icon(Icons.Default.Delete, contentDescription = "پاک‌سازی")
-                                }
-                            } else {
-                                CircularProgressIndicator(
-                                    modifier = Modifier.size(24.dp), strokeWidth = 2.dp)
-                            }
-                        }
-                    )
-                },
-                floatingActionButton = {
-                    if (!importRunning) {
-                        FloatingActionButton(onClick = {
-                            if (nativeError == null) showPalette = true
-                        }) {
-                            Icon(Icons.Default.Add, contentDescription = "افزودن")
-                        }
-                    }
-                }
-            ) { padding ->
-                Column(modifier = Modifier.padding(padding).fillMaxSize()) {
-                    if (nativeError != null) {
-                        Surface(color = MaterialTheme.colorScheme.errorContainer) {
-                            Column(Modifier.padding(16.dp)) {
-                                Text("خطای native",
-                                    style = MaterialTheme.typography.titleMedium)
-                                Text(nativeError,
-                                    style = MaterialTheme.typography.bodySmall)
-                            }
-                        }
-                    }
-                    if (lastMessage != null) {
-                        Surface(color = MaterialTheme.colorScheme.secondaryContainer) {
-                            Row(
-                                modifier = Modifier.padding(12.dp).fillMaxWidth(),
-                                horizontalArrangement = Arrangement.SpaceBetween
-                            ) {
-                                Text(lastMessage,
-                                    style = MaterialTheme.typography.bodySmall)
-                                if (lastReport != null) {
-                                    TextButton(onClick = { showReport = true }) {
-                                        Text("گزارش")
-                                    }
-                                }
-                            }
-                        }
-                    }
-                    if (crashFiles.isNotEmpty()) {
-                        Surface(color = MaterialTheme.colorScheme.tertiaryContainer) {
-                            Text("${crashFiles.size} فایل کرش ذخیره‌شده",
-                                Modifier.padding(12.dp),
-                                style = MaterialTheme.typography.bodySmall)
-                        }
-                    }
-                    Row(modifier = Modifier.weight(1f).fillMaxWidth()) {
-                        Box(modifier = Modifier.weight(0.62f).fillMaxHeight()) {
-                            DesignCanvas(
-                                state = state,
-                                onSelect = { vm.select(it) },
-                                onLongPress = { pendingDelete = it }
-                            )
-                        }
-                        Box(modifier = Modifier.weight(0.38f).fillMaxHeight()) {
-                            PropertiesPanel(state)
-                        }
-                    }
-                }
+            externalNativeBuild {
+                cmake { path = file("src/main/cpp/CMakeLists.txt") }
             }
-
-            if (showPalette) ComponentPaletteSheet(
-                onSelect = { t: WidgetType -> vm.addWidget(t); showPalette = false },
-                onDismiss = { showPalette = false })
-            if (showCode) CodeDialog(code = vm.generateCode(),
-                onDismiss = { showCode = false })
-            if (showReport) lastReport?.let { rep ->
-                ImportReportDialog(report = rep, onDismiss = { showReport = false })
-            }
-            if (pendingDelete != null) {
-                val id = pendingDelete!!
-                ConfirmDeleteDialog(
-                    widgetId = id,
-                    onConfirm = { state.deleteWidget(id); pendingDelete = null },
-                    onDismiss = { pendingDelete = null }
-                )
-            }
-            if (pendingClear) {
-                AlertDialog(
-                    onDismissRequest = { pendingClear = false },
-                    title = { Text("پاک‌سازی") },
-                    text = { Text("همه ویجت‌ها حذف شوند؟") },
-                    confirmButton = {
-                        TextButton(onClick = {
-                            vm.clearAll(); pendingClear = false
-                        }) { Text("پاک کن") }
-                    },
-                    dismissButton = {
-                        TextButton(onClick = { pendingClear = false }) { Text("لغو") }
-                    }
-                )
+            buildFeatures { buildConfig = true }
+            compileOptions {
+                sourceCompatibility = JavaVersion.VERSION_1_8
+                targetCompatibility = JavaVersion.VERSION_1_8
             }
         }
         EOF
-        echo "EditorScreen.kt rewritten with Icons.Default.Code fix"
 
-    - name: Commit fix
+        cat > android/app/src/main/AndroidManifest.xml <<'EOF'
+        <?xml version="1.0" encoding="utf-8"?>
+        <manifest xmlns:android="http://schemas.android.com/apk/res/android">
+            <application
+                android:label="@string/app_name"
+                android:hasCode="true"
+                android:theme="@android:style/Theme.NoTitleBar.Fullscreen">
+                <activity
+                    android:name=".MainActivity"
+                    android:exported="true"
+                    android:configChanges="orientation|keyboardHidden|screenSize"
+                    android:theme="@android:style/Theme.NoTitleBar.Fullscreen">
+                    <meta-data
+                        android:name="android.app.lib_name"
+                        android:value="imgui_editor" />
+                    <intent-filter>
+                        <action android:name="android.intent.action.MAIN" />
+                        <category android:name="android.intent.category.LAUNCHER" />
+                    </intent-filter>
+                </activity>
+            </application>
+        </manifest>
+        EOF
+
+        cat > android/app/src/main/res/values/strings.xml <<'EOF'
+        <resources>
+            <string name="app_name">ImGui Native Editor</string>
+        </resources>
+        EOF
+
+        cat > android/app/src/main/java/com/example/imguieditor/MainActivity.java <<'EOF'
+        package com.example.imguieditor;
+
+        import android.app.NativeActivity;
+        import android.os.Bundle;
+        import android.util.Log;
+
+        public class MainActivity extends NativeActivity {
+            static {
+                try {
+                    System.loadLibrary("imgui_editor");
+                    Log.i("ImGuiEditor", "libimgui_editor.so loaded");
+                } catch (Throwable t) {
+                    Log.e("ImGuiEditor", "Failed to load native library", t);
+                }
+            }
+        }
+        EOF
+
+    - name: Write widget_model.h
       run: |
-        git config user.name "ImStudio Sync Bot"
-        git config user.email "bot@imstudio.local"
+        cat > android/app/src/main/cpp/widget_model.h <<'EOF'
+        #pragma once
+        #include <string>
+        #include <vector>
+        #include <cstring>
+
+        // Widget types recognized by the model
+        enum class WidgetKind {
+            Button, Checkbox, Radio, SliderFloat, SliderInt,
+            DragFloat, InputText, Combo, Text, ProgressBar,
+            Separator, SameLine, Spacing
+        };
+
+        struct Widget {
+            int id = 0;
+            WidgetKind kind = WidgetKind::Button;
+            char label[128] = "Widget";     // for display / edit
+            char valueBuf[256] = "";        // for InputText
+            float x = 50.0f;
+            float y = 50.0f;
+            float w = 180.0f;
+            float h = 0.0f;                 // 0 = auto
+            bool checked = false;
+            float floatValue = 0.5f;
+            int intValue = 0;
+            float minValue = 0.0f;
+            float maxValue = 1.0f;
+            int comboIndex = 0;
+            std::vector<std::string> comboItems;
+            std::string groupName;          // For grouping in inspector
+        };
+
+        // A group is a logical section (like a window or tab).
+        struct WidgetGroup {
+            std::string name;
+            float x = 20.0f;
+            float y = 20.0f;
+            float w = 300.0f;
+        };
+
+        class WidgetModel {
+        public:
+            std::vector<WidgetGroup> groups;
+            std::vector<Widget> widgets;
+            int selectedId = -1;
+            int nextId = 1;
+            bool editMode = true;   // true = drag to move; false = interact normally
+            bool showInspector = true;
+
+            void clear();
+            void initDemo();        // populate with demo widgets
+            Widget* find(int id);
+            Widget* add(WidgetKind kind, const char* label, const char* group,
+                        float x, float y, float w = 180.0f);
+            void remove(int id);
+            int countInGroup(const std::string& group) const;
+        };
+        EOF
+
+    - name: Write widget_model.cpp
+      run: |
+        cat > android/app/src/main/cpp/widget_model.cpp <<'EOF'
+        #include "widget_model.h"
+        #include <cstring>
+        #include <algorithm>
+
+        void WidgetModel::clear() {
+            groups.clear();
+            widgets.clear();
+            selectedId = -1;
+            nextId = 1;
+        }
+
+        Widget* WidgetModel::find(int id) {
+            for (auto& w : widgets) if (w.id == id) return &w;
+            return nullptr;
+        }
+
+        Widget* WidgetModel::add(WidgetKind kind, const char* label, const char* group,
+                                 float x, float y, float w) {
+            Widget w;
+            w.id = nextId++;
+            w.kind = kind;
+            std::strncpy(w.label, label ? label : "", sizeof(w.label) - 1);
+            w.label[sizeof(w.label) - 1] = 0;
+            w.x = x;
+            w.y = y;
+            w.w = w;
+            w.groupName = group ? group : "";
+            widgets.push_back(w);
+            return &widgets.back();
+        }
+
+        void WidgetModel::remove(int id) {
+            widgets.erase(std::remove_if(widgets.begin(), widgets.end(),
+                [id](const Widget& w) { return w.id == id; }), widgets.end());
+            if (selectedId == id) selectedId = -1;
+        }
+
+        int WidgetModel::countInGroup(const std::string& group) const {
+            int n = 0;
+            for (auto& w : widgets) if (w.groupName == group) n++;
+            return n;
+        }
+
+        void WidgetModel::initDemo() {
+            clear();
+
+            groups.push_back({"Aimbot", 30, 30, 320});
+            groups.push_back({"ESP",     30, 30, 320});  // same area, different tab later
+            groups.push_back({"Misc",    30, 30, 320});
+            groups.push_back({"About",   400, 30, 320});
+
+            // --- Aimbot group widgets ---
+            {
+                float y = 80.0f;
+                auto* w = add(WidgetKind::Checkbox, "Enable Aimbot", "Aimbot", 50, y);
+                w->checked = true;
+                w = add(WidgetKind::SliderFloat, "FOV", "Aimbot", 50, y += 40);
+                w->minValue = 0.0f; w->maxValue = 180.0f; w->floatValue = 45.0f;
+                w = add(WidgetKind::SliderFloat, "Smoothing", "Aimbot", 50, y += 40);
+                w->minValue = 0.0f; w->maxValue = 100.0f; w->floatValue = 30.0f;
+                w = add(WidgetKind::Combo, "Target Bone", "Aimbot", 50, y += 40);
+                w->comboItems = {"Head", "Chest", "Pelvis", "Legs"};
+                w = add(WidgetKind::Button, "Apply Aim Settings", "Aimbot", 50, y += 40, 240);
+            }
+
+            // --- ESP group widgets ---
+            {
+                float y = 80.0f;
+                auto* w = add(WidgetKind::Checkbox, "Enable ESP", "ESP", 50, y);
+                w->checked = true;
+                w = add(WidgetKind::Checkbox, "Box ESP", "ESP", 50, y += 36);
+                w->checked = true;
+                w = add(WidgetKind::Checkbox, "Health Bar", "ESP", 50, y += 36);
+                w = add(WidgetKind::SliderFloat, "Thickness", "ESP", 50, y += 40);
+                w->minValue = 0.5f; w->maxValue = 5.0f; w->floatValue = 1.5f;
+                w = add(WidgetKind::Button, "Reset ESP", "ESP", 50, y += 40, 200);
+            }
+
+            // --- Misc group widgets ---
+            {
+                float y = 80.0f;
+                auto* w = add(WidgetKind::Checkbox, "Anti-Flash", "Misc", 50, y);
+                w->checked = true;
+                w = add(WidgetKind::SliderFloat, "FOV Changer", "Misc", 50, y += 40);
+                w->minValue = 60.0f; w->maxValue = 120.0f; w->floatValue = 90.0f;
+                w = add(WidgetKind::InputText, "Player Name", "Misc", 50, y += 40);
+                std::strncpy(w->valueBuf, "Player", sizeof(w->valueBuf) - 1);
+                w = add(WidgetKind::Button, "Save Config", "Misc", 50, y += 50, 200);
+            }
+
+            // --- About group widgets ---
+            {
+                float y = 80.0f;
+                add(WidgetKind::Text, "ImGui Native Editor", "About", 420, y);
+                add(WidgetKind::Text, "Stage 1+2 Demo", "About", 420, y += 28);
+                add(WidgetKind::Separator, "", "About", 420, y += 30);
+                add(WidgetKind::Text, "Click any widget to select it", "About", 420, y += 20);
+                add(WidgetKind::Text, "Drag in Edit Mode to move it", "About", 420, y += 20);
+                add(WidgetKind::Text, "Use Inspector to edit values", "About", 420, y += 20);
+                add(WidgetKind::Button, "Reset Demo", "About", 420, y += 40, 200);
+            }
+        }
+        EOF
+
+    - name: Write android_main.cpp
+      run: |
+        cat > android/app/src/main/cpp/android_main.cpp <<'EOF'
+        #include <android/log.h>
+        #include <android_native_app_glue.h>
+        #include <EGL/egl.h>
+        #include <GLES3/gl3.h>
+        #include <cmath>
+        #include <cstring>
+
+        #include "imgui.h"
+        #include "imgui_impl_android.h"
+        #include "imgui_impl_opengl3.h"
+
+        #include "widget_model.h"
+
+        #define LOG_TAG "ImGuiEditor"
+        #define LOGI(...) __android_log_print(ANDROID_LOG_INFO, LOG_TAG, __VA_ARGS__)
+        #define LOGE(...) __android_log_print(ANDROID_LOG_ERROR, LOG_TAG, __VA_ARGS__)
+
+        struct EngineState {
+            EGLDisplay display = EGL_NO_DISPLAY;
+            EGLSurface surface = EGL_NO_SURFACE;
+            EGLContext context = EGL_NO_CONTEXT;
+            bool eglReady = false;
+            bool imguiReady = false;
+            int width = 0;
+            int height = 0;
+            bool animating = true;
+            WidgetModel model;
+        };
+
+        static EngineState g_Engine;
+
+        // ============================================================
+        // EGL initialization
+        // ============================================================
+        static bool init_egl(android_app* app) {
+            if (g_Engine.eglReady) return true;
+
+            if (!app->window) {
+                LOGE("init_egl: no native window");
+                return false;
+            }
+
+            g_Engine.width = ANativeWindow_getWidth(app->window);
+            g_Engine.height = ANativeWindow_getHeight(app->window);
+            LOGI("init_egl: window %dx%d", g_Engine.width, g_Engine.height);
+
+            g_Engine.display = eglGetDisplay(EGL_DEFAULT_DISPLAY);
+            if (g_Engine.display == EGL_NO_DISPLAY) { LOGE("no display"); return false; }
+
+            EGLint major, minor;
+            if (!eglInitialize(g_Engine.display, &major, &minor)) {
+                LOGE("eglInitialize failed");
+                return false;
+            }
+            LOGI("EGL %d.%d", major, minor);
+
+            const EGLint attribs[] = {
+                EGL_SURFACE_TYPE, EGL_WINDOW_BIT,
+                EGL_RENDERABLE_TYPE, EGL_OPENGL_ES3_BIT,
+                EGL_BLUE_SIZE, 8, EGL_GREEN_SIZE, 8, EGL_RED_SIZE, 8,
+                EGL_ALPHA_SIZE, 8, EGL_DEPTH_SIZE, 24,
+                EGL_NONE
+            };
+            EGLConfig config;
+            EGLint numConfigs;
+            if (!eglChooseConfig(g_Engine.display, attribs, &config, 1, &numConfigs) || numConfigs == 0) {
+                LOGE("no matching config");
+                return false;
+            }
+
+            g_Engine.surface = eglCreateWindowSurface(g_Engine.display, config, app->window, nullptr);
+            if (g_Engine.surface == EGL_NO_SURFACE) { LOGE("create surface failed"); return false; }
+
+            const EGLint ctxAttribs[] = { EGL_CONTEXT_CLIENT_VERSION, 3, EGL_NONE };
+            g_Engine.context = eglCreateContext(g_Engine.display, config, EGL_NO_CONTEXT, ctxAttribs);
+            if (g_Engine.context == EGL_NO_CONTEXT) { LOGE("create context failed"); return false; }
+
+            if (!eglMakeCurrent(g_Engine.display, g_Engine.surface, g_Engine.surface, g_Engine.context)) {
+                LOGE("eglMakeCurrent failed");
+                return false;
+            }
+
+            g_Engine.eglReady = true;
+            LOGI("EGL ready");
+            return true;
+        }
+
+        static void destroy_egl_surface_only() {
+            if (g_Engine.display != EGL_NO_DISPLAY) {
+                eglMakeCurrent(g_Engine.display, EGL_NO_SURFACE, EGL_NO_SURFACE, EGL_NO_CONTEXT);
+                if (g_Engine.surface != EGL_NO_SURFACE) {
+                    eglDestroySurface(g_Engine.display, g_Engine.surface);
+                    g_Engine.surface = EGL_NO_SURFACE;
+                }
+            }
+            g_Engine.eglReady = false;
+            LOGI("EGL surface destroyed (context preserved)");
+        }
+
+        static void destroy_egl_all() {
+            if (g_Engine.display != EGL_NO_DISPLAY) {
+                eglMakeCurrent(g_Engine.display, EGL_NO_SURFACE, EGL_NO_SURFACE, EGL_NO_CONTEXT);
+                if (g_Engine.context != EGL_NO_CONTEXT) {
+                    eglDestroyContext(g_Engine.display, g_Engine.context);
+                    g_Engine.context = EGL_NO_CONTEXT;
+                }
+                if (g_Engine.surface != EGL_NO_SURFACE) {
+                    eglDestroySurface(g_Engine.display, g_Engine.surface);
+                    g_Engine.surface = EGL_NO_SURFACE;
+                }
+                eglTerminate(g_Engine.display);
+                g_Engine.display = EGL_NO_DISPLAY;
+            }
+            g_Engine.eglReady = false;
+        }
+
+        // ============================================================
+        // ImGui init
+        // ============================================================
+        static bool init_imgui(android_app* app) {
+            if (g_Engine.imguiReady) return true;
+            if (!app->window) return false;
+
+            IMGUI_CHECKVERSION();
+            ImGui::CreateContext();
+            ImGuiIO& io = ImGui::GetIO();
+            io.IniFilename = nullptr;   // don't save imgui.ini
+            io.LogFilename = nullptr;
+            io.ConfigFlags |= ImGuiConfigFlags_IsTouchScreen;
+
+            // Dark theme
+            ImGui::StyleColorsDark();
+            ImGuiStyle& style = ImGui::GetStyle();
+            style.WindowRounding = 6.0f;
+            style.FrameRounding = 4.0f;
+            style.ScrollbarRounding = 4.0f;
+            style.GrabRounding = 4.0f;
+            style.FramePadding = ImVec2(8, 6);
+            style.ItemSpacing = ImVec2(8, 8);
+
+            ImGui_ImplAndroid_Init(app->window);
+            ImGui_ImplOpenGL3_Init("#version 300 es");
+
+            g_Engine.imguiReady = true;
+            LOGI("ImGui initialized");
+            return true;
+        }
+
+        static void destroy_imgui() {
+            if (!g_Engine.imguiReady) return;
+            ImGui_ImplOpenGL3_Shutdown();
+            ImGui_ImplAndroid_Shutdown();
+            ImGui::DestroyContext();
+            g_Engine.imguiReady = false;
+            LOGI("ImGui destroyed");
+        }
+
+        // ============================================================
+        // Widget rendering
+        // ============================================================
+        static void render_widget(Widget& w) {
+            ImGui::PushID(w.id);
+            ImGui::SetCursorPos(ImVec2(w.x, w.y));
+
+            const ImVec2 size = (w.h > 0) ? ImVec2(w.w, w.h) : ImVec2(w.w, 0);
+
+            switch (w.kind) {
+                case WidgetKind::Button:
+                    ImGui::Button(w.label, size);
+                    break;
+                case WidgetKind::Checkbox:
+                    ImGui::Checkbox(w.label, &w.checked);
+                    break;
+                case WidgetKind::Radio:
+                    ImGui::RadioButton(w.label, w.checked);
+                    break;
+                case WidgetKind::SliderFloat:
+                    ImGui::SetNextItemWidth(w.w);
+                    ImGui::SliderFloat(w.label, &w.floatValue, w.minValue, w.maxValue);
+                    break;
+                case WidgetKind::SliderInt:
+                    ImGui::SetNextItemWidth(w.w);
+                    ImGui::SliderInt(w.label, &w.intValue, (int)w.minValue, (int)w.maxValue);
+                    break;
+                case WidgetKind::DragFloat:
+                    ImGui::SetNextItemWidth(w.w);
+                    ImGui::DragFloat(w.label, &w.floatValue, 0.01f, w.minValue, w.maxValue);
+                    break;
+                case WidgetKind::InputText:
+                    ImGui::SetNextItemWidth(w.w);
+                    ImGui::InputText(w.label, w.valueBuf, sizeof(w.valueBuf));
+                    break;
+                case WidgetKind::Combo: {
+                    ImGui::SetNextItemWidth(w.w);
+                    std::vector<const char*> items;
+                    items.reserve(w.comboItems.size());
+                    for (auto& s : w.comboItems) items.push_back(s.c_str());
+                    if (!items.empty()) {
+                        ImGui::Combo(w.label, &w.comboIndex, items.data(), (int)items.size());
+                    }
+                    break;
+                }
+                case WidgetKind::Text:
+                    ImGui::TextUnformatted(w.label);
+                    break;
+                case WidgetKind::ProgressBar:
+                    ImGui::ProgressBar(w.floatValue, ImVec2(w.w, 0));
+                    break;
+                case WidgetKind::Separator:
+                    ImGui::Separator();
+                    break;
+                case WidgetKind::SameLine:
+                    ImGui::SameLine();
+                    break;
+                case WidgetKind::Spacing:
+                    ImGui::Spacing();
+                    break;
+            }
+
+            // ---- Selection & drag-to-move ----
+            if (ImGui::IsItemHovered() && ImGui::IsMouseClicked(0)) {
+                g_Engine.model.selectedId = w.id;
+            }
+
+            if (g_Engine.model.editMode && ImGui::IsItemActive() && ImGui::IsMouseDragging(0)) {
+                ImVec2 d = ImGui::GetMouseDragDelta(0);
+                if (std::fabs(d.x) > 1.5f || std::fabs(d.y) > 1.5f) {
+                    w.x += d.x;
+                    w.y += d.y;
+                    ImGui::ResetMouseDragDelta(0);
+                }
+            }
+
+            // ---- Highlight selection ----
+            if (g_Engine.model.selectedId == w.id) {
+                ImDrawList* fg = ImGui::GetForegroundDrawList();
+                ImVec2 mn = ImGui::GetItemRectMin();
+                ImVec2 mx = ImGui::GetItemRectMax();
+                fg->AddRect(ImVec2(mn.x - 2, mn.y - 2), ImVec2(mx.x + 2, mx.y + 2),
+                            IM_COL32(0, 220, 255, 255), 4.0f, 0, 2.0f);
+            }
+
+            ImGui::PopID();
+        }
+
+        // ============================================================
+        // Inspector panel (ImGui-built)
+        // ============================================================
+        static void render_inspector() {
+            const float w = 340.0f;
+            ImGui::SetNextWindowPos(ImVec2(g_Engine.width - w, 0), ImGuiCond_Always);
+            ImGui::SetNextWindowSize(ImVec2(w, (float)g_Engine.height), ImGuiCond_Always);
+
+            ImGui::Begin("Inspector", nullptr,
+                ImGuiWindowFlags_NoMove | ImGuiWindowFlags_NoResize |
+                ImGuiWindowFlags_NoCollapse | ImGuiWindowFlags_NoBringToFrontOnFocus);
+
+            Widget* sel = g_Engine.model.find(g_Engine.model.selectedId);
+            if (!sel) {
+                ImGui::TextColored(ImVec4(0.7f, 0.7f, 0.7f, 1.0f),
+                    "No widget selected");
+                ImGui::Separator();
+                ImGui::TextWrapped("Click any widget on the canvas to select it, "
+                    "then edit its properties here.");
+                ImGui::End();
+                return;
+            }
+
+            ImGui::TextColored(ImVec4(0.4f, 0.7f, 1.0f, 1.0f),
+                "Selected: #%d", sel->id);
+            ImGui::Separator();
+
+            ImGui::Text("Type: %d", (int)sel->kind);
+            ImGui::InputText("Label", sel->label, sizeof(sel->label));
+            ImGui::InputText("Group", (char*)sel->groupName.c_str(),
+                             sel->groupName.capacity() + 1);  // best effort
+
+            ImGui::Separator();
+            ImGui::DragFloat2("Position", &sel->x, 0.5f);
+            ImGui::DragFloat("Width", &sel->w, 1.0f, 20.0f, 1000.0f);
+            ImGui::DragFloat("Height (0=auto)", &sel->h, 0.5f, 0.0f, 500.0f);
+
+            ImGui::Separator();
+            switch (sel->kind) {
+                case WidgetKind::Checkbox:
+                case WidgetKind::Radio:
+                    ImGui::Checkbox("Checked", &sel->checked);
+                    break;
+                case WidgetKind::SliderFloat:
+                case WidgetKind::DragFloat:
+                    ImGui::SliderFloat("Value", &sel->floatValue, sel->minValue, sel->maxValue);
+                    ImGui::DragFloat("Min", &sel->minValue, 0.1f);
+                    ImGui::DragFloat("Max", &sel->maxValue, 0.1f);
+                    break;
+                case WidgetKind::SliderInt:
+                    ImGui::SliderInt("Value", &sel->intValue, (int)sel->minValue, (int)sel->maxValue);
+                    break;
+                case WidgetKind::InputText:
+                    ImGui::InputText("Value", sel->valueBuf, sizeof(sel->valueBuf));
+                    break;
+                case WidgetKind::Combo:
+                    ImGui::SliderInt("Index", &sel->comboIndex,
+                        0, (int)sel->comboItems.size() - 1);
+                    break;
+                case WidgetKind::ProgressBar:
+                    ImGui::SliderFloat("Progress", &sel->floatValue, 0.0f, 1.0f);
+                    break;
+                default:
+                    break;
+            }
+
+            ImGui::Separator();
+            if (ImGui::Button("Delete Widget", ImVec2(-1, 0))) {
+                g_Engine.model.remove(sel->id);
+            }
+
+            ImGui::End();
+        }
+
+        // ============================================================
+        // Main render loop
+        // ============================================================
+        static void render_frame() {
+            if (!g_Engine.eglReady || !g_Engine.imguiReady) return;
+
+            ImGui_ImplOpenGL3_NewFrame();
+            ImGui_ImplAndroid_NewFrame();
+            ImGui::NewFrame();
+
+            // --- Top toolbar ---
+            ImGui::SetNextWindowPos(ImVec2(0, 0));
+            ImGui::SetNextWindowSize(ImVec2((float)g_Engine.width, 44.0f));
+            ImGui::Begin("##toolbar", nullptr,
+                ImGuiWindowFlags_NoTitleBar | ImGuiWindowFlags_NoResize |
+                ImGuiWindowFlags_NoMove | ImGuiWindowFlags_NoScrollbar |
+                ImGuiWindowFlags_NoBringToFrontOnFocus);
+            ImGui::SameLine();
+            ImGui::Checkbox("Edit Mode", &g_Engine.model.editMode);
+            ImGui::SameLine();
+            ImGui::Checkbox("Show Inspector", &g_Engine.model.showInspector);
+            ImGui::SameLine();
+            if (ImGui::Button("Reset Demo")) g_Engine.model.initDemo();
+            ImGui::SameLine();
+            ImGui::Text("| %d widgets, %d selected",
+                (int)g_Engine.model.widgets.size(), g_Engine.model.selectedId);
+            ImGui::End();
+
+            // --- Canvas window ---
+            ImGui::SetNextWindowPos(ImVec2(0, 44));
+            ImGui::SetNextWindowSize(ImVec2(
+                (float)g_Engine.width - (g_Engine.model.showInspector ? 340.0f : 0.0f),
+                (float)g_Engine.height - 44.0f));
+            ImGui::Begin("##canvas", nullptr,
+                ImGuiWindowFlags_NoTitleBar | ImGuiWindowFlags_NoResize |
+                ImGuiWindowFlags_NoMove | ImGuiWindowFlags_NoScrollbar |
+                ImGuiWindowFlags_NoBringToFrontOnFocus);
+
+            // Draw each group's background card
+            ImDrawList* dl = ImGui::GetWindowDrawList();
+            for (auto& grp : g_Engine.model.groups) {
+                ImU32 bg = IM_COL32(30, 30, 30, 220);
+                ImU32 border = IM_COL32(60, 60, 60, 255);
+                dl->AddRectFilled(ImVec2(grp.x, grp.y),
+                                  ImVec2(grp.x + grp.w, grp.y + 340),
+                                  bg, 8.0f);
+                dl->AddRect(ImVec2(grp.x, grp.y),
+                            ImVec2(grp.x + grp.w, grp.y + 340),
+                            border, 8.0f, 0, 1.5f);
+                // Group title
+                dl->AddText(ImVec2(grp.x + 12, grp.y + 8), IM_COL32(80, 160, 220, 255),
+                            grp.name.c_str());
+            }
+
+            // Draw widgets
+            for (auto& w : g_Engine.model.widgets) {
+                render_widget(w);
+            }
+
+            ImGui::End();
+
+            // --- Inspector ---
+            if (g_Engine.model.showInspector) {
+                render_inspector();
+            }
+
+            // --- Render to screen ---
+            ImGui::Render();
+            glViewport(0, 0, g_Engine.width, g_Engine.height);
+            glClearColor(0.06f, 0.06f, 0.06f, 1.0f);
+            glClear(GL_COLOR_BUFFER_BIT);
+            ImGui_ImplOpenGL3_RenderDrawData(ImGui::GetDrawData());
+            eglSwapBuffers(g_Engine.display, g_Engine.surface);
+        }
+
+        // ============================================================
+        // Android callbacks
+        // ============================================================
+        static void handle_app_cmd(android_app* app, int32_t cmd) {
+            switch (cmd) {
+                case APP_CMD_INIT_WINDOW:
+                    if (app->window != nullptr) {
+                        if (init_egl(app)) {
+                            init_imgui(app);
+                            g_Engine.animating = true;
+                        }
+                    }
+                    break;
+                case APP_CMD_TERM_WINDOW:
+                    destroy_imgui();
+                    destroy_egl_surface_only();
+                    g_Engine.animating = false;
+                    break;
+                case APP_CMD_GAINED_FOCUS:
+                    g_Engine.animating = true;
+                    break;
+                case APP_CMD_LOST_FOCUS:
+                    g_Engine.animating = false;
+                    break;
+                case APP_CMD_DESTROY:
+                    destroy_imgui();
+                    destroy_egl_all();
+                    break;
+                default:
+                    break;
+            }
+        }
+
+        static int32_t handle_input(android_app* app, AInputEvent* event) {
+            if (!g_Engine.imguiReady) return 0;
+            return ImGui_ImplAndroid_HandleInputEvent(event);
+        }
+
+        void android_main(android_app* app) {
+            LOGI("android_main started");
+            app->onAppCmd = handle_app_cmd;
+            app->onInputEvent = handle_input;
+
+            g_Engine.model.initDemo();
+
+            while (true) {
+                int events;
+                android_poll_source* source;
+                while (ALooper_pollAll(g_Engine.animating ? 0 : -1, nullptr,
+                                        &events, (void**)&source) >= 0) {
+                    if (source) source->process(app, source);
+                    if (app->destroyRequested != 0) {
+                        destroy_imgui();
+                        destroy_egl_all();
+                        LOGI("android_main exiting");
+                        return;
+                    }
+                }
+                if (g_Engine.animating && g_Engine.eglReady && g_Engine.imguiReady) {
+                    render_frame();
+                }
+            }
+        }
+        EOF
+
+    - name: Write CMakeLists.txt
+      run: |
+        cat > android/app/src/main/cpp/CMakeLists.txt <<'CMAKE'
+        cmake_minimum_required(VERSION 3.22)
+        project(imgui_editor)
+        set(CMAKE_CXX_STANDARD 17)
+
+        # ---- Locate native_app_glue ----
+        set(NATIVE_APP_GLUE_DIR "")
+        foreach(candidate
+                "${ANDROID_NDK}/sources/android/native_app_glue"
+                "${CMAKE_ANDROID_NDK}/sources/android/native_app_glue"
+                "${ANDROID_NDK_ROOT}/sources/android/native_app_glue")
+            if(EXISTS "${candidate}/android_native_app_glue.c")
+                set(NATIVE_APP_GLUE_DIR "${candidate}")
+                message(STATUS "native_app_glue at ${candidate}")
+                break()
+            endif()
+        endforeach()
+        if(NOT NATIVE_APP_GLUE_DIR)
+            message(FATAL_ERROR "native_app_glue not found in NDK")
+        endif()
+
+        # ---- ImGui core + backends ----
+        set(IMGUI_DIR "${CMAKE_CURRENT_SOURCE_DIR}/vendor/imgui")
+
+        add_library(imgui STATIC
+            ${IMGUI_DIR}/imgui.cpp
+            ${IMGUI_DIR}/imgui_draw.cpp
+            ${IMGUI_DIR}/imgui_tables.cpp
+            ${IMGUI_DIR}/imgui_widgets.cpp
+            ${IMGUI_DIR}/backends/imgui_impl_android.cpp
+            ${IMGUI_DIR}/backends/imgui_impl_opengl3.cpp
+        )
+        target_include_directories(imgui PUBLIC
+            ${IMGUI_DIR}
+            ${IMGUI_DIR}/backends
+        )
+
+        # ---- Our editor app ----
+        add_library(imgui_editor SHARED
+            android_main.cpp
+            widget_model.cpp
+            ${NATIVE_APP_GLUE_DIR}/android_native_app_glue.c
+        )
+        target_include_directories(imgui_editor PRIVATE
+            ${CMAKE_CURRENT_SOURCE_DIR}
+            ${NATIVE_APP_GLUE_DIR}
+        )
+
+        find_library(log-lib log)
+        target_link_libraries(imgui_editor
+            imgui
+            android
+            EGL
+            GLESv3
+            ${log-lib}
+        )
+
+        # Force-keep ANativeActivity_onCreate
+        target_link_options(imgui_editor PRIVATE "-u" "ANativeActivity_onCreate")
+        CMAKE
+
+    - name: Write .gitignore and README
+      run: |
+        cat > .gitignore <<'EOF'
+        *.iml
+        .gradle/
+        .idea/
+        local.properties
+        .DS_Store
+        build/
+        captures/
+        .externalNativeBuild/
+        .cxx/
+        *.apk
+        *.aab
+        android/app/build/
+        android/build/
+        android/app/.cxx/
+        *.log
+        EOF
+        cat > README.md <<'EOF'
+        # ImGui Native Editor (Android)
+
+        Stage 1+2: Native ImGui rendering on Android via NativeActivity + EGL.
+
+        - Renders real ImGui widgets (100% accurate layout and appearance)
+        - WidgetModel drives the rendering (not hardcoded)
+        - Click any widget to select it
+        - Inspector panel (built with ImGui itself) edits values live
+        - Drag in Edit Mode to move widgets
+
+        ## Future stages
+        - Stage 3: Import C++ files → populate WidgetModel
+        - Stage 4: Full drag/select with handles
+        - Stage 5: Inspector with all property types
+        - Stage 6: Export back to C++ code
+        EOF
+
+    - name: Commit
+      run: |
+        git config user.name "ImGui Editor Bot"
+        git config user.email "bot@imgui-editor.local"
         git add -A
         if git diff --staged --quiet; then
           echo "Nothing to commit"
         else
-          git commit -m "fix(android): add missing Code icon import + rewrite EditorScreen [skip ci]"
+          git commit -m "feat: native ImGui editor — Stage 1+2 (NativeActivity + EGL + ImGui)"
           git push
         fi
       env:
@@ -339,10 +935,12 @@ jobs:
         packages: 'platforms;android-34 build-tools;34.0.0'
         accept-android-sdk-licenses: true
 
-    - name: Install Android NDK
+    - name: Install NDK
       run: |
         echo "y" | sdkmanager --install "ndk;26.1.10909125"
         echo "ANDROID_NDK_HOME=$ANDROID_HOME/ndk/26.1.10909125" >> $GITHUB_ENV
+        ls $ANDROID_HOME/ndk/26.1.10909125/sources/android/ 2>/dev/null || \
+          echo "(native_app_glue check skipped)"
 
     - name: Set up Gradle
       uses: gradle/actions/setup-gradle@v3
@@ -356,6 +954,6 @@ jobs:
     - name: Upload APK
       uses: actions/upload-artifact@v4
       with:
-        name: ImStudio-Android-fixed
+        name: ImGui-Native-Editor-stage1-2
         path: android/app/build/outputs/apk/debug/*.apk
         if-no-files-found: error
