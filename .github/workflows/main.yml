@@ -29,11 +29,15 @@ jobs:
         UPSTREAM_SHA=$(cd /tmp/ImStudio && git rev-parse --short HEAD)
         echo "UPSTREAM_SHA=$UPSTREAM_SHA" >> $GITHUB_ENV
         echo "Syncing from upstream commit $UPSTREAM_SHA"
+        echo "→ Available sources:"
+        ls -1 /tmp/ImStudio/src/sources/ | head -40
 
     - name: Prepare helper
       run: |
         cat > /tmp/write_if_missing <<'HELPER_EOF'
         #!/bin/bash
+        # Usage: write_if_missing <path>
+        # Reads stdin, writes to file only if it doesn't exist. Drains stdin otherwise.
         path="$1"
         if [ ! -f "$path" ]; then
             mkdir -p "$(dirname "$path")"
@@ -65,10 +69,19 @@ jobs:
         cp -f /tmp/ImStudio/src/sources/ims_buffer.cpp    $VD/imstudio/
         cp -f /tmp/ImStudio/src/sources/ims_buffer.h      $VD/imstudio/
         cp -f /tmp/ImStudio/src/sources/ims_object.h      $VD/imstudio/
+
+        # ★ Fix 1: ims_object.cpp باید کپی و کامپایل بشه
+        if [ -f /tmp/ImStudio/src/sources/ims_object.cpp ]; then
+            cp -f /tmp/ImStudio/src/sources/ims_object.cpp $VD/imstudio/
+            echo "  + copied ims_object.cpp"
+        else
+            echo "  ! ims_object.cpp not found upstream — will patch later"
+        fi
+
         [ -f /tmp/ImStudio/src/utils/ims_utils.cpp ] && cp -f /tmp/ImStudio/src/utils/ims_utils.cpp $VD/imstudio/ || true
         [ -f /tmp/ImStudio/src/utils/ims_utils.h ]   && cp -f /tmp/ImStudio/src/utils/ims_utils.h   $VD/imstudio/ || true
 
-        echo "→ Copying ImGui core..."
+        echo "→ Copying ImGui core (incl. demo)..."
         cp -f /tmp/ImStudio/src/third-party/imgui/imgui*.cpp     $VD/imgui/ 2>/dev/null || true
         cp -f /tmp/ImStudio/src/third-party/imgui/imgui*.h       $VD/imgui/ 2>/dev/null || true
         cp -f /tmp/ImStudio/src/third-party/imgui/imconfig.h     $VD/imgui/ 2>/dev/null || true
@@ -101,6 +114,7 @@ jobs:
       run: |
         write_if_missing android/app/src/main/cpp/include/jni_bridge.h <<'EOF'
         #pragma once
+        // Public C++ API consumed by jni_bridge.cpp.
         #include <string>
 
         namespace imstudio::engine {
@@ -178,7 +192,8 @@ jobs:
 
         namespace imstudio::engine {
 
-        ImStudio::BufferWindow g_Buffer;  // non-static so code_generator.cpp can extern it
+        // ★ بدون static تا code_generator.cpp بتونه extern کنه
+        ImStudio::BufferWindow g_Buffer;
 
         static ImStudio::Object* get_obj(int id) {
             return g_Buffer.getobj(id);
@@ -264,7 +279,10 @@ jobs:
         #include "ims_object.h"
         #include <sstream>
 
-        extern ImStudio::BufferWindow g_Buffer;
+        // ★ Fix 3: extern داخل namespace imstudio::engine (نه global)
+        namespace imstudio::engine {
+            extern ImStudio::BufferWindow g_Buffer;
+        }
 
         namespace imstudio::engine {
 
@@ -416,11 +434,13 @@ jobs:
         project(imstudio_core)
         set(CMAKE_CXX_STANDARD 17)
 
+        # ★ Fix 4: imgui_demo.cpp اضافه شد (ShowStyleEditor)
         add_library(imgui STATIC
             vendor/imgui/imgui.cpp
             vendor/imgui/imgui_draw.cpp
             vendor/imgui/imgui_tables.cpp
             vendor/imgui/imgui_widgets.cpp
+            vendor/imgui/imgui_demo.cpp
             vendor/imgui/misc/cpp/imgui_stdlib.cpp
         )
         target_include_directories(imgui PUBLIC
@@ -432,10 +452,14 @@ jobs:
         target_include_directories(fmt INTERFACE vendor/fmt/include)
         target_compile_definitions(fmt INTERFACE FMT_HEADER_ONLY=1)
 
+        # ★ Fix 5: ims_object.cpp به لیست سورس‌ها اضافه شد (اگر موجود باشد)
         set(IMS_SOURCES
             vendor/imstudio/ims_generator.cpp
             vendor/imstudio/ims_buffer.cpp
         )
+        if(EXISTS ${CMAKE_CURRENT_SOURCE_DIR}/vendor/imstudio/ims_object.cpp)
+            list(APPEND IMS_SOURCES vendor/imstudio/ims_object.cpp)
+        endif()
         if(EXISTS ${CMAKE_CURRENT_SOURCE_DIR}/vendor/imstudio/ims_utils.cpp)
             list(APPEND IMS_SOURCES vendor/imstudio/ims_utils.cpp)
         endif()
@@ -469,24 +493,34 @@ jobs:
         SRC=android/app/src/main/cpp/src
         CPP=android/app/src/main/cpp
 
-        echo "→ Fix 1: imgui_stdlib from misc/cpp/"
+        echo "→ Fix 1: imgui_demo.cpp must be in vendor/imgui"
+        cp -f /tmp/ImStudio/src/third-party/imgui/imgui_demo.cpp $VD/imgui/
+
+        echo "→ Fix 2: imgui_stdlib from misc/cpp/"
         mkdir -p $VD/imgui/misc/cpp
         cp -f /tmp/ImStudio/src/third-party/imgui/misc/cpp/imgui_stdlib.h   $VD/imgui/misc/cpp/
         cp -f /tmp/ImStudio/src/third-party/imgui/misc/cpp/imgui_stdlib.cpp $VD/imgui/misc/cpp/
-        # Also flatten copies into imgui root so both include styles resolve
-        cp -f $VD/imgui/misc/cpp/imgui_stdlib.h   $VD/imgui/
-        cp -f $VD/imgui/misc/cpp/imgui_stdlib.cpp $VD/imgui/
 
-        echo "→ Fix 2: wrong include paths (vendor/imstudio/X → X)"
+        echo "→ Fix 3: normalize include paths (vendor/imstudio/X → X)"
         sed -i -E 's|#include "vendor/imstudio/([^"]+)"|#include "\1"|g' \
             $SRC/engine/buffer_accessor.cpp \
-            $SRC/engine/code_generator.cpp
+            $SRC/engine/code_generator.cpp || true
 
-        echo "→ Fix 3: static g_Buffer blocks extern in code_generator.cpp"
+        echo "→ Fix 4: ensure g_Buffer is non-static"
         sed -i -E 's|^static ImStudio::BufferWindow g_Buffer;|ImStudio::BufferWindow g_Buffer;|' \
-            $SRC/engine/buffer_accessor.cpp
+            $SRC/engine/buffer_accessor.cpp || true
 
-        echo "→ Fix 4: force-update CMakeLists (imgui_stdlib + misc/cpp in -I)"
+        echo "→ Fix 5: ensure extern g_Buffer sits inside namespace imstudio::engine"
+        # فقط اگر extern در ابتدای خط (scope گلوبال) باشد، آن را داخل namespace می‌بریم
+        if grep -qE '^extern ImStudio::BufferWindow g_Buffer;' $SRC/engine/code_generator.cpp; then
+            sed -i -E 's|^extern ImStudio::BufferWindow g_Buffer;|namespace imstudio::engine { extern ImStudio::BufferWindow g_Buffer; }|' \
+                $SRC/engine/code_generator.cpp
+            echo "  + patched global-scope extern"
+        else
+            echo "  · extern already scoped (or absent) — leaving as-is"
+        fi
+
+        echo "→ Fix 6: force-update CMakeLists (imgui_demo + ims_object.cpp + misc/cpp)"
         cat > $CPP/CMakeLists.txt <<'CMAKE'
         cmake_minimum_required(VERSION 3.22)
         project(imstudio_core)
@@ -497,6 +531,7 @@ jobs:
             vendor/imgui/imgui_draw.cpp
             vendor/imgui/imgui_tables.cpp
             vendor/imgui/imgui_widgets.cpp
+            vendor/imgui/imgui_demo.cpp
             vendor/imgui/misc/cpp/imgui_stdlib.cpp
         )
         target_include_directories(imgui PUBLIC
@@ -512,6 +547,9 @@ jobs:
             vendor/imstudio/ims_generator.cpp
             vendor/imstudio/ims_buffer.cpp
         )
+        if(EXISTS ${CMAKE_CURRENT_SOURCE_DIR}/vendor/imstudio/ims_object.cpp)
+            list(APPEND IMS_SOURCES vendor/imstudio/ims_object.cpp)
+        endif()
         if(EXISTS ${CMAKE_CURRENT_SOURCE_DIR}/vendor/imstudio/ims_utils.cpp)
             list(APPEND IMS_SOURCES vendor/imstudio/ims_utils.cpp)
         endif()
@@ -1338,6 +1376,7 @@ jobs:
         cp -f "$TMP"/ImStudio/src/sources/ims_buffer.cpp    "$VD/imstudio/"
         cp -f "$TMP"/ImStudio/src/sources/ims_buffer.h      "$VD/imstudio/"
         cp -f "$TMP"/ImStudio/src/sources/ims_object.h      "$VD/imstudio/"
+        [ -f "$TMP"/ImStudio/src/sources/ims_object.cpp ] && cp -f "$TMP"/ImStudio/src/sources/ims_object.cpp "$VD/imstudio/" || true
         [ -f "$TMP"/ImStudio/src/utils/ims_utils.cpp ] && cp -f "$TMP"/ImStudio/src/utils/ims_utils.cpp "$VD/imstudio/" || true
         [ -f "$TMP"/ImStudio/src/utils/ims_utils.h ]   && cp -f "$TMP"/ImStudio/src/utils/ims_utils.h   "$VD/imstudio/" || true
 
