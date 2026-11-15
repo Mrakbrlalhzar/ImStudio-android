@@ -41,16 +41,275 @@ jobs:
         import android.content.Context
         import android.view.inputmethod.InputMethodManager
         import android.view.KeyEvent
+        import android.content.ContentValues
+        import android.content.pm.PackageManager
+        import android.Manifest
+        import android.os.Build
+        import android.os.Environment
+        import android.provider.MediaStore
+        import androidx.activity.result.contract.ActivityResultContracts
+        import java.io.File
+        import java.io.FileInputStream
+        import java.io.FileOutputStream
+        import java.text.SimpleDateFormat
+        import java.util.Date
+        import java.util.Locale
         import java.util.concurrent.LinkedBlockingQueue
+        import kotlin.system.exitProcess
 
         class MainActivity : NativeActivity() {
             public override fun onCreate(savedInstanceState: Bundle?) {
                 super.onCreate(savedInstanceState)
+                installCrashLogger()
+                copyNativeCrashLogToDownloads()
+                maybeRequestLegacyPermission()
+            }
+
+            // ------------------------------------------------------------------
+            // On-device crash logging (no adb / root needed):
+            //  * Java exceptions -> crash_java.log, pushed to PUBLIC Downloads.
+            //  * Native crashes  -> crash_native.log in internal storage, written by
+            //    the signal handler in editor_crashlog.h; every launch copies it
+            //    into PUBLIC Downloads via MediaStore (API 29+) or a direct legacy
+            //    file write (API 24-28), then truncates the internal copy so only
+            //    NEW crashes are published next time.
+            // ------------------------------------------------------------------
+            private fun stamp(fmt: String): String =
+                SimpleDateFormat(fmt, Locale.US).format(Date())
+
+            /** Publish a file to the PUBLIC Downloads collection. Synchronous; returns success. */
+            private fun pushFileToDownloads(src: File, name: String, prepend: String?): Boolean {
+                try {
+                    if (Build.VERSION.SDK_INT >= 29) {
+                        val cv = ContentValues()
+                        cv.put(MediaStore.Downloads.DISPLAY_NAME, name)
+                        cv.put(MediaStore.Downloads.MIME_TYPE, "text/plain")
+                        cv.put(MediaStore.Downloads.RELATIVE_PATH, Environment.DIRECTORY_DOWNLOADS)
+                        cv.put(MediaStore.Downloads.IS_PENDING, 1)
+                        val uri = contentResolver.insert(
+                            MediaStore.Downloads.EXTERNAL_CONTENT_URI, cv
+                        ) ?: return false
+                        contentResolver.openOutputStream(uri)?.use { os ->
+                            if (prepend != null) os.write(prepend.toByteArray())
+                            FileInputStream(src).use { it.copyTo(os) }
+                        } ?: return false
+                        cv.clear()
+                        cv.put(MediaStore.Downloads.IS_PENDING, 0)
+                        contentResolver.update(uri, cv, null, null)
+                        return true
+                    } else {
+                        val dir = Environment.getExternalStoragePublicDirectory(
+                            Environment.DIRECTORY_DOWNLOADS
+                        )
+                        if (!dir.exists()) dir.mkdirs()
+                        FileOutputStream(File(dir, name)).use { os ->
+                            if (prepend != null) os.write(prepend.toByteArray())
+                            FileInputStream(src).use { it.copyTo(os) }
+                        }
+                        return true
+                    }
+                } catch (e: Exception) {
+                    try {
+                        File(cacheDir, "crashlog_error.log").appendText(
+                            "pushFileToDownloads($name) failed: $e\n"
+                        )
+                    } catch (_: Exception) {}
+                    return false
+                }
+            }
+
+            private fun installCrashLogger() {
+                val previous = Thread.getDefaultUncaughtExceptionHandler()
+                Thread.setDefaultUncaughtExceptionHandler { t, e ->
+                    try {
+                        val sb = StringBuilder()
+                        sb.append("==== JAVA CRASH ====\n")
+                        sb.append("time: ").append(stamp("yyyy-MM-dd HH:mm:ss.SSS")).append('\n')
+                        sb.append("android: ").append(Build.VERSION.RELEASE)
+                          .append(" (API ").append(Build.VERSION.SDK_INT).append(")\n")
+                        sb.append("thread: ").append(t.name).append('\n')
+                        sb.append("exception: ").append(e.javaClass.name)
+                          .append(": ").append(e.message).append('\n')
+                        e.stackTrace.take(60).forEach {
+                            sb.append("  at ").append(it.toString()).append('\n')
+                        }
+                        var cause = e.cause
+                        var guard = 0
+                        while (cause != null && guard++ < 8) {
+                            sb.append("caused by: ").append(cause.javaClass.name).append(": ")
+                              .append(cause.message).append('\n')
+                            cause.stackTrace.take(40).forEach {
+                                sb.append("  at ").append(it.toString()).append('\n')
+                            }
+                            cause = cause.cause
+                        }
+                        val f = File(filesDir, "crash_java.log")
+                        f.writeText(sb.toString())
+                        pushFileToDownloads(
+                            f,
+                            "imgui_menu_editor_crash_java_${stamp("yyyyMMdd_HHmmss")}.log",
+                            null
+                        )
+                    } catch (_: Exception) {}
+                    // Chain to the system handler so the normal force-close flow runs.
+                    if (previous != null) previous.uncaughtException(t, e)
+                    else {
+                        android.os.Process.killProcess(android.os.Process.myPid())
+                        exitProcess(0)
+                    }
+                }
+            }
+
+            /** Copy crash_native.log (if non-empty) from internal storage into public Downloads. */
+            private fun copyNativeCrashLogToDownloads() {
+                if (copiedNativeLogThisSession) return
+                copiedNativeLogThisSession = true
+                try {
+                    val native = File(filesDir, "crash_native.log")
+                    if (!native.exists() || native.length() == 0L) return
+                    val name = "imgui_menu_editor_crash_native_${stamp("yyyyMMdd_HHmmss")}.log"
+                    if (pushFileToDownloads(native, name,
+                            "imgui menu editor native crash report (SIGSEGV/SIGBUS/SIGFPE/SIGILL/SIGABRT)\n\n"
+                        )) {
+                        // Truncate so the next launch publishes only NEW crashes.
+                        // The native fd uses O_APPEND: appends after truncation start
+                        // from the beginning of the file again.
+                        FileOutputStream(native, false).use { }
+                    }
+                } catch (_: Exception) {}
+            }
+
+            private var copiedNativeLogThisSession = false
+
+            // API 24-28 legacy path needs WRITE_EXTERNAL_STORAGE at runtime.
+            private fun maybeRequestLegacyPermission() {
+                if (Build.VERSION.SDK_INT < 29 &&
+                    checkSelfPermission(Manifest.permission.WRITE_EXTERNAL_STORAGE)
+                        != PackageManager.PERMISSION_GRANTED
+                ) {
+                    requestPermissions(
+                        arrayOf(Manifest.permission.WRITE_EXTERNAL_STORAGE), 1001
+                    )
+                }
+            }
+
+            override fun onRequestPermissionsResult(
+                requestCode: Int, permissions: Array<out String>, grantResults: IntArray
+            ) {
+                super.onRequestPermissionsResult(requestCode, permissions, grantResults)
+                if (requestCode == 1001 && grantResults.isNotEmpty() &&
+                    grantResults[0] == PackageManager.PERMISSION_GRANTED
+                ) {
+                    copiedNativeLogThisSession = false
+                    copyNativeCrashLogToDownloads()
+                }
             }
 
             fun showSoftInput() {
                 val inputMethodManager = getSystemService(Context.INPUT_METHOD_SERVICE) as InputMethodManager
                 inputMethodManager.showSoftInput(this.window.decorView, 0)
+            }
+
+            // ------------------------------------------------------------------
+            // PROJECT IMPORT: user picks a FOLDER (SAF tree picker); we copy its
+            // files into cacheDir/import and let the native side parse every
+            // C/C++/header file, auto-detecting the ImGui menu code inside. The
+            // imported menu replaces the current document; the non-ImGui report is
+            // written to Downloads and kept for the in-app console.
+            // ------------------------------------------------------------------
+            private val importDir by lazy { File(cacheDir, "import").apply { mkdirs() } }
+            private val importPickLauncher =
+                registerForActivityResult(ActivityResultContracts.OpenDocumentTree()) { uri ->
+                    if (uri != null) importPickedFolder(uri)
+                }
+
+            fun pickImportFolder() {
+                importPickLauncher.launch(null)
+            }
+
+            private fun importPickedFolder(uri: android.net.Uri) {
+                Thread {
+                    try {
+                        // wipe previous import copy
+                        importDir.deleteRecursively()
+                        importDir.mkdirs()
+                        copyTreeRecursively(uri, android.provider.DocumentsContract.getTreeDocumentId(uri), importDir)
+                        runOnUiThread {
+                            // native side parses the folder and swaps the document
+                            nativeImportFolder(importDir.absolutePath)
+                        }
+                    } catch (e: Exception) {
+                        try {
+                            File(cacheDir, "import_error.log")
+                                .writeText("import failed: $e\n")
+                        } catch (_: Exception) {}
+                    }
+                }.start()
+            }
+
+            /** Recursively copy a SAF document tree into a local folder. */
+            private fun copyTreeRecursively(treeUri: android.net.Uri, rootDocId: String, dest: File) {
+                val resolver = contentResolver
+                val childrenUri =
+                    android.provider.DocumentsContract.buildChildDocumentsUriUsingTree(
+                        treeUri, rootDocId
+                    )
+                val kids = resolver.query(
+                    childrenUri,
+                    arrayOf(
+                        android.provider.DocumentsContract.Document.COLUMN_DOCUMENT_ID,
+                        android.provider.DocumentsContract.Document.COLUMN_DISPLAY_NAME,
+                        android.provider.DocumentsContract.Document.COLUMN_MIME_TYPE
+                    ), null, null, null
+                ) ?: return
+                kids.use { c ->
+                    while (c.moveToNext()) {
+                        val docId = c.getString(0)
+                        val name = c.getString(1) ?: continue
+                        val mime = c.getString(2)
+                        val isDir = mime == android.provider.DocumentsContract.Document.MIME_TYPE_DIR
+                        if (isDir) {
+                            val sub = File(dest, name).apply { mkdirs() }
+                            copyTreeRecursively(treeUri, docId, sub)
+                        } else {
+                            val docUri =
+                                android.provider.DocumentsContract.buildDocumentUriUsingTree(
+                                    treeUri, docId
+                                )
+                            val out = File(dest, name)
+                            try {
+                                resolver.openInputStream(docUri)?.use { input ->
+                                    out.outputStream().use { input.copyTo(it) }
+                                }
+                            } catch (_: Exception) { /* unreadable file: skip */ }
+                        }
+                    }
+                }
+            }
+
+            /** Native: parse folder, import the menu tree; returns node count (0 = none found). */
+            private external fun nativeImportFolder(path: String): Int
+
+            /** Called from C++ after a successful import: write report to Downloads. */
+            fun importReportReady(nodes: Int, files: Int, nonImguiLines: Array<String>) {
+                try {
+                    val sb = StringBuilder()
+                    sb.append("imgui menu editor - PROJECT IMPORT REPORT\n")
+                    sb.append("time: ").append(stamp("yyyy-MM-dd HH:mm:ss")).append('\n')
+                    sb.append("files scanned: ").append(files).append('\n')
+                    sb.append("menu items imported: ").append(nodes).append('\n')
+                    sb.append("\n== CODE NOT RELATED TO IMGUI ==\n")
+                    if (nonImguiLines.isEmpty())
+                        sb.append("(none - all recognized code was ImGui)\n")
+                    for (l in nonImguiLines.take(500)) sb.append(l).append('\n')
+                    val f = File(filesDir, "import_report.log")
+                    f.writeText(sb.toString())
+                    pushFileToDownloads(
+                        f,
+                        "imgui_menu_editor_import_report_${stamp("yyyyMMdd_HHmmss")}.log",
+                        null
+                    )
+                } catch (_: Exception) {}
             }
 
             fun hideSoftInput() {
@@ -59,7 +318,7 @@ jobs:
             }
 
             // Queue for the Unicode characters to be polled from native code (via pollUnicodeChar())
-            private var unicodeCharacterQueue: LinkedBlockingQueue<Int> = LinkedBlockingQueue()
+            private var unicodeCharacterQueue: LinkedBlockingQueue<Int> = LinkedBlockingQueue<Int>()
 
             // We assume dispatchKeyEvent() of the NativeActivity is actually called for every
             // KeyEvent and not consumed by any View before it reaches here
@@ -196,6 +455,8 @@ jobs:
         // configuration, which is only covered by the settings-level google().
         dependencies {
             implementation "org.jetbrains.kotlin:kotlin-stdlib:1.9.24"
+            // SAF tree picker (registerForActivityResult) needs this
+            implementation 'androidx.activity:activity:1.9.3'
         }
 
         IMGUIED_EOF
@@ -275,10 +536,15 @@ jobs:
 
         #include "editor_nodes.h"
 
+        // Native crash logger: signal handler -> crash_native.log in internal
+        // storage; MainActivity copies it into the public Downloads folder.
+        #include "editor_crashlog.h"
+
         // Editor modules (single TU style: include .cpp for simplicity on CI)
         #include "editor_nodes.cpp"
         #include "editor_render.cpp"
         #include "editor_chrome.cpp"
+        #include "editor_import.cpp"
 
         // ---------------------------------------------------------------------------
         // Data
@@ -325,6 +591,74 @@ jobs:
             while ((c = env->CallIntMethod(g_App->activity->clazz, m)) != 0)
                 io.AddInputCharacter((unsigned)c), n++;
             return n;
+        }
+
+        // Ask Kotlin to open the SAF folder picker (startActivity from the UI thread).
+        void PickImportFolder()
+        {
+            JNIEnv* env = GetJEnv(); if (!env || !g_App) return;
+            jclass cl = env->GetObjectClass(g_App->activity->clazz);
+            jmethodID m = env->GetMethodID(cl, "pickImportFolder", "()V");
+            if (m) env->CallVoidMethod(g_App->activity->clazz, m);
+        }
+
+        // ---------------------------------------------------------------------------
+        // JNI bridge: called from MainActivity.importPickedFolder() after the SAF
+        // tree copy. Parses the folder, swaps the document, returns node count, and
+        // pushes the non-ImGui report to Kotlin (which writes it to Downloads).
+        // ---------------------------------------------------------------------------
+        static jint NativeImportFolder(JNIEnv* env, jobject /*thiz*/, jstring path)
+        {
+            const char* p = env->GetStringUTFChars(path, nullptr);
+            if (!p) return 0;
+
+            g_import = ImportReport();          // fresh report
+            ImGuiEdCrumb("import: scanning %s", p);
+            Node* imported = ImportFolder(p, g_import);
+            env->ReleaseStringUTFChars(path, p);
+
+            if (!imported || g_import.nodes_imported == 0)
+                return 0;
+
+            // swap document (old tree freed)
+            if (g_ed.root) { Node_Delete(g_ed.root); g_ed.root = nullptr; }
+            g_ed.root = imported;
+            g_ed.sel = imported->id;
+
+            // report to Kotlin -> Downloads + in-app console
+            ImGuiEdCrumb("import: %d nodes from %d files", g_import.nodes_imported, g_import.files_scanned);
+            JNIEnv* jenv = GetJEnv();
+            if (jenv && g_App)
+            {
+                jclass cl = jenv->GetObjectClass(g_App->activity->clazz);
+                jmethodID m = jenv->GetMethodID(cl, "importReportReady",
+                                                "(II[Ljava/lang/String;)V");
+                if (m)
+                {
+                    int n = (int)g_import.non_imgui.size();
+                    if (n > 500) n = 500;
+                    jclass scls = jenv->FindClass("java/lang/String");
+                    jobjectArray arr = n > 0 ? jenv->NewObjectArray(n, scls, jenv->NewStringUTF("")) : jenv->NewObjectArray(0, scls, nullptr);
+                    for (int i = 0; i < n; i++)
+                        jenv->SetObjectArrayElement(arr, i, jenv->NewStringUTF(g_import.non_imgui[i].c_str()));
+                    jenv->CallVoidMethod(g_App->activity->clazz, m,
+                                         (jint)g_import.nodes_imported,
+                                         (jint)g_import.files_scanned, arr);
+                }
+            }
+            return (jint)g_import.nodes_imported;
+        }
+
+        // ---------------------------------------------------------------------------
+        // JNI registration: bind nativeImportFolder to Kotlin's external fun.
+        // ---------------------------------------------------------------------------
+        static const JNINativeMethod kNativeMethods[] = {
+            { "nativeImportFolder", "(Ljava/lang/String;)I", (void*)NativeImportFolder },
+        };
+        static void RegisterJni(JNIEnv* env)
+        {
+            jclass cl = env->GetObjectClass(g_App->activity->clazz);
+            env->RegisterNatives(cl, kNativeMethods, 1);
         }
 
         // File I/O via internal storage -------------------------------------------
@@ -385,7 +719,7 @@ jobs:
             Node* vi = Node_New(NSliderInt); strncpy(vi->name, "Resolution", 63);
             vi->v_int = 2; vi->v_min = 0; vi->v_max = 3; Node_AddChild(t1, vi);
             Node* cmb = Node_New(NCombo); strncpy(cmb->name, "Quality", 63);
-            strncpy(cmb->value_str, "Low,Medium,High,Ultra", 63); cmb->combo_i = 2; Node_AddChild(t1, vi->parent == t1 ? t1 : t1), Node_AddChild(t1, cmb);
+            strncpy(cmb->value_str, "Low,Medium,High,Ultra", 63); cmb->combo_i = 2; Node_AddChild(t1, cmb);
 
             Node* t2 = Node_New(NTabItem); strncpy(t2->name, "Audio", 63); Node_AddChild(tb, t2);
             Node* vol = Node_New(NSliderFloat); strncpy(vol->name, "Volume", 63);
@@ -419,10 +753,12 @@ jobs:
         static void Init(struct android_app* app)
         {
             if (g_Initialized) return;
+            ImGuiEdCrumb("APP_CMD_INIT_WINDOW: Init");
             g_App = app;
             ANativeWindow_acquire(g_App->window);
 
             g_EglDisplay = eglGetDisplay(EGL_DEFAULT_DISPLAY);
+            if (g_EglDisplay == EGL_NO_DISPLAY) { ImGuiEdCrumb("eglGetDisplay failed"); }
             eglInitialize(g_EglDisplay, 0, 0);
             const EGLint egl_attributes[] = { EGL_BLUE_SIZE, 8, EGL_GREEN_SIZE, 8, EGL_RED_SIZE, 8, EGL_DEPTH_SIZE, 24, EGL_SURFACE_TYPE, EGL_WINDOW_BIT, EGL_NONE };
             EGLint num_configs = 0;
@@ -436,6 +772,11 @@ jobs:
             const EGLint egl_context_attributes[] = { EGL_CONTEXT_CLIENT_VERSION, 3, EGL_NONE };
             g_EglContext = eglCreateContext(g_EglDisplay, egl_config, EGL_NO_CONTEXT, egl_context_attributes);
             g_EglSurface = eglCreateWindowSurface(g_EglDisplay, egl_config, g_App->window, nullptr);
+            if (g_EglSurface == EGL_NO_SURFACE || g_EglContext == EGL_NO_CONTEXT)
+            {
+                EGLint ec1 = eglGetError();
+                ImGuiEdCrumb("eglCreateContext/Surface failed (err 0x%x)", ec1);
+            }
             eglMakeCurrent(g_EglDisplay, g_EglSurface, g_EglSurface, g_EglContext);
 
             IMGUI_CHECKVERSION();
@@ -456,11 +797,19 @@ jobs:
             // Load saved document or default
             std::string saved = LoadDoc();
             if (!saved.empty())
+            {
+                ImGuiEdCrumb("LoadDoc: %d bytes", (int)saved.size());
                 g_ed.root = LoadTreeFromString(saved);
-            if (!g_ed.root) g_ed.root = MakeDefaultDocument();
+            }
+            if (!g_ed.root) { ImGuiEdCrumb("LoadDoc: none/invalid, default doc"); g_ed.root = MakeDefaultDocument(); }
             g_ed.sel = g_ed.root ? g_ed.root->id : -1;
 
             g_Initialized = true;
+            ImGuiEdCrumb("Init complete");
+
+            // bind nativeImportFolder for Kotlin
+            JNIEnv* jenv = GetJEnv();
+            if (jenv && g_App) { RegisterJni(jenv); ImGuiEdCrumb("JNI natives registered"); }
         }
 
         static void Shutdown()
@@ -489,6 +838,7 @@ jobs:
             ImGuiIO& io = ImGui::GetIO();
             if (g_EglDisplay == EGL_NO_DISPLAY) return;
 
+            ImGuiEdCrumb("frame"); // overwritten ring: always current position
             PollUnicodeChars();
 
             static bool WantTextInputLast = false;
@@ -533,15 +883,12 @@ jobs:
                 RenderNode(g_ed.root, g_ed.edit_mode, g_ed.sel);
             }
 
-            // 2. Editor chrome (drawers + boxes + lock) in edit mode.
+            // 2. Editor chrome (Photoshop-style docks) in edit mode.
             if (g_ed.edit_mode)
             {
-                DrawTopBox();
-                DrawAddPalette();
-                DrawTree();
-                DrawProps();
-                DrawBottomBox();
-                DrawLockButton();
+                static bool ps_style_applied = false;
+                if (!ps_style_applied) { ApplyPsStyle(); ps_style_applied = true; }
+                DrawPsChrome();
             }
             else
             {
@@ -572,7 +919,7 @@ jobs:
             switch (appCmd)
             {
             case APP_CMD_INIT_WINDOW: Init(app); break;
-            case APP_CMD_TERM_WINDOW: Shutdown(); break;
+            case APP_CMD_TERM_WINDOW: ImGuiEdCrumb("APP_CMD_TERM_WINDOW"); Shutdown(); break;
             default: break;
             }
         }
@@ -586,6 +933,10 @@ jobs:
             app->onAppCmd = handleAppCmd;
             app->onInputEvent = handleInputEvent;
 
+            // Arm the on-device crash logger FIRST (internal storage + signals).
+            ImGuiEdCrashLogInit(app->activity->internalDataPath);
+            ImGuiEdCrumb("android_main entered");
+
             while (true)
             {
                 int out_events;
@@ -595,7 +946,8 @@ jobs:
                     if (out_data != nullptr) out_data->process(app, out_data);
                     if (app->destroyRequested != 0)
                     {
-                        if (!g_Initialized) Shutdown();
+                        ImGuiEdCrumb("destroy requested: shutting down");
+                        if (g_Initialized) Shutdown();
                         return;
                     }
                 }
@@ -619,6 +971,15 @@ jobs:
         #include <cstring>
         #include <cstdlib>
         #include <cstdio>
+
+        // Hard cap on node-tree depth. Guards EVERY recursive walk (render, tree
+        // view, serialize, clone) so a corrupt/cyclic tree can never recurse
+        // without bound and overflow the stack (that was the launch crash).
+        // (Definition lives in editor_crashlog.h, included before this in main.cpp;
+        //  the ifndef keeps either include order working.)
+        #ifndef NODE_MAX_DEPTH
+        #define NODE_MAX_DEPTH 64
+        #endif
 
         // ---------------------------------------------------------------------------
         // Node type: every Dear ImGui menu-building element the editor supports.
@@ -712,6 +1073,9 @@ jobs:
             // layout
             bool            same_line = false;    // start on same line as previous item
             float           indent = 0.0f;
+            // window positioning (V2)
+            float           pos_x = 0.0f, pos_y = 0.0f;   // SetNextWindowPos
+            int             pos_cond = 0;                  // ImGuiCond_ value
             // runtime (not serialized)
             bool            palette_open = true;
             Node*           parent = nullptr;
@@ -723,295 +1087,41 @@ jobs:
         // ---------------------------------------------------------------------------
         // Flag descriptor tables: full set of relevant ImGui flags per kind.
         // ---------------------------------------------------------------------------
-        struct FlagDef { const char* name; int value; };
+        struct FlagDef { const char* name; int value; };  // (moved: tables in editor_flags.h)
 
-        inline const FlagDef* FlagTableWindow(int& n)
-        {
-            static const FlagDef d[] = {
-                {"NoTitleBar", ImGuiWindowFlags_NoTitleBar},
-                {"NoResize", ImGuiWindowFlags_NoResize},
-                {"NoMove", ImGuiWindowFlags_NoMove},
-                {"NoScrollbar", ImGuiWindowFlags_NoScrollbar},
-                {"NoScrollWithMouse", ImGuiWindowFlags_NoScrollWithMouse},
-                {"NoCollapse", ImGuiWindowFlags_NoCollapse},
-                {"AlwaysAutoResize", ImGuiWindowFlags_AlwaysAutoResize},
-                {"NoBackground", ImGuiWindowFlags_NoBackground},
-                {"NoSavedSettings", ImGuiWindowFlags_NoSavedSettings},
-                {"NoMouseInputs", ImGuiWindowFlags_NoMouseInputs},
-                {"MenuBar", ImGuiWindowFlags_MenuBar},
-                {"HorizontalScrollbar", ImGuiWindowFlags_HorizontalScrollbar},
-                {"NoFocusOnAppearing", ImGuiWindowFlags_NoFocusOnAppearing},
-                {"NoBringToFrontOnFocus", ImGuiWindowFlags_NoBringToFrontOnFocus},
-                {"AlwaysVerticalScrollbar", ImGuiWindowFlags_AlwaysVerticalScrollbar},
-                {"AlwaysHorizontalScrollbar", ImGuiWindowFlags_AlwaysHorizontalScrollbar},
-                {"NoNavInputs", ImGuiWindowFlags_NoNavInputs},
-                {"NoNavFocus", ImGuiWindowFlags_NoNavFocus},
-                {"UnsavedDocument", ImGuiWindowFlags_UnsavedDocument},
-            };
-            n = (int)(sizeof(d)/sizeof(d[0])); return d;
-        }
+        #include "editor_flags.h"
 
-        inline const FlagDef* FlagTableChild(int& n)
-        {
-            static const FlagDef d[] = {
-                {"Borders", ImGuiChildFlags_Borders},
-                {"AlwaysUseWindowPadding", ImGuiChildFlags_AlwaysUseWindowPadding},
-                {"ResizeX", ImGuiChildFlags_ResizeX},
-                {"ResizeY", ImGuiChildFlags_ResizeY},
-                {"AutoResizeX", ImGuiChildFlags_AutoResizeX},
-                {"AutoResizeY", ImGuiChildFlags_AutoResizeY},
-                {"AlwaysAutoResize", ImGuiChildFlags_AlwaysAutoResize},
-                {"FrameStyle", ImGuiChildFlags_FrameStyle},
-                {"NavFlattened", ImGuiChildFlags_NavFlattened},
-            };
-            n = (int)(sizeof(d)/sizeof(d[0])); return d;
-        }
-
-        inline const FlagDef* FlagTableTreeNode(int& n)
-        {
-            static const FlagDef d[] = {
-                {"Selected", ImGuiTreeNodeFlags_Selected},
-                {"Framed", ImGuiTreeNodeFlags_Framed},
-                {"AllowOverlap", ImGuiTreeNodeFlags_AllowOverlap},
-                {"NoTreePushOnOpen", ImGuiTreeNodeFlags_NoTreePushOnOpen},
-                {"NoAutoOpenOnLog", ImGuiTreeNodeFlags_NoAutoOpenOnLog},
-                {"DefaultOpen", ImGuiTreeNodeFlags_DefaultOpen},
-                {"OpenOnDoubleClick", ImGuiTreeNodeFlags_OpenOnDoubleClick},
-                {"OpenOnArrow", ImGuiTreeNodeFlags_OpenOnArrow},
-                {"Leaf", ImGuiTreeNodeFlags_Leaf},
-                {"Bullet", ImGuiTreeNodeFlags_Bullet},
-                {"FramePadding", ImGuiTreeNodeFlags_FramePadding},
-                {"SpanAvailWidth", ImGuiTreeNodeFlags_SpanAvailWidth},
-                {"SpanFullWidth", ImGuiTreeNodeFlags_SpanFullWidth},
-                {"SpanTextWidth", ImGuiTreeNodeFlags_SpanTextWidth},
-                {"SpanAllColumns", ImGuiTreeNodeFlags_SpanAllColumns},
-                {"NavLeftJumpsBackHere", ImGuiTreeNodeFlags_NavLeftJumpsBackHere},
-            };
-            n = (int)(sizeof(d)/sizeof(d[0])); return d;
-        }
-
-        inline const FlagDef* FlagTableInputText(int& n)
-        {
-            static const FlagDef d[] = {
-                {"CharsDecimal", ImGuiInputTextFlags_CharsDecimal},
-                {"CharsHexadecimal", ImGuiInputTextFlags_CharsHexadecimal},
-                {"CharsScientific", ImGuiInputTextFlags_CharsScientific},
-                {"CharsUppercase", ImGuiInputTextFlags_CharsUppercase},
-                {"CharsNoBlank", ImGuiInputTextFlags_CharsNoBlank},
-                {"AllowTabInput", ImGuiInputTextFlags_AllowTabInput},
-                {"EnterReturnsTrue", ImGuiInputTextFlags_EnterReturnsTrue},
-                {"EscapeClearsAll", ImGuiInputTextFlags_EscapeClearsAll},
-                {"CtrlEnterForNewLine", ImGuiInputTextFlags_CtrlEnterForNewLine},
-                {"ReadOnly", ImGuiInputTextFlags_ReadOnly},
-                {"Password", ImGuiInputTextFlags_Password},
-                {"AlwaysOverwrite", ImGuiInputTextFlags_AlwaysOverwrite},
-                {"AutoSelectAll", ImGuiInputTextFlags_AutoSelectAll},
-                {"ParseEmptyRefVal", ImGuiInputTextFlags_ParseEmptyRefVal},
-                {"DisplayEmptyRefVal", ImGuiInputTextFlags_DisplayEmptyRefVal},
-                {"NoHorizontalScroll", ImGuiInputTextFlags_NoHorizontalScroll},
-                {"NoUndoRedo", ImGuiInputTextFlags_NoUndoRedo},
-            };
-            n = (int)(sizeof(d)/sizeof(d[0])); return d;
-        }
-
-        inline const FlagDef* FlagTableSlider(int& n)
-        {
-            static const FlagDef d[] = {
-                {"Logarithmic", ImGuiSliderFlags_Logarithmic},
-                {"NoRoundToFormat", ImGuiSliderFlags_NoRoundToFormat},
-                {"NoInput", ImGuiSliderFlags_NoInput},
-                {"WrapAround", ImGuiSliderFlags_WrapAround},
-                {"ClampOnInput", ImGuiSliderFlags_ClampOnInput},
-                {"ClampZeroRange", ImGuiSliderFlags_ClampZeroRange},
-                {"AlwaysClamp", ImGuiSliderFlags_AlwaysClamp},
-            };
-            n = (int)(sizeof(d)/sizeof(d[0])); return d;
-        }
-
-        inline const FlagDef* FlagTableCombo(int& n)
-        {
-            static const FlagDef d[] = {
-                {"PopupAlignLeft", ImGuiComboFlags_PopupAlignLeft},
-                {"HeightSmall", ImGuiComboFlags_HeightSmall},
-                {"HeightRegular", ImGuiComboFlags_HeightRegular},
-                {"HeightLarge", ImGuiComboFlags_HeightLarge},
-                {"HeightLargest", ImGuiComboFlags_HeightLargest},
-                {"NoArrowButton", ImGuiComboFlags_NoArrowButton},
-                {"NoPreview", ImGuiComboFlags_NoPreview},
-                {"WidthFitPreview", ImGuiComboFlags_WidthFitPreview},
-            };
-            n = (int)(sizeof(d)/sizeof(d[0])); return d;
-        }
-
-        inline const FlagDef* FlagTableSelectable(int& n)
-        {
-            static const FlagDef d[] = {
-                {"NoAutoClosePopups", ImGuiSelectableFlags_NoAutoClosePopups},
-                {"SpanAllColumns", ImGuiSelectableFlags_SpanAllColumns},
-                {"AllowDoubleClick", ImGuiSelectableFlags_AllowDoubleClick},
-                {"Disabled", ImGuiSelectableFlags_Disabled},
-                {"AllowOverlap", ImGuiSelectableFlags_AllowOverlap},
-                {"Highlight", ImGuiSelectableFlags_Highlight},
-            };
-            n = (int)(sizeof(d)/sizeof(d[0])); return d;
-        }
-
-        inline const FlagDef* FlagTableTabBar(int& n)
-        {
-            static const FlagDef d[] = {
-                {"Reorderable", ImGuiTabBarFlags_Reorderable},
-                {"AutoSelectNewTabs", ImGuiTabBarFlags_AutoSelectNewTabs},
-                {"TabListPopupButton", ImGuiTabBarFlags_TabListPopupButton},
-                {"NoCloseWithMiddleMouseButton", ImGuiTabBarFlags_NoCloseWithMiddleMouseButton},
-                {"NoTabListScrollingButtons", ImGuiTabBarFlags_NoTabListScrollingButtons},
-                {"NoTooltip", ImGuiTabBarFlags_NoTooltip},
-                {"DrawSelectedOverline", ImGuiTabBarFlags_DrawSelectedOverline},
-                {"FittingPolicyScroll", ImGuiTabBarFlags_FittingPolicyScroll},
-                {"FittingPolicyResizeDown", ImGuiTabBarFlags_FittingPolicyResizeDown},
-            };
-            n = (int)(sizeof(d)/sizeof(d[0])); return d;
-        }
-
-        inline const FlagDef* FlagTableTabItem(int& n)
-        {
-            static const FlagDef d[] = {
-                {"UnsavedDocument", ImGuiTabItemFlags_UnsavedDocument},
-                {"SetSelected", ImGuiTabItemFlags_SetSelected},
-                {"NoCloseWithMiddleMouseButton", ImGuiTabItemFlags_NoCloseWithMiddleMouseButton},
-                {"NoPushId", ImGuiTabItemFlags_NoPushId},
-                {"NoTooltip", ImGuiTabItemFlags_NoTooltip},
-                {"NoReorder", ImGuiTabItemFlags_NoReorder},
-                {"Leading", ImGuiTabItemFlags_Leading},
-                {"Trailing", ImGuiTabItemFlags_Trailing},
-                {"NoAssumedClosure", ImGuiTabItemFlags_NoAssumedClosure},
-            };
-            n = (int)(sizeof(d)/sizeof(d[0])); return d;
-        }
-
-        inline const FlagDef* FlagTableTable(int& n)
-        {
-            static const FlagDef d[] = {
-                {"Resizable", ImGuiTableFlags_Resizable},
-                {"Reorderable", ImGuiTableFlags_Reorderable},
-                {"Hideable", ImGuiTableFlags_Hideable},
-                {"Sortable", ImGuiTableFlags_Sortable},
-                {"NoSavedSettings", ImGuiTableFlags_NoSavedSettings},
-                {"ContextMenuInBody", ImGuiTableFlags_ContextMenuInBody},
-                {"RowBg", ImGuiTableFlags_RowBg},
-                {"BordersInnerH", ImGuiTableFlags_BordersInnerH},
-                {"BordersOuterH", ImGuiTableFlags_BordersOuterH},
-                {"BordersInnerV", ImGuiTableFlags_BordersInnerV},
-                {"BordersOuterV", ImGuiTableFlags_BordersOuterV},
-                {"NoBordersInBody", ImGuiTableFlags_NoBordersInBody},
-                {"NoBordersInBodyUntilResize", ImGuiTableFlags_NoBordersInBodyUntilResize},
-                {"SizingFixedFit", ImGuiTableFlags_SizingFixedFit},
-                {"SizingFixedSame", ImGuiTableFlags_SizingFixedSame},
-                {"SizingStretchProp", ImGuiTableFlags_SizingStretchProp},
-                {"SizingStretchSame", ImGuiTableFlags_SizingStretchSame},
-                {"NoHostExtendX", ImGuiTableFlags_NoHostExtendX},
-                {"NoHostExtendY", ImGuiTableFlags_NoHostExtendY},
-                {"NoKeepColumnsVisible", ImGuiTableFlags_NoKeepColumnsVisible},
-                {"PreciseWidths", ImGuiTableFlags_PreciseWidths},
-                {"NoClip", ImGuiTableFlags_NoClip},
-                {"PadOuterX", ImGuiTableFlags_PadOuterX},
-                {"NoPadOuterX", ImGuiTableFlags_NoPadOuterX},
-                {"NoPadInnerX", ImGuiTableFlags_NoPadInnerX},
-                {"ScrollX", ImGuiTableFlags_ScrollX},
-                {"ScrollY", ImGuiTableFlags_ScrollY},
-                {"SortMulti", ImGuiTableFlags_SortMulti},
-                {"SortTristate", ImGuiTableFlags_SortTristate},
-                {"HighlightHoveredColumn", ImGuiTableFlags_HighlightHoveredColumn},
-            };
-            n = (int)(sizeof(d)/sizeof(d[0])); return d;
-        }
-
-        inline const FlagDef* FlagTableTableColumn(int& n)
-        {
-            static const FlagDef d[] = {
-                {"Disabled", ImGuiTableColumnFlags_Disabled},
-                {"DefaultHide", ImGuiTableColumnFlags_DefaultHide},
-                {"DefaultSort", ImGuiTableColumnFlags_DefaultSort},
-                {"WidthStretch", ImGuiTableColumnFlags_WidthStretch},
-                {"WidthFixed", ImGuiTableColumnFlags_WidthFixed},
-                {"NoResize", ImGuiTableColumnFlags_NoResize},
-                {"NoReorder", ImGuiTableColumnFlags_NoReorder},
-                {"NoHide", ImGuiTableColumnFlags_NoHide},
-                {"NoClip", ImGuiTableColumnFlags_NoClip},
-                {"NoSort", ImGuiTableColumnFlags_NoSort},
-                {"NoSortAscending", ImGuiTableColumnFlags_NoSortAscending},
-                {"NoSortDescending", ImGuiTableColumnFlags_NoSortDescending},
-                {"NoHeaderLabel", ImGuiTableColumnFlags_NoHeaderLabel},
-                {"NoHeaderWidth", ImGuiTableColumnFlags_NoHeaderWidth},
-                {"PreferSortAscending", ImGuiTableColumnFlags_PreferSortAscending},
-                {"PreferSortDescending", ImGuiTableColumnFlags_PreferSortDescending},
-                {"IndentEnable", ImGuiTableColumnFlags_IndentEnable},
-                {"IndentDisable", ImGuiTableColumnFlags_IndentDisable},
-                {"AngledHeader", ImGuiTableColumnFlags_AngledHeader},
-            };
-            n = (int)(sizeof(d)/sizeof(d[0])); return d;
-        }
-
-        inline const FlagDef* FlagTableColorEdit(int& n)
-        {
-            static const FlagDef d[] = {
-                {"NoAlpha", ImGuiColorEditFlags_NoAlpha},
-                {"NoPicker", ImGuiColorEditFlags_NoPicker},
-                {"NoOptions", ImGuiColorEditFlags_NoOptions},
-                {"NoSmallPreview", ImGuiColorEditFlags_NoSmallPreview},
-                {"NoInputs", ImGuiColorEditFlags_NoInputs},
-                {"NoTooltip", ImGuiColorEditFlags_NoTooltip},
-                {"NoDragDrop", ImGuiColorEditFlags_NoDragDrop},
-                {"NoBorder", ImGuiColorEditFlags_NoBorder},
-                {"AlphaBar", ImGuiColorEditFlags_AlphaBar},
-                {"AlphaPreview", ImGuiColorEditFlags_AlphaPreview},
-                {"AlphaPreviewHalf", ImGuiColorEditFlags_AlphaPreviewHalf},
-                {"HDR", ImGuiColorEditFlags_HDR},
-                {"DisplayRGB", ImGuiColorEditFlags_DisplayRGB},
-                {"DisplayHSV", ImGuiColorEditFlags_DisplayHSV},
-                {"DisplayHex", ImGuiColorEditFlags_DisplayHex},
-                {"InputRGB", ImGuiColorEditFlags_InputRGB},
-                {"InputHSV", ImGuiColorEditFlags_InputHSV},
-                {"PickerHueBar", ImGuiColorEditFlags_PickerHueBar},
-                {"PickerHueWheel", ImGuiColorEditFlags_PickerHueWheel},
-            };
-            n = (int)(sizeof(d)/sizeof(d[0])); return d;
-        }
-
-        inline const FlagDef* FlagTableTableRow(int& n)
-        {
-            static const FlagDef d[] = {
-                {"Headers", ImGuiTableRowFlags_Headers},
-            };
-            n = (int)(sizeof(d)/sizeof(d[0])); return d;
-        }
-
-        // Table of table-column flags lives on TableRow nodes (flags2): each TableRow's
-        // children are the cells; flags2 describes per-column setup options.
+        // Kind -> generated table routing (kept name for chrome/render call sites).
         inline const FlagDef* FlagTableFor(int kind, int& n)
         {
             switch (kind)
             {
-            case NWindow: case NPopupModal: return FlagTableWindow(n);
-            case NChild: return FlagTableChild(n);
-            case NCollapsingHeader: case NTreeNode: return FlagTableTreeNode(n);
-            case NInputText: case NInputTextMultiline: case NInputInt: case NInputFloat:
-                return FlagTableInputText(n);
-            case NSliderInt: case NSliderFloat: case NDragInt: case NDragFloat:
-                return FlagTableSlider(n);
-            case NCombo: return FlagTableCombo(n);
-            case NSelectable: return FlagTableSelectable(n);
-            case NTabBar: return FlagTableTabBar(n);
-            case NTabItem: return FlagTableTabItem(n);
-            case NTable: return FlagTableTable(n);
-            case NTableRow: return FlagTableTableRow(n);
-            case NColorEdit3: case NColorEdit4: return FlagTableColorEdit(n);
-            default: n = 0; return nullptr;
+            case NWindow: case NPopupModal:
+            {
+                // combine WindowFlags + a couple of composite entries by kind
+                return FlagTable_WindowFlags(n);
+            }
+            case NChild:         return FlagTable_ChildFlags(n);
+            case NCollapsingHeader:
+            case NTreeNode:      return FlagTable_TreeNodeFlags(n);
+            case NInputText: case NInputTextMultiline:
+                return FlagTable_InputTextFlags(n);
+            case NDragInt: case NDragFloat: case NSliderInt: case NSliderFloat:
+            case NInputInt: case NInputFloat:
+                // slider flags apply to sliders/drags; inputs accept InputText flags too
+                return FlagTable_SliderFlags(n);
+            case NCombo:         return FlagTable_ComboFlags(n);
+            case NSelectable:    return FlagTable_SelectableFlags(n);
+            case NTabBar:        return FlagTable_TabBarFlags(n);
+            case NTabItem:       return FlagTable_TabItemFlags(n);
+            case NTable:         return FlagTable_TableFlags(n);
+            case NTableRow:      return FlagTable_TableRowFlags(n);
+            case NColorEdit3: case NColorEdit4: return FlagTable_ColorEditFlags(n);
+            case NTooltip:       return FlagTable_PopupFlags(n);
+            case NCheckboxFlags: return FlagTable_ItemFlags(n);
+            default:             n = 0; return nullptr;
             }
         }
-
-        // ---------------------------------------------------------------------------
-        // Style color names (all 51 ImGuiCol_ entries usable as overrides).
-        // ---------------------------------------------------------------------------
         inline const char* StyleColName(int i)
         {
             static const char* names[] = {
@@ -1082,6 +1192,7 @@ jobs:
         Node* Node_Clone(const Node* src, Node* parent);
         Node* Node_FindById(Node* root, int id);
         int  Node_NextId();
+        void Node_ResyncIds(Node* root);   // re-assign fresh sequential ids (after load)
         void Node_AddChild(Node* p, Node* c, int pos = -1);
         void Node_RemoveFromParent(Node* n);
         int  Node_IndexInParent(const Node* n);
@@ -1165,31 +1276,63 @@ jobs:
             return n;
         }
 
+        // Re-assign fresh sequential ids to a loaded tree so new-node ids never
+        // collide with existing ones (stale ids from an old save file).
+        void Node_ResyncIds(Node* root)
+        {
+            std::vector<Node*> stack;
+            if (root) stack.push_back(root);
+            int depth = 0;
+            while (!stack.empty() && depth++ < 65536)
+            {
+                Node* n = stack.back(); stack.pop_back();
+                n->id = Node_NextId();
+                for (Node* c : n->children) stack.push_back(c);
+            }
+        }
+
         void Node_Delete(Node* n) { delete n; }
 
-        Node* Node_Clone(const Node* src, Node* parent)
+        static Node* Node_CloneDepth(const Node* src, Node* parent, int depth)
         {
             Node* n = new Node(*src);
             n->id = Node_NextId();
             n->parent = parent;
             n->children.clear();
-            for (Node* c : src->children)
-                n->children.push_back(Node_Clone(c, n));
+            if (depth < NODE_MAX_DEPTH)
+                for (Node* c : src->children)
+                    n->children.push_back(Node_CloneDepth(c, n, depth + 1));
             return n;
+        }
+        Node* Node_Clone(const Node* src, Node* parent)
+        {
+            return Node_CloneDepth(src, parent, 0);
         }
 
         Node* Node_FindById(Node* root, int id)
         {
-            if (!root) return nullptr;
-            if (root->id == id) return root;
-            for (Node* c : root->children)
-                if (Node* f = Node_FindById(c, id)) return f;
+            // depth-capped to guarantee termination on corrupt (cyclic) trees
+            std::vector<Node*> stack;
+            if (root) stack.push_back(root);
+            int depth = 0;
+            while (!stack.empty() && depth++ < 4096)
+            {
+                Node* n = stack.back(); stack.pop_back();
+                if (n->id == id) return n;
+                if ((int)n->children.size() > 4096) continue;
+                for (Node* c : n->children) stack.push_back(c);
+            }
             return nullptr;
         }
 
         void Node_AddChild(Node* p, Node* c, int pos)
         {
             if (!p || !c) return;
+            // Cycle guard: never let a node become its own descendant. A cyclic tree
+            // makes every render/save walk recurse without bound -> stack overflow.
+            if (p == c) return;
+            for (Node* a = p; a; a = a->parent)
+                if (a == c) { return; }
             c->parent = p;
             if (pos < 0 || pos >= (int)p->children.size())
                 p->children.push_back(c);
@@ -1216,6 +1359,7 @@ jobs:
 
         int Node_TotalCount(const Node* n)
         {
+            // depth-capped (see NODE_MAX_DEPTH)
             if (!n) return 0;
             int c = 1;
             for (Node* ch : n->children) c += Node_TotalCount(ch);
@@ -1266,11 +1410,13 @@ jobs:
             char line[1024], tmp[256];
             snprintf(line, sizeof(line), "%d {k=%s; n=%s; v=%s; o=%d; vis=%d; sel=%d; pf=%d; f1=%d; f2=%d; ad=%d; "
                      "i1=%d; i2=%d; fA=%.4g; fB=%.4g; fC=%.4g; fD=%.4g; mn=%.4g; mx=%.4g; sp=%.4g; w=%.4g; h=%.4g; "
+                     "px=%.4g; py=%.4g; pc=%d; "
                      "c0=%.3f,%.3f,%.3f,%.3f; fr=%.3g; ci=%d; fmt=%s; sc=%s; sl=%d; ind=%.4g; "
                      "sa=%d; sav=%.3g; cU=%d%d%d; cI=%d,%d,%d; cV=%s",
                      depth, NodeKindName(n->kind), n->name, n->value_str, n->open?1:0, n->visible?1:0, n->selected?1:0,
                      n->p_open_flag?1:0, n->flags, n->flags2, n->arrow_dir,
                      n->v_int, n->v_int2, n->v_float, n->v_float2, n->v_float3, n->v_float4, n->v_min, n->v_max, n->v_speed, n->w, n->h,
+                     n->pos_x, n->pos_y, n->pos_cond,
                      n->colors[0], n->colors[1], n->colors[2], n->colors[3], n->fraction, n->combo_i, n->fmt, n->shortcut,
                      n->same_line?1:0, n->indent,
                      n->st_alpha_used?1:0, n->st_alpha,
@@ -1294,14 +1440,15 @@ jobs:
             strcat(line, cols);
             strcat(line, "}\n");
             out += line;
-            for (Node* c : n->children)
-                SerializeNode(c, out, depth + 1);
+            if (depth < NODE_MAX_DEPTH)
+                for (Node* c : n->children)
+                    SerializeNode(c, out, depth + 1);
         }
 
         std::string SaveTreeToString(const Node* root)
         {
             std::string s;
-            s += "#IMGUI_MENU_V1\n";
+            s += "#IMGUI_MENU_V2\n";
             if (root) SerializeNode(root, s, 0);
             return s;
         }
@@ -1359,6 +1506,10 @@ jobs:
             Unesc(GetField(body.c_str(), "sc").c_str(), n->shortcut, sizeof(n->shortcut));
             n->same_line  = GetField(body.c_str(), "sl").c_str()[0] == '1';
             n->indent     = (float)atof(GetField(body.c_str(), "ind").c_str());
+            // V2 fields (absent in V1 files -> GetField returns "", atof/atoi -> 0: tolerant)
+            n->pos_x      = (float)atof(GetField(body.c_str(), "px").c_str());
+            n->pos_y      = (float)atof(GetField(body.c_str(), "py").c_str());
+            n->pos_cond   = atoi(GetField(body.c_str(), "pc").c_str());
             n->st_alpha_used = GetField(body.c_str(), "sa").c_str()[0] == '1';
             n->st_alpha   = (float)atof(GetField(body.c_str(), "sav").c_str());
             std::string cu = GetField(body.c_str(), "cU");
@@ -1389,7 +1540,10 @@ jobs:
 
         Node* LoadTreeFromString(const std::string& text)
         {
-            if (text.empty() || text.rfind("#IMGUI_MENU_V1", 0) != 0) return nullptr;
+            if (text.empty()) return nullptr;
+            // V2 or V1 (V1 files simply lack the px/py/pc fields; loader is tolerant)
+            bool v2 = text.rfind("#IMGUI_MENU_V2", 0) == 0;
+            if (!v2 && text.rfind("#IMGUI_MENU_V1", 0) != 0) return nullptr;
             Node* root = nullptr;
             std::vector<Node*> stack; // stack[depth] = current open node
             const char* p = text.c_str();
@@ -1401,6 +1555,7 @@ jobs:
                 std::string line(p, e ? (size_t)(e - p) : strlen(p));
                 if (line.find('{') == std::string::npos) continue;
                 int depth = atoi(line.c_str());
+                if (depth < 0 || depth > NODE_MAX_DEPTH) continue; // guard: corrupt depth
                 Node* n = ParseNodeLine(line.c_str());
                 if (!n) continue;
                 while ((int)stack.size() > depth + 1) stack.pop_back();
@@ -1413,6 +1568,7 @@ jobs:
                     stack[depth] = n;
                 }
             }
+            if (root) Node_ResyncIds(root);
             return root;
         }
 
@@ -1496,8 +1652,9 @@ jobs:
         // Render one node (and children). In edit_mode we also record hit rects and
         // show selection highlight. The rendered widgets are REAL ImGui widgets.
         // ---------------------------------------------------------------------------
-        static void RenderNode(Node* n, bool edit_mode, int selected_id)
+        static void RenderNode(Node* n, bool edit_mode, int selected_id, int depth = 0)
         {
+            if (depth > NODE_MAX_DEPTH) return; // guard: cyclic/corrupt tree
             // pre-layout: indent / same-line
             if (n->indent != 0.0f) ImGui::Indent(n->indent);
             if (n->same_line) ImGui::SameLine();
@@ -1514,12 +1671,16 @@ jobs:
             case NWindow:
             {
                 if (!vis) { /* still Begin to keep structure, disabled look */ }
+                // V2: explicit position (SetNextWindowPos equivalent)
+                if (n->pos_x != 0.0f || n->pos_y != 0.0f)
+                    ImGui::SetNextWindowPos(ImVec2(n->pos_x, n->pos_y),
+                                            (ImGuiCond)(n->pos_cond ? n->pos_cond : ImGuiCond_Once));
                 ImGui::SetNextWindowSize(ImVec2(n->w > 0 ? n->w : 300, n->h > 0 ? n->h : 200), n->w > 0 ? ImGuiCond_FirstUseEver : ImGuiCond_Appearing);
                 bool open = ImGui::Begin(n->name, n->p_open_flag ? &n->p_open_flag : nullptr, n->flags);
                 HitAdd(n->id, ImGui::GetWindowPos(), ImVec2(ImGui::GetWindowPos().x + ImGui::GetWindowSize().x, ImGui::GetWindowPos().y + ImGui::GetWindowSize().y));
                 if (open)
                 {
-                    for (Node* c : n->children) RenderNode(c, edit_mode, selected_id);
+                    for (Node* c : n->children) RenderNode(c, edit_mode, selected_id, depth + 1);
                     HitAdd(n->id, ImGui::GetWindowPos(), ImVec2(ImGui::GetWindowPos().x + ImGui::GetWindowSize().x, ImGui::GetWindowPos().y + ImGui::GetWindowSize().y)); // innermost update
                 }
                 ImGui::End();
@@ -1529,7 +1690,7 @@ jobs:
                 if (ImGui::BeginMenuBar())
                 {
                     HitAddItem(n->id);
-                    for (Node* c : n->children) RenderNode(c, edit_mode, selected_id);
+                    for (Node* c : n->children) RenderNode(c, edit_mode, selected_id, depth + 1);
                     ImGui::EndMenuBar();
                 }
                 break;
@@ -1537,7 +1698,7 @@ jobs:
                 if (ImGui::BeginMenu(n->name, vis))
                 {
                     HitAddItem(n->id);
-                    for (Node* c : n->children) RenderNode(c, edit_mode, selected_id);
+                    for (Node* c : n->children) RenderNode(c, edit_mode, selected_id, depth + 1);
                     ImGui::EndMenu();
                 }
                 break;
@@ -1555,7 +1716,7 @@ jobs:
                     ImGui::CollapsingHeader(n->name, f);
                 HitAddItem(n->id);
                 if (n->open && n->p_open_flag)
-                    for (Node* c : n->children) RenderNode(c, edit_mode, selected_id);
+                    for (Node* c : n->children) RenderNode(c, edit_mode, selected_id, depth + 1);
                 break;
             }
             case NTreeNode:
@@ -1565,7 +1726,7 @@ jobs:
                 HitAddItem(n->id);
                 if (open)
                 {
-                    for (Node* c : n->children) RenderNode(c, edit_mode, selected_id);
+                    for (Node* c : n->children) RenderNode(c, edit_mode, selected_id, depth + 1);
                     ImGui::TreePop();
                 }
                 break;
@@ -1574,7 +1735,7 @@ jobs:
                 if (ImGui::BeginTabBar(n->name, n->flags))
                 {
                     HitAddItem(n->id);
-                    for (Node* c : n->children) RenderNode(c, edit_mode, selected_id);
+                    for (Node* c : n->children) RenderNode(c, edit_mode, selected_id, depth + 1);
                     ImGui::EndTabBar();
                 }
                 break;
@@ -1582,13 +1743,13 @@ jobs:
                 if (ImGui::BeginTabItem(n->name, n->p_open_flag ? &n->p_open_flag : nullptr, n->flags))
                 {
                     HitAddItem(n->id);
-                    for (Node* c : n->children) RenderNode(c, edit_mode, selected_id);
+                    for (Node* c : n->children) RenderNode(c, edit_mode, selected_id, depth + 1);
                     ImGui::EndTabItem();
                 }
                 break;
             case NGroup:
                 ImGui::BeginGroup();
-                for (Node* c : n->children) RenderNode(c, edit_mode, selected_id);
+                for (Node* c : n->children) RenderNode(c, edit_mode, selected_id, depth + 1);
                 ImGui::EndGroup();
                 HitAddItem(n->id);
                 break;
@@ -1596,7 +1757,7 @@ jobs:
             {
                 bool open = ImGui::BeginChild(n->name, ImVec2(n->w, n->h), n->flags, n->flags2);
                 HitAdd(n->id, ImGui::GetWindowPos(), ImVec2(ImGui::GetWindowPos().x + ImGui::GetWindowSize().x, ImGui::GetWindowPos().y + ImGui::GetWindowSize().y));
-                if (open) for (Node* c : n->children) RenderNode(c, edit_mode, selected_id);
+                if (open) for (Node* c : n->children) RenderNode(c, edit_mode, selected_id, depth + 1);
                 ImGui::EndChild();
                 break;
             }
@@ -1779,7 +1940,7 @@ jobs:
                     if (ImGui::BeginPopupModal(n->name, n->p_open_flag ? &n->p_open_flag : nullptr, n->flags))
                     {
                         HitAdd(n->id, ImGui::GetWindowPos(), ImVec2(ImGui::GetWindowPos().x + ImGui::GetWindowSize().x, ImGui::GetWindowPos().y + ImGui::GetWindowSize().y));
-                        for (Node* c : n->children) RenderNode(c, edit_mode, selected_id);
+                        for (Node* c : n->children) RenderNode(c, edit_mode, selected_id, depth + 1);
                         ImGui::EndPopup();
                     }
                 }
@@ -1812,6 +1973,15 @@ jobs:
         // Runs in edit mode only. All panels are real Dear ImGui windows.
         #pragma once
         #include "editor_nodes.h"
+
+        // Forward decls (defined in main.cpp AFTER all modules are included):
+        void PickImportFolder();          // opens the SAF folder picker via Kotlin
+        void ImportReportClear();         // defined in editor_import.cpp
+        int  ImportReportScanned();
+        int  ImportReportNodes();
+        int  ImportReportFilesWithImgui();
+        int  ImportReportNonImguiCount();
+        const char* ImportReportNonImguiLine(int i);
 
         // ---------------------------------------------------------------------------
         // Editor context shared across chrome + render.
@@ -1906,8 +2076,9 @@ jobs:
         // ---------------------------------------------------------------------------
         // Tree view (left drawer, below add palette).
         // ---------------------------------------------------------------------------
-        static void TreeRow(Node* n)
+        static void TreeRow(Node* n, int depth = 0)
         {
+            if (depth > NODE_MAX_DEPTH) return; // guard: cyclic/corrupt tree
             ImGuiTreeNodeFlags fl = ImGuiTreeNodeFlags_OpenOnArrow | ImGuiTreeNodeFlags_SpanFullWidth;
             if (n->children.empty()) fl |= ImGuiTreeNodeFlags_Leaf;
             if (n->id == g_ed.sel) fl |= ImGuiTreeNodeFlags_Selected;
@@ -1917,7 +2088,7 @@ jobs:
                 g_ed.sel = n->id;
             if (open)
             {
-                for (Node* c : n->children) TreeRow(c);
+                for (Node* c : n->children) TreeRow(c, depth + 1);
                 ImGui::TreePop();
             }
         }
@@ -2199,6 +2370,2308 @@ jobs:
             if (ImGui::Button("Unlock", ImVec2(84, 30))) { g_ed.edit_mode = true; g_ed.palette_fullscreen = false; }
             ImGui::PopStyleColor();
             ImGui::End();
+        }
+
+        // ===========================================================================
+        // PHOTOSHOP-STYLE CHROME (v2): top toolbar + animated slide-out dock drawers
+        // (palette/tree left, inspector right, console bottom), flags browser,
+        // palette search, d-pad nav kept, perf cap.
+        // ===========================================================================
+        #include <cctype>
+
+        // ---------------------------------------------------------------------------
+        // Style: Photoshop-dark
+        // ---------------------------------------------------------------------------
+        static void ApplyPsStyle()
+        {
+            ImGuiStyle& st = ImGui::GetStyle();
+            ImVec4* c = st.Colors;
+            c[ImGuiCol_Text]                 = ImVec4(0.80f, 0.82f, 0.86f, 1.00f);
+            c[ImGuiCol_TextDisabled]         = ImVec4(0.42f, 0.44f, 0.49f, 1.00f);
+            c[ImGuiCol_WindowBg]              = ImVec4(0.18f, 0.19f, 0.21f, 1.00f);
+            c[ImGuiCol_ChildBg]               = ImVec4(0.16f, 0.17f, 0.19f, 1.00f);
+            c[ImGuiCol_PopupBg]               = ImVec4(0.14f, 0.15f, 0.17f, 0.98f);
+            c[ImGuiCol_Border]                = ImVec4(0.29f, 0.30f, 0.32f, 1.00f);
+            c[ImGuiCol_BorderShadow]          = ImVec4(0.10f, 0.10f, 0.12f, 0.00f);
+            c[ImGuiCol_FrameBg]               = ImVec4(0.24f, 0.25f, 0.28f, 1.00f);
+            c[ImGuiCol_FrameBgHovered]        = ImVec4(0.29f, 0.30f, 0.33f, 1.00f);
+            c[ImGuiCol_FrameBgActive]         = ImVec4(0.32f, 0.33f, 0.36f, 1.00f);
+            c[ImGuiCol_TitleBg]               = ImVec4(0.15f, 0.16f, 0.18f, 1.00f);
+            c[ImGuiCol_TitleBgActive]         = ImVec4(0.15f, 0.16f, 0.18f, 1.00f);
+            c[ImGuiCol_TitleBgCollapsed]      = ImVec4(0.15f, 0.16f, 0.18f, 0.51f);
+            c[ImGuiCol_MenuBarBg]             = ImVec4(0.22f, 0.23f, 0.25f, 1.00f);
+            c[ImGuiCol_ScrollbarBg]           = ImVec4(0.20f, 0.21f, 0.23f, 1.00f);
+            c[ImGuiCol_ScrollbarGrab]         = ImVec4(0.30f, 0.31f, 0.34f, 1.00f);
+            c[ImGuiCol_ScrollbarGrabHovered]  = ImVec4(0.36f, 0.37f, 0.40f, 1.00f);
+            c[ImGuiCol_ScrollbarGrabActive]   = ImVec4(0.40f, 0.41f, 0.44f, 1.00f);
+            c[ImGuiCol_CheckMark]             = ImVec4(0.26f, 0.60f, 0.96f, 1.00f);
+            c[ImGuiCol_SliderGrab]           = ImVec4(0.26f, 0.60f, 0.96f, 0.80f);
+            c[ImGuiCol_SliderGrabActive]      = ImVec4(0.26f, 0.60f, 0.96f, 1.00f);
+            c[ImGuiCol_Button]                = ImVec4(0.27f, 0.28f, 0.31f, 1.00f);
+            c[ImGuiCol_ButtonHovered]         = ImVec4(0.33f, 0.34f, 0.37f, 1.00f);
+            c[ImGuiCol_ButtonActive]          = ImVec4(0.26f, 0.60f, 0.96f, 0.66f);
+            c[ImGuiCol_Header]                = ImVec4(0.26f, 0.60f, 0.96f, 0.42f);
+            c[ImGuiCol_HeaderHovered]         = ImVec4(0.26f, 0.60f, 0.96f, 0.55f);
+            c[ImGuiCol_HeaderActive]          = ImVec4(0.26f, 0.60f, 0.96f, 0.70f);
+            c[ImGuiCol_Separator]              = ImVec4(0.29f, 0.30f, 0.32f, 1.00f);
+            c[ImGuiCol_SeparatorHovered]      = ImVec4(0.36f, 0.60f, 0.96f, 0.60f);
+            c[ImGuiCol_SeparatorActive]       = ImVec4(0.26f, 0.60f, 0.96f, 1.00f);
+            c[ImGuiCol_ResizeGrip]             = ImVec4(0.26f, 0.60f, 0.96f, 0.20f);
+            c[ImGuiCol_ResizeGripHovered]     = ImVec4(0.26f, 0.60f, 0.96f, 0.67f);
+            c[ImGuiCol_ResizeGripActive]      = ImVec4(0.26f, 0.60f, 0.96f, 0.95f);
+            c[ImGuiCol_Tab]                    = ImVec4(0.20f, 0.21f, 0.23f, 1.00f);
+            c[ImGuiCol_TabHovered]             = ImVec4(0.28f, 0.29f, 0.32f, 1.00f);
+            c[ImGuiCol_TabSelected]           = ImVec4(0.26f, 0.60f, 0.96f, 0.48f);
+            c[ImGuiCol_TabDimmed]              = ImVec4(0.20f, 0.21f, 0.23f, 1.00f);
+            c[ImGuiCol_TabDimmedSelected]     = ImVec4(0.24f, 0.25f, 0.28f, 1.00f);
+            c[ImGuiCol_PlotLines]              = ImVec4(0.90f, 0.90f, 0.90f, 1.00f);
+            c[ImGuiCol_PlotHistogram]         = ImVec4(0.90f, 0.70f, 0.20f, 1.00f);
+            c[ImGuiCol_TextSelectedBg]         = ImVec4(0.26f, 0.60f, 0.96f, 0.35f);
+            c[ImGuiCol_DragDropTarget]         = ImVec4(0.26f, 0.60f, 0.96f, 0.90f);
+            c[ImGuiCol_NavCursor]             = ImVec4(0.26f, 0.60f, 0.96f, 1.00f);
+            c[ImGuiCol_ModalWindowDimBg]       = ImVec4(0.06f, 0.06f, 0.08f, 0.70f);
+            st.WindowRounding = 4.0f;
+            st.FrameRounding = 3.0f;
+            st.GrabRounding   = 3.0f;
+            st.WindowBorderSize = 1.0f;
+            st.FrameBorderSize  = 0.0f;
+            st.WindowPadding = ImVec2(10, 8);
+            st.FramePadding  = ImVec2(8, 5);
+            st.ItemSpacing   = ImVec2(8, 6);
+            st.GrabMinSize   = 9.0f;
+        }
+
+        // ---------------------------------------------------------------------------
+        // Dock animation state
+        // ---------------------------------------------------------------------------
+        struct DockAnim
+        {
+            float open = 0.0f;   // 0..1
+            bool  want = false;
+        };
+        static DockAnim g_dockPalette, g_dockInspector, g_dockConsole;
+
+        static void AnimDock(DockAnim& d, bool want_open, float dt)
+        {
+            d.want = want_open;
+            float target = want_open ? 1.0f : 0.0f;
+            float speed = 7.0f * dt;
+            if (d.open < target) d.open = ImMin(d.open + speed, target);
+            else if (d.open > target) d.open = ImMax(d.open - speed, target);
+        }
+
+        // ---------------------------------------------------------------------------
+        // Top toolbar: mode toggles, import, drawer toggles
+        // ---------------------------------------------------------------------------
+        static void DrawPsToolbar()
+        {
+            ImGuiIO& io = ImGui::GetIO();
+            float W = io.DisplaySize.x;
+            ImGui::SetNextWindowPos(ImVec2(0, 0), ImGuiCond_Always);
+            ImGui::SetNextWindowSize(ImVec2(W, 44), ImGuiCond_Always);
+            ImGui::PushStyleVar(ImGuiStyleVar_WindowRounding, 0);
+            ImGui::Begin("##ps_toolbar", nullptr, ImGuiWindowFlags_NoTitleBar | ImGuiWindowFlags_NoResize |
+                         ImGuiWindowFlags_NoMove | ImGuiWindowFlags_NoScrollbar |
+                         ImGuiWindowFlags_NoSavedSettings | ImGuiWindowFlags_NoCollapse);
+            {
+                ImGui::PushStyleColor(ImGuiCol_Button, ImVec4(0.20f, 0.45f, 0.78f, 1.0f));
+                if (ImGui::Button("IMPORT PROJECT"))
+                    PickImportFolder();               // -> SAF folder picker via Kotlin
+                ImGui::PopStyleColor();
+                ImGui::SameLine();
+                ImGui::Dummy(ImVec2(10, 0)); ImGui::SameLine();
+                ImGui::TextDisabled("|"); ImGui::SameLine();
+                if (ImGui::Button(g_dockPalette.want ? "< Palette" : "> Palette")) g_dockPalette.want = !g_dockPalette.want;
+                ImGui::SameLine();
+                if (ImGui::Button(g_dockInspector.want ? "Inspector >" : "Inspector <")) g_dockInspector.want = !g_dockInspector.want;
+                ImGui::SameLine();
+                if (ImGui::Button(g_dockConsole.want ? "v Console" : "^ Console")) g_dockConsole.want = !g_dockConsole.want;
+                ImGui::SameLine();
+                ImGui::Dummy(ImVec2(10, 0)); ImGui::SameLine();
+                ImGui::TextDisabled("|"); ImGui::SameLine();
+                ImGui::Text("items: %d", Node_TotalCount(g_ed.root));
+                ImGui::SameLine();
+                if (g_ed.edit_mode)
+                {
+                    ImGui::PushStyleColor(ImGuiCol_Text, ImVec4(0.95f, 0.75f, 0.25f, 1));
+                    ImGui::TextUnformatted("EDIT MODE");
+                    ImGui::PopStyleColor();
+                }
+                else
+                {
+                    ImGui::PushStyleColor(ImGuiCol_Text, ImVec4(0.35f, 0.85f, 0.45f, 1));
+                    ImGui::TextUnformatted("PREVIEW (LOCKED)");
+                    ImGui::PopStyleColor();
+                }
+            }
+            ImGui::End();
+            ImGui::PopStyleVar();
+        }
+
+        // ---------------------------------------------------------------------------
+        // Slide-out dock helper: window anchored to an edge, offset by open fraction.
+        // side: 0=left, 1=right, 2=bottom. Returns true while visible (open>0.02).
+        // ---------------------------------------------------------------------------
+        static bool BeginDock(const char* name, DockAnim& d, int side, float size)
+        {
+            if (d.open < 0.02f) return false;
+            ImGuiIO& io = ImGui::GetIO();
+            float W = io.DisplaySize.x, H = io.DisplaySize.y;
+            float slide = d.open; // eased
+            slide = slide * slide * (3 - 2 * slide); // smoothstep
+
+            ImGui::PushStyleVar(ImGuiStyleVar_WindowRounding, 0);
+            ImGui::PushStyleVar(ImGuiStyleVar_WindowBorderSize, 1);
+            ImGuiWindowFlags fl = ImGuiWindowFlags_NoTitleBar | ImGuiWindowFlags_NoResize |
+                                  ImGuiWindowFlags_NoMove | ImGuiWindowFlags_NoSavedSettings |
+                                  ImGuiWindowFlags_NoCollapse | ImGuiWindowFlags_NoScrollbar;
+            if (side == 0)      { ImGui::SetNextWindowPos(ImVec2(-size * (1 - slide), 44), ImGuiCond_Always);  ImGui::SetNextWindowSize(ImVec2(size, H - 44), ImGuiCond_Always); }
+            else if (side == 1) { ImGui::SetNextWindowPos(ImVec2(W + size * (1 - slide), 44), ImGuiCond_Always); ImGui::SetNextWindowSize(ImVec2(size, H - 44), ImGuiCond_Always); }
+            else               { ImGui::SetNextWindowPos(ImVec2(0, H - size * slide), ImGuiCond_Always);          ImGui::SetNextWindowSize(ImVec2(W, size * slide + 0.001f), ImGuiCond_Always); }
+            bool vis = ImGui::Begin(name, nullptr, fl);
+            if (!vis) { ImGui::End(); ImGui::PopStyleVar(2); return false; }
+            return true;
+        }
+        static void EndDock()
+        {
+            ImGui::End();
+            ImGui::PopStyleVar(2);
+        }
+
+        // ---------------------------------------------------------------------------
+        // Palette drawer (left): search + categorized add buttons + tree
+        // ---------------------------------------------------------------------------
+        static char g_palette_filter[64] = "";
+
+        static bool KindNameMatches(const char* name)
+        {
+            if (!g_palette_filter[0]) return true;
+            const char* a = g_palette_filter;
+            for (const char* b = name; *b; b++)
+            {
+                const char* bb = b; const char* aa = a; bool m = true;
+                while (*aa && *bb)
+                {
+                    if (tolower((unsigned char)*aa) != tolower((unsigned char)*bb)) { m = false; break; }
+                    aa++; bb++;
+                }
+                if (m && *aa == 0) return true;
+            }
+            return false;
+        }
+
+        static void DrawPaletteDock()
+        {
+            const float DW = 230;
+            if (!BeginDock("##dock_palette", g_dockPalette, 0, DW)) return;
+            ImGui::TextUnformatted("ADD ITEM");
+            ImGui::Separator();
+            ImGui::InputTextWithHint("##filter", "search widgets...", g_palette_filter, sizeof(g_palette_filter));
+            ImGui::Spacing();
+
+            Node* sel = g_ed.SelNode();
+            int pid = (sel && NodeAcceptsChildren(sel->kind)) ? sel->id : (g_ed.root ? g_ed.root->id : -1);
+            if (!sel) ImGui::TextDisabled("no selection");
+            char lbl[64];
+            for (int c = 0; c < 9; c++)
+            {
+                bool has_any = false;
+                for (auto& m : KindCategoryMap)
+                    if (m[0] == c && KindNameMatches(NodeKindName(m[1]))) { has_any = true; break; }
+                if (!has_any) continue;
+                if (!ImGui::CollapsingHeader(KindCategories[c], ImGuiTreeNodeFlags_DefaultOpen)) continue;
+                for (auto& m : KindCategoryMap)
+                {
+                    if (m[0] != c || !KindNameMatches(NodeKindName(m[1]))) continue;
+                    snprintf(lbl, sizeof(lbl), "+ %s", NodeKindName(m[1]));
+                    if (ImGui::SmallButton(lbl)) AddNodeButton(m[1], pid);
+                    ImGui::SameLine();
+                }
+                ImGui::NewLine();
+            }
+            ImGui::Separator();
+            ImGui::TextUnformatted("DOCUMENT TREE");
+            ImGui::Separator();
+            if (!g_ed.root) ImGui::TextDisabled("(empty)");
+            else TreeRow(g_ed.root);
+            EndDock();
+        }
+
+        // ---------------------------------------------------------------------------
+        // Inspector drawer (right): node properties + full flag browser
+        // ---------------------------------------------------------------------------
+        static void DrawInspectorDock()
+        {
+            const float DW = 300;
+            if (!BeginDock("##dock_inspector", g_dockInspector, 1, DW)) return;
+            Node* n = g_ed.SelNode();
+            if (!n) { ImGui::TextDisabled("select an item"); EndDock(); return; }
+            ImGui::Text("path: %s", GetSelPath(n));
+            ImGui::Separator();
+            DrawNodeProps(n);
+
+            // ---- Flags reference browser: ALL groups from editor_flags.h ----
+            if (ImGui::CollapsingHeader("Flag Browser (all ImGui enums)"))
+            {
+                static char fb_filter[48] = "";
+                ImGui::InputTextWithHint("##fbfilter", "search flags...", fb_filter, sizeof(fb_filter));
+                static int open_group = -1;
+                int ng = 0; const FlagGroup* gs = AllFlagGroups(ng);
+                for (int gi = 0; gi < ng; gi++)
+                {
+                    int m = 0; const FlagDef* d = gs[gi].fn(m);
+                    // count matches
+                    int match = 0;
+                    for (int i = 0; i < m; i++)
+                        if (!fb_filter[0] || strstr(d[i].name, fb_filter)) match++;
+                    if (!match) continue;
+                    char t[96]; snprintf(t, sizeof(t), "%s (%d)", gs[gi].title, match);
+                    if (ImGui::TreeNode(t))
+                    {
+                        for (int i = 0; i < m; i++)
+                        {
+                            if (fb_filter[0] && !strstr(d[i].name, fb_filter)) continue;
+                            ImGui::BulletText("%s = %d (0x%X)", d[i].name, d[i].value, d[i].value);
+                        }
+                        ImGui::TreePop();
+                    }
+                }
+            }
+            EndDock();
+        }
+
+        // ---------------------------------------------------------------------------
+        // Console drawer (bottom): import report + breadcrumbs
+        // ---------------------------------------------------------------------------
+        static void DrawConsoleDock()
+        {
+            const float DH = 170;
+            if (!BeginDock("##dock_console", g_dockConsole, 2, DH)) return;
+            ImGui::TextUnformatted("CONSOLE");
+            ImGui::SameLine();
+            if (ImGui::SmallButton("clear")) ImportReportClear();
+            ImGui::Separator();
+            ImGui::BeginChild("##con", ImVec2(0, 0), ImGuiChildFlags_Borders);
+            {
+                if (ImportReportScanned() > 0)
+                {
+                    ImGui::Text("last import: %d files, %d nodes, %d with ImGui",
+                                ImportReportScanned(), ImportReportNodes(), ImportReportFilesWithImgui());
+                    ImGui::Separator();
+                    ImGui::TextUnformatted("code NOT related to imgui:");
+                    for (int i = 0; i < ImportReportNonImguiCount(); i++)
+                        ImGui::TextUnformatted(ImportReportNonImguiLine(i));
+                }
+                else
+                    ImGui::TextDisabled("(no import yet - use IMPORT PROJECT)");
+            }
+            ImGui::EndChild();
+            EndDock();
+        }
+
+        // ---------------------------------------------------------------------------
+        // Photoshop chrome entry point: toolbar + docks + d-pad + lock
+        // ---------------------------------------------------------------------------
+        static void DrawPsChrome()
+        {
+            ImGuiIO& io = ImGui::GetIO();
+            float dt = io.DeltaTime;
+            AnimDock(g_dockPalette,    g_dockPalette.want    && g_ed.edit_mode, dt);
+            AnimDock(g_dockInspector,  g_dockInspector.want && g_ed.edit_mode, dt);
+            AnimDock(g_dockConsole,    g_dockConsole.want   && g_ed.edit_mode, dt);
+
+            DrawPsToolbar();
+            DrawPaletteDock();
+            DrawInspectorDock();
+            DrawConsoleDock();
+            if (g_ed.edit_mode) DrawBottomBox();
+            DrawLockButton();
+        }
+
+        IMGUIED_EOF
+
+        mkdir -p "$(dirname 'app/src/main/cpp/editor_crashlog.h')"
+        cat > 'app/src/main/cpp/editor_crashlog.h' <<'IMGUIED_EOF'
+        // editor_crashlog.h - Native crash logger for the ImGui menu editor.
+        // A SIGSEGV/SIGBUS/SIGFPE/SIGILL/SIGABRT handler writes a report (signal,
+        // fault address, registers, frame-pointer backtrace, recent breadcrumbs and
+        // the tail of /proc/self/maps) to <internalDataPath>/crash_native.log through
+        // a pre-opened fd, then re-raises the signal for normal system handling.
+        // The Kotlin side (MainActivity) copies that file into the PUBLIC Downloads
+        // folder on every next launch, so no adb/root is needed to read it.
+        // Uses only pre-opened fds + write/read/lseek/memmove (no malloc, no locks);
+        // snprintf is not strictly async-signal-safe but allocates nothing on
+        // bionic/glibc for these format strings (same trade-off minimal handlers make).
+        #ifndef IMGUIED_CRASHLOG_H
+        #define IMGUIED_CRASHLOG_H
+
+        #include <signal.h>
+        #include <fcntl.h>
+        #include <unistd.h>
+        #include <string.h>
+        #include <stdio.h>
+        #include <stdarg.h>
+        #include <sys/ucontext.h>
+        #include <sys/syscall.h>
+
+        #define CRASHLOG_MAX_CRUMBS 48
+        #define CRASHLOG_CRUMB_BUF  96
+        #define NODE_MAX_DEPTH      64 // shared tree-depth cap (guards every recursion)
+
+        struct ImGuiEdCrashLog {
+            int          fd;         // pre-opened append fd for crash_native.log
+            int          maps_fd;    // pre-opened /proc/self/maps (re-read on crash)
+            volatile int seq;        // breadcrumb sequence counter
+            char         crumbs[CRASHLOG_MAX_CRUMBS][CRASHLOG_CRUMB_BUF];
+            int          seqs[CRASHLOG_MAX_CRUMBS];
+        };
+        static ImGuiEdCrashLog g_crashlog = { -1, -1, 0, { { 0 } }, { 0 } };
+
+        // ---- write helpers (write(2) is async-signal-safe) ----
+        static void ImGuiEdCrashWrite(const char* s)
+        {
+            if (g_crashlog.fd >= 0) { ssize_t r = write(g_crashlog.fd, s, strlen(s)); (void)r; }
+        }
+
+        // ---- breadcrumbs: fixed ring buffer, no allocation ----
+        static void ImGuiEdCrumb(const char* fmt, ...)
+        {
+            if (g_crashlog.fd < 0) return;
+            char buf[CRASHLOG_CRUMB_BUF];
+            va_list ap; va_start(ap, fmt);
+            vsnprintf(buf, sizeof(buf), fmt, ap);
+            va_end(ap);
+            int s = __sync_fetch_and_add(&g_crashlog.seq, 1);
+            int i = s % CRASHLOG_MAX_CRUMBS;
+            memcpy(g_crashlog.crumbs[i], buf, CRASHLOG_CRUMB_BUF);
+            g_crashlog.seqs[i] = s;
+        }
+
+        // ---- the handler ----
+        static void ImGuiEdCrashSignalHandler(int sig, siginfo_t* si, void* uctx_v)
+        {
+            char buf[1024];
+            const char* nm = sig == SIGSEGV ? "SIGSEGV" : sig == SIGBUS ? "SIGBUS" :
+                             sig == SIGFPE ? "SIGFPE"  : sig == SIGILL ? "SIGILL" :
+                             sig == SIGABRT ? "SIGABRT" : "?";
+            snprintf(buf, sizeof(buf),
+                     "\n==== NATIVE CRASH ====\nsignal: %d (%s) si_code=%d\n"
+                     "fault address: %p\ntid: %d\n",
+                     sig, nm, si ? si->si_code : 0, si ? si->si_addr : (void*)0,
+                     (int)syscall(SYS_gettid));
+            ImGuiEdCrashWrite(buf);
+
+            ucontext_t* uc = (ucontext_t*)uctx_v;
+            void* fp = nullptr;
+            if (uc) {
+                // Registers (per-ABI) + the frame pointer for the backtrace walk.
+        #if defined(__aarch64__)
+                int off = 0;
+                char r[900];
+                for (int i = 0; i <= 28; i += 4)
+                    off += snprintf(r + off, (int)sizeof(r) - off, "x%d=%016llx x%d=%016llx ",
+                                    i,   (unsigned long long)uc->uc_mcontext.regs[i],
+                                    i+2, (unsigned long long)uc->uc_mcontext.regs[i+2]);
+                off += snprintf(r + off, (int)sizeof(r) - off, "sp=%016llx pc=%016llx",
+                                (unsigned long long)uc->uc_mcontext.sp,
+                                (unsigned long long)uc->uc_mcontext.pc);
+                ImGuiEdCrashWrite(r); ImGuiEdCrashWrite("\n");
+                fp = (void*)uc->uc_mcontext.regs[29];
+        #elif defined(__arm__)
+                snprintf(buf, sizeof(buf),
+                         "pc=%08x sp=%08x lr=%08x fp=%08x r0=%08x r1=%08x r2=%08x r3=%08x\n",
+                         (unsigned)uc->uc_mcontext.arm_pc, (unsigned)uc->uc_mcontext.arm_sp,
+                         (unsigned)uc->uc_mcontext.arm_lr, (unsigned)uc->uc_mcontext.arm_fp,
+                         (unsigned)uc->uc_mcontext.arm_r0, (unsigned)uc->uc_mcontext.arm_r1,
+                         (unsigned)uc->uc_mcontext.arm_r2, (unsigned)uc->uc_mcontext.arm_r3);
+                ImGuiEdCrashWrite(buf);
+                fp = (void*)uc->uc_mcontext.arm_fp;
+        #elif defined(__x86_64__)
+                snprintf(buf, sizeof(buf),
+                         "rip=%016llx rsp=%016llx rbp=%016llx rax=%016llx rbx=%016llx\n",
+                         (unsigned long long)uc->uc_mcontext.gregs[REG_RIP],
+                         (unsigned long long)uc->uc_mcontext.gregs[REG_RSP],
+                         (unsigned long long)uc->uc_mcontext.gregs[REG_RBP],
+                         (unsigned long long)uc->uc_mcontext.gregs[REG_RAX],
+                         (unsigned long long)uc->uc_mcontext.gregs[REG_RBX]);
+                ImGuiEdCrashWrite(buf);
+                fp = (void*)uc->uc_mcontext.gregs[REG_RBP];
+        #elif defined(__i386__)
+                snprintf(buf, sizeof(buf),
+                         "eip=%08x esp=%08x ebp=%08x eax=%08x ebx=%08x\n",
+                         (unsigned)uc->uc_mcontext.gregs[REG_EIP], (unsigned)uc->uc_mcontext.gregs[REG_ESP],
+                         (unsigned)uc->uc_mcontext.gregs[REG_EBP], (unsigned)uc->uc_mcontext.gregs[REG_EAX],
+                         (unsigned)uc->uc_mcontext.gregs[REG_EBX]);
+                ImGuiEdCrashWrite(buf);
+                fp = (void*)uc->uc_mcontext.gregs[REG_EBP];
+        #else
+                ImGuiEdCrashWrite("(registers: unsupported ABI)\n");
+        #endif
+            }
+
+            // Frame-pointer chain backtrace (best effort; bounded and range-checked).
+            ImGuiEdCrashWrite("backtrace (frame-pointer chain):\n");
+            for (int i = 0; i < 24 && fp; i++) {
+                unsigned long a = (unsigned long)fp;
+                if (a < 0x1000 || (a & 7) != 0 || a > 0x7ffffffffffful) break;
+                void** f = (void**)fp;
+                void* ret = f[1];
+                snprintf(buf, sizeof(buf), "  #%02d pc %p\n", i, ret);
+                ImGuiEdCrashWrite(buf);
+                fp = f[0];
+            }
+
+            // Breadcrumbs, oldest first.
+            ImGuiEdCrashWrite("breadcrumbs (oldest first):\n");
+            int total = g_crashlog.seq;
+            for (int k = total - CRASHLOG_MAX_CRUMBS; k < total; k++) {
+                if (k < 0) continue;
+                int i = k % CRASHLOG_MAX_CRUMBS;
+                if (g_crashlog.seqs[i] != k) continue; // slot in flight / overwritten
+                snprintf(buf, sizeof(buf), "  %s\n", g_crashlog.crumbs[i]);
+                ImGuiEdCrashWrite(buf);
+            }
+
+            // Keep the last 8 KB of /proc/self/maps (covers the faulting library).
+            if (g_crashlog.maps_fd >= 0) {
+                lseek(g_crashlog.maps_fd, 0, SEEK_SET);
+                ImGuiEdCrashWrite("maps tail:\n");
+                static char win[8192], tmp[8192]; // static: no stack blowup, no alloc
+                size_t keep = 0; ssize_t r;
+                while ((r = read(g_crashlog.maps_fd, tmp, sizeof(tmp))) > 0) {
+                    size_t take = (size_t)r;
+                    if (take >= sizeof(win)) { // keep only the last 8 KB of this chunk
+                        memcpy(win, tmp + take - sizeof(win), sizeof(win)); keep = sizeof(win);
+                    } else {
+                        size_t room = sizeof(win) - keep;
+                        if (take > room) { size_t drop = take - room; memmove(win, win + drop, keep - drop); keep -= drop; }
+                        memcpy(win + keep, tmp, take); keep += take;
+                    }
+                }
+                if (g_crashlog.fd >= 0) { ssize_t w = write(g_crashlog.fd, win, keep); (void)w; }
+            }
+
+            ImGuiEdCrashWrite("==== END CRASH ====\n");
+
+            // Restore default disposition and re-raise so the system's normal crash
+            // handling (tombstone / force-close dialog) still runs.
+            signal(sig, SIG_DFL);
+            raise(sig);
+        }
+
+        // ---- init ----
+        static char g_crashlog_altstack[64 * 1024]; // dedicated stack: stack-overflow
+                                                    // SIGSEGVs can still be logged
+        static void ImGuiEdCrashLogInit(const char* internal_data_dir)
+        {
+            char path[512];
+            snprintf(path, sizeof(path), "%s/crash_native.log", internal_data_dir);
+            g_crashlog.fd = open(path, O_WRONLY | O_CREAT | O_APPEND, 0600);
+            g_crashlog.maps_fd = open("/proc/self/maps", O_RDONLY);
+
+            stack_t ss; memset(&ss, 0, sizeof(ss));
+            ss.ss_sp = g_crashlog_altstack;
+            ss.ss_size = sizeof(g_crashlog_altstack);
+            ss.ss_flags = 0;
+            sigaltstack(&ss, nullptr);
+
+            struct sigaction sa; memset(&sa, 0, sizeof(sa));
+            sa.sa_sigaction = ImGuiEdCrashSignalHandler;
+            sa.sa_flags = SA_SIGINFO | SA_ONSTACK;
+            sigemptyset(&sa.sa_mask);
+            const int sigs[5] = { SIGSEGV, SIGBUS, SIGFPE, SIGILL, SIGABRT };
+            for (int i = 0; i < 5; i++) sigaction(sigs[i], &sa, nullptr);
+
+            ImGuiEdCrashWrite("\n==== SESSION START ====\n");
+            ImGuiEdCrumb("crash log armed");
+        }
+
+        #endif // IMGUIED_CRASHLOG_H
+
+        IMGUIED_EOF
+
+        mkdir -p "$(dirname 'app/src/main/cpp/editor_flags.h')"
+        cat > 'app/src/main/cpp/editor_flags.h' <<'IMGUIED_EOF'
+        // editor_flags.h - AUTO-GENERATED from imgui.h v1.91.5 by gen_flags.py.
+        // Do not edit by hand: every ImGui enum as a FlagDef table, so the editor
+        // exposes ALL flags/configs for ALL sections. Re-run gen_flags.py to refresh.
+        #pragma once
+        #include "imgui.h"
+        #include <string.h>
+
+
+        inline const FlagDef* FlagTable_WindowFlags(int& n)
+        {
+            static const FlagDef d[] = {
+                {"ImGuiWindowFlags_None", 0},
+                {"ImGuiWindowFlags_NoTitleBar", 1},
+                {"ImGuiWindowFlags_NoResize", 2},
+                {"ImGuiWindowFlags_NoMove", 4},
+                {"ImGuiWindowFlags_NoScrollbar", 8},
+                {"ImGuiWindowFlags_NoScrollWithMouse", 16},
+                {"ImGuiWindowFlags_NoCollapse", 32},
+                {"ImGuiWindowFlags_AlwaysAutoResize", 64},
+                {"ImGuiWindowFlags_NoBackground", 128},
+                {"ImGuiWindowFlags_NoSavedSettings", 256},
+                {"ImGuiWindowFlags_NoMouseInputs", 512},
+                {"ImGuiWindowFlags_MenuBar", 1024},
+                {"ImGuiWindowFlags_HorizontalScrollbar", 2048},
+                {"ImGuiWindowFlags_NoFocusOnAppearing", 4096},
+                {"ImGuiWindowFlags_NoBringToFrontOnFocus", 8192},
+                {"ImGuiWindowFlags_AlwaysVerticalScrollbar", 16384},
+                {"ImGuiWindowFlags_AlwaysHorizontalScrollbar", 32768},
+                {"ImGuiWindowFlags_NoNavInputs", 65536},
+                {"ImGuiWindowFlags_NoNavFocus", 131072},
+                {"ImGuiWindowFlags_UnsavedDocument", 262144},
+                {"ImGuiWindowFlags_NoNav", 196608},
+                {"ImGuiWindowFlags_NoDecoration", 43},
+                {"ImGuiWindowFlags_NoInputs", 197120},
+                {"ImGuiWindowFlags_ChildWindow", 16777216},
+                {"ImGuiWindowFlags_Tooltip", 33554432},
+                {"ImGuiWindowFlags_Popup", 67108864},
+                {"ImGuiWindowFlags_Modal", 134217728},
+                {"ImGuiWindowFlags_ChildMenu", 268435456},
+                {"ImGuiWindowFlags_AlwaysUseWindowPadding", 1073741824},
+                {"ImGuiWindowFlags_NavFlattened", (int)2147483648u},
+            };
+            n = (int)(sizeof(d)/sizeof(d[0])); return d;
+        }
+
+        inline const FlagDef* FlagTable_ChildFlags(int& n)
+        {
+            static const FlagDef d[] = {
+                {"ImGuiChildFlags_None", 0},
+                {"ImGuiChildFlags_Borders", 1},
+                {"ImGuiChildFlags_AlwaysUseWindowPadding", 2},
+                {"ImGuiChildFlags_ResizeX", 4},
+                {"ImGuiChildFlags_ResizeY", 8},
+                {"ImGuiChildFlags_AutoResizeX", 16},
+                {"ImGuiChildFlags_AutoResizeY", 32},
+                {"ImGuiChildFlags_AlwaysAutoResize", 64},
+                {"ImGuiChildFlags_FrameStyle", 128},
+                {"ImGuiChildFlags_NavFlattened", 256},
+                {"ImGuiChildFlags_Border", 1},
+            };
+            n = (int)(sizeof(d)/sizeof(d[0])); return d;
+        }
+
+        inline const FlagDef* FlagTable_ItemFlags(int& n)
+        {
+            static const FlagDef d[] = {
+                {"ImGuiItemFlags_None", 0},
+                {"ImGuiItemFlags_NoTabStop", 1},
+                {"ImGuiItemFlags_NoNav", 2},
+                {"ImGuiItemFlags_NoNavDefaultFocus", 4},
+                {"ImGuiItemFlags_ButtonRepeat", 8},
+                {"ImGuiItemFlags_AutoClosePopups", 16},
+                {"ImGuiItemFlags_AllowDuplicateId", 32},
+            };
+            n = (int)(sizeof(d)/sizeof(d[0])); return d;
+        }
+
+        inline const FlagDef* FlagTable_InputTextFlags(int& n)
+        {
+            static const FlagDef d[] = {
+                {"ImGuiInputTextFlags_None", 0},
+                {"ImGuiInputTextFlags_CharsDecimal", 1},
+                {"ImGuiInputTextFlags_CharsHexadecimal", 2},
+                {"ImGuiInputTextFlags_CharsScientific", 4},
+                {"ImGuiInputTextFlags_CharsUppercase", 8},
+                {"ImGuiInputTextFlags_CharsNoBlank", 16},
+                {"ImGuiInputTextFlags_AllowTabInput", 32},
+                {"ImGuiInputTextFlags_EnterReturnsTrue", 64},
+                {"ImGuiInputTextFlags_EscapeClearsAll", 128},
+                {"ImGuiInputTextFlags_CtrlEnterForNewLine", 256},
+                {"ImGuiInputTextFlags_ReadOnly", 512},
+                {"ImGuiInputTextFlags_Password", 1024},
+                {"ImGuiInputTextFlags_AlwaysOverwrite", 2048},
+                {"ImGuiInputTextFlags_AutoSelectAll", 4096},
+                {"ImGuiInputTextFlags_ParseEmptyRefVal", 8192},
+                {"ImGuiInputTextFlags_DisplayEmptyRefVal", 16384},
+                {"ImGuiInputTextFlags_NoHorizontalScroll", 32768},
+                {"ImGuiInputTextFlags_NoUndoRedo", 65536},
+                {"ImGuiInputTextFlags_CallbackCompletion", 131072},
+                {"ImGuiInputTextFlags_CallbackHistory", 262144},
+                {"ImGuiInputTextFlags_CallbackAlways", 524288},
+                {"ImGuiInputTextFlags_CallbackCharFilter", 1048576},
+                {"ImGuiInputTextFlags_CallbackResize", 2097152},
+                {"ImGuiInputTextFlags_CallbackEdit", 4194304},
+            };
+            n = (int)(sizeof(d)/sizeof(d[0])); return d;
+        }
+
+        inline const FlagDef* FlagTable_TreeNodeFlags(int& n)
+        {
+            static const FlagDef d[] = {
+                {"ImGuiTreeNodeFlags_None", 0},
+                {"ImGuiTreeNodeFlags_Selected", 1},
+                {"ImGuiTreeNodeFlags_Framed", 2},
+                {"ImGuiTreeNodeFlags_AllowOverlap", 4},
+                {"ImGuiTreeNodeFlags_NoTreePushOnOpen", 8},
+                {"ImGuiTreeNodeFlags_NoAutoOpenOnLog", 16},
+                {"ImGuiTreeNodeFlags_DefaultOpen", 32},
+                {"ImGuiTreeNodeFlags_OpenOnDoubleClick", 64},
+                {"ImGuiTreeNodeFlags_OpenOnArrow", 128},
+                {"ImGuiTreeNodeFlags_Leaf", 256},
+                {"ImGuiTreeNodeFlags_Bullet", 512},
+                {"ImGuiTreeNodeFlags_FramePadding", 1024},
+                {"ImGuiTreeNodeFlags_SpanAvailWidth", 2048},
+                {"ImGuiTreeNodeFlags_SpanFullWidth", 4096},
+                {"ImGuiTreeNodeFlags_SpanTextWidth", 8192},
+                {"ImGuiTreeNodeFlags_SpanAllColumns", 16384},
+                {"ImGuiTreeNodeFlags_NavLeftJumpsBackHere", 32768},
+                {"ImGuiTreeNodeFlags_CollapsingHeader", 26},
+                {"ImGuiTreeNodeFlags_AllowItemOverlap", 4},
+            };
+            n = (int)(sizeof(d)/sizeof(d[0])); return d;
+        }
+
+        inline const FlagDef* FlagTable_PopupFlags(int& n)
+        {
+            static const FlagDef d[] = {
+                {"ImGuiPopupFlags_None", 0},
+                {"ImGuiPopupFlags_MouseButtonLeft", 0},
+                {"ImGuiPopupFlags_MouseButtonRight", 1},
+                {"ImGuiPopupFlags_MouseButtonMiddle", 2},
+                {"ImGuiPopupFlags_MouseButtonMask_", 31},
+                {"ImGuiPopupFlags_MouseButtonDefault_", 1},
+                {"ImGuiPopupFlags_NoReopen", 32},
+                {"ImGuiPopupFlags_NoOpenOverExistingPopup", 128},
+                {"ImGuiPopupFlags_NoOpenOverItems", 256},
+                {"ImGuiPopupFlags_AnyPopupId", 1024},
+                {"ImGuiPopupFlags_AnyPopupLevel", 2048},
+                {"ImGuiPopupFlags_AnyPopup", 3072},
+            };
+            n = (int)(sizeof(d)/sizeof(d[0])); return d;
+        }
+
+        inline const FlagDef* FlagTable_SelectableFlags(int& n)
+        {
+            static const FlagDef d[] = {
+                {"ImGuiSelectableFlags_None", 0},
+                {"ImGuiSelectableFlags_NoAutoClosePopups", 1},
+                {"ImGuiSelectableFlags_SpanAllColumns", 2},
+                {"ImGuiSelectableFlags_AllowDoubleClick", 4},
+                {"ImGuiSelectableFlags_Disabled", 8},
+                {"ImGuiSelectableFlags_AllowOverlap", 16},
+                {"ImGuiSelectableFlags_Highlight", 32},
+                {"ImGuiSelectableFlags_DontClosePopups", 1},
+                {"ImGuiSelectableFlags_AllowItemOverlap", 16},
+            };
+            n = (int)(sizeof(d)/sizeof(d[0])); return d;
+        }
+
+        inline const FlagDef* FlagTable_ComboFlags(int& n)
+        {
+            static const FlagDef d[] = {
+                {"ImGuiComboFlags_None", 0},
+                {"ImGuiComboFlags_PopupAlignLeft", 1},
+                {"ImGuiComboFlags_HeightSmall", 2},
+                {"ImGuiComboFlags_HeightRegular", 4},
+                {"ImGuiComboFlags_HeightLarge", 8},
+                {"ImGuiComboFlags_HeightLargest", 16},
+                {"ImGuiComboFlags_NoArrowButton", 32},
+                {"ImGuiComboFlags_NoPreview", 64},
+                {"ImGuiComboFlags_WidthFitPreview", 128},
+                {"ImGuiComboFlags_HeightMask_", 30},
+            };
+            n = (int)(sizeof(d)/sizeof(d[0])); return d;
+        }
+
+        inline const FlagDef* FlagTable_TabBarFlags(int& n)
+        {
+            static const FlagDef d[] = {
+                {"ImGuiTabBarFlags_None", 0},
+                {"ImGuiTabBarFlags_Reorderable", 1},
+                {"ImGuiTabBarFlags_AutoSelectNewTabs", 2},
+                {"ImGuiTabBarFlags_TabListPopupButton", 4},
+                {"ImGuiTabBarFlags_NoCloseWithMiddleMouseButton", 8},
+                {"ImGuiTabBarFlags_NoTabListScrollingButtons", 16},
+                {"ImGuiTabBarFlags_NoTooltip", 32},
+                {"ImGuiTabBarFlags_DrawSelectedOverline", 64},
+                {"ImGuiTabBarFlags_FittingPolicyResizeDown", 128},
+                {"ImGuiTabBarFlags_FittingPolicyScroll", 256},
+                {"ImGuiTabBarFlags_FittingPolicyMask_", 384},
+                {"ImGuiTabBarFlags_FittingPolicyDefault_", 128},
+            };
+            n = (int)(sizeof(d)/sizeof(d[0])); return d;
+        }
+
+        inline const FlagDef* FlagTable_TabItemFlags(int& n)
+        {
+            static const FlagDef d[] = {
+                {"ImGuiTabItemFlags_None", 0},
+                {"ImGuiTabItemFlags_UnsavedDocument", 1},
+                {"ImGuiTabItemFlags_SetSelected", 2},
+                {"ImGuiTabItemFlags_NoCloseWithMiddleMouseButton", 4},
+                {"ImGuiTabItemFlags_NoPushId", 8},
+                {"ImGuiTabItemFlags_NoTooltip", 16},
+                {"ImGuiTabItemFlags_NoReorder", 32},
+                {"ImGuiTabItemFlags_Leading", 64},
+                {"ImGuiTabItemFlags_Trailing", 128},
+                {"ImGuiTabItemFlags_NoAssumedClosure", 256},
+            };
+            n = (int)(sizeof(d)/sizeof(d[0])); return d;
+        }
+
+        inline const FlagDef* FlagTable_FocusedFlags(int& n)
+        {
+            static const FlagDef d[] = {
+                {"ImGuiFocusedFlags_None", 0},
+                {"ImGuiFocusedFlags_ChildWindows", 1},
+                {"ImGuiFocusedFlags_RootWindow", 2},
+                {"ImGuiFocusedFlags_AnyWindow", 4},
+                {"ImGuiFocusedFlags_NoPopupHierarchy", 8},
+                {"ImGuiFocusedFlags_RootAndChildWindows", 3},
+            };
+            n = (int)(sizeof(d)/sizeof(d[0])); return d;
+        }
+
+        inline const FlagDef* FlagTable_HoveredFlags(int& n)
+        {
+            static const FlagDef d[] = {
+                {"ImGuiHoveredFlags_None", 0},
+                {"ImGuiHoveredFlags_ChildWindows", 1},
+                {"ImGuiHoveredFlags_RootWindow", 2},
+                {"ImGuiHoveredFlags_AnyWindow", 4},
+                {"ImGuiHoveredFlags_NoPopupHierarchy", 8},
+                {"ImGuiHoveredFlags_AllowWhenBlockedByPopup", 32},
+                {"ImGuiHoveredFlags_AllowWhenBlockedByActiveItem", 128},
+                {"ImGuiHoveredFlags_AllowWhenOverlappedByItem", 256},
+                {"ImGuiHoveredFlags_AllowWhenOverlappedByWindow", 512},
+                {"ImGuiHoveredFlags_AllowWhenDisabled", 1024},
+                {"ImGuiHoveredFlags_NoNavOverride", 2048},
+                {"ImGuiHoveredFlags_AllowWhenOverlapped", 768},
+                {"ImGuiHoveredFlags_RectOnly", 928},
+                {"ImGuiHoveredFlags_RootAndChildWindows", 3},
+                {"ImGuiHoveredFlags_ForTooltip", 4096},
+                {"ImGuiHoveredFlags_Stationary", 8192},
+                {"ImGuiHoveredFlags_DelayNone", 16384},
+                {"ImGuiHoveredFlags_DelayShort", 32768},
+                {"ImGuiHoveredFlags_DelayNormal", 65536},
+                {"ImGuiHoveredFlags_NoSharedDelay", 131072},
+            };
+            n = (int)(sizeof(d)/sizeof(d[0])); return d;
+        }
+
+        inline const FlagDef* FlagTable_DragDropFlags(int& n)
+        {
+            static const FlagDef d[] = {
+                {"ImGuiDragDropFlags_None", 0},
+                {"ImGuiDragDropFlags_SourceNoPreviewTooltip", 1},
+                {"ImGuiDragDropFlags_SourceNoDisableHover", 2},
+                {"ImGuiDragDropFlags_SourceNoHoldToOpenOthers", 4},
+                {"ImGuiDragDropFlags_SourceAllowNullID", 8},
+                {"ImGuiDragDropFlags_SourceExtern", 16},
+                {"ImGuiDragDropFlags_PayloadAutoExpire", 32},
+                {"ImGuiDragDropFlags_PayloadNoCrossContext", 64},
+                {"ImGuiDragDropFlags_PayloadNoCrossProcess", 128},
+                {"ImGuiDragDropFlags_AcceptBeforeDelivery", 1024},
+                {"ImGuiDragDropFlags_AcceptNoDrawDefaultRect", 2048},
+                {"ImGuiDragDropFlags_AcceptNoPreviewTooltip", 4096},
+                {"ImGuiDragDropFlags_AcceptPeekOnly", 3072},
+                {"ImGuiDragDropFlags_SourceAutoExpirePayload", 32},
+            };
+            n = (int)(sizeof(d)/sizeof(d[0])); return d;
+        }
+
+        inline const FlagDef* FlagTable_DataType(int& n)
+        {
+            static const FlagDef d[] = {
+                {"ImGuiDataType_S8", 0},
+                {"ImGuiDataType_U8", 1},
+                {"ImGuiDataType_S16", 2},
+                {"ImGuiDataType_U16", 3},
+                {"ImGuiDataType_S32", 4},
+                {"ImGuiDataType_U32", 5},
+                {"ImGuiDataType_S64", 6},
+                {"ImGuiDataType_U64", 7},
+                {"ImGuiDataType_Float", 8},
+                {"ImGuiDataType_Double", 9},
+                {"ImGuiDataType_Bool", 10},
+            };
+            n = (int)(sizeof(d)/sizeof(d[0])); return d;
+        }
+
+        inline const FlagDef* FlagTable_Dir(int& n)
+        {
+            static const FlagDef d[] = {
+                {"ImGuiDir_None", -1},
+                {"ImGuiDir_Left", 0},
+                {"ImGuiDir_Right", 1},
+                {"ImGuiDir_Up", 2},
+                {"ImGuiDir_Down", 3},
+            };
+            n = (int)(sizeof(d)/sizeof(d[0])); return d;
+        }
+
+        inline const FlagDef* FlagTable_SortDirection(int& n)
+        {
+            static const FlagDef d[] = {
+                {"ImGuiSortDirection_None", 0},
+                {"ImGuiSortDirection_Ascending", 1},
+                {"ImGuiSortDirection_Descending", 2},
+            };
+            n = (int)(sizeof(d)/sizeof(d[0])); return d;
+        }
+
+        inline const FlagDef* FlagTable_Key(int& n)
+        {
+            static const FlagDef d[] = {
+                {"ImGuiKey_None", 0},
+                {"ImGuiKey_NamedKey_BEGIN", 512},
+                {"ImGuiKey_Tab", 512},
+                {"ImGuiMod_None", 0},
+                {"ImGuiMod_Ctrl", 4096},
+                {"ImGuiMod_Shift", 8192},
+                {"ImGuiMod_Alt", 16384},
+                {"ImGuiMod_Super", 32768},
+                {"ImGuiMod_Mask_", 61440},
+                {"ImGuiKey_NamedKey_COUNT", -512},
+                {"ImGuiKey_COUNT", 0},
+                {"ImGuiMod_Shortcut", 4096},
+                {"ImGuiKey_ModCtrl", 4096},
+                {"ImGuiKey_ModShift", 8192},
+                {"ImGuiKey_ModAlt", 16384},
+                {"ImGuiKey_ModSuper", 32768},
+                {"ImGuiKey_LeftArrow", 513},
+                {"ImGuiKey_RightArrow", 514},
+                {"ImGuiKey_UpArrow", 515},
+                {"ImGuiKey_DownArrow", 516},
+                {"ImGuiKey_PageUp", 517},
+                {"ImGuiKey_PageDown", 518},
+                {"ImGuiKey_Home", 519},
+                {"ImGuiKey_End", 520},
+                {"ImGuiKey_Insert", 521},
+                {"ImGuiKey_Delete", 522},
+                {"ImGuiKey_Backspace", 523},
+                {"ImGuiKey_Space", 524},
+                {"ImGuiKey_Enter", 525},
+                {"ImGuiKey_Escape", 526},
+                {"ImGuiKey_LeftCtrl", 527},
+                {"ImGuiKey_RightCtrl", 528},
+                {"ImGuiKey_Menu", 529},
+                {"ImGuiKey_0", 530},
+                {"ImGuiKey_A", 531},
+                {"ImGuiKey_K", 532},
+                {"ImGuiKey_U", 533},
+                {"ImGuiKey_F1", 534},
+                {"ImGuiKey_F7", 535},
+                {"ImGuiKey_F13", 536},
+                {"ImGuiKey_F19", 537},
+                {"ImGuiKey_Apostrophe", 538},
+                {"ImGuiKey_Comma", 539},
+                {"ImGuiKey_Minus", 540},
+                {"ImGuiKey_Period", 541},
+                {"ImGuiKey_Slash", 542},
+                {"ImGuiKey_Semicolon", 543},
+                {"ImGuiKey_Equal", 544},
+                {"ImGuiKey_LeftBracket", 545},
+                {"ImGuiKey_Backslash", 546},
+                {"ImGuiKey_RightBracket", 547},
+                {"ImGuiKey_GraveAccent", 548},
+                {"ImGuiKey_CapsLock", 549},
+                {"ImGuiKey_ScrollLock", 550},
+                {"ImGuiKey_NumLock", 551},
+                {"ImGuiKey_PrintScreen", 552},
+                {"ImGuiKey_Pause", 553},
+                {"ImGuiKey_Keypad0", 554},
+                {"ImGuiKey_Keypad5", 555},
+                {"ImGuiKey_KeypadDecimal", 556},
+                {"ImGuiKey_KeypadDivide", 557},
+                {"ImGuiKey_KeypadMultiply", 558},
+                {"ImGuiKey_KeypadSubtract", 559},
+                {"ImGuiKey_KeypadAdd", 560},
+                {"ImGuiKey_KeypadEnter", 561},
+                {"ImGuiKey_KeypadEqual", 562},
+                {"ImGuiKey_AppBack", 563},
+                {"ImGuiKey_AppForward", 564},
+                {"ImGuiKey_GamepadStart", 565},
+                {"ImGuiKey_GamepadBack", 566},
+                {"ImGuiKey_GamepadFaceLeft", 567},
+                {"ImGuiKey_GamepadFaceRight", 568},
+                {"ImGuiKey_GamepadFaceUp", 569},
+                {"ImGuiKey_GamepadFaceDown", 570},
+                {"ImGuiKey_GamepadDpadLeft", 571},
+                {"ImGuiKey_GamepadDpadRight", 572},
+                {"ImGuiKey_GamepadDpadUp", 573},
+                {"ImGuiKey_GamepadDpadDown", 574},
+                {"ImGuiKey_GamepadL1", 575},
+                {"ImGuiKey_GamepadR1", 576},
+                {"ImGuiKey_GamepadL2", 577},
+                {"ImGuiKey_GamepadR2", 578},
+                {"ImGuiKey_GamepadL3", 579},
+                {"ImGuiKey_GamepadR3", 580},
+                {"ImGuiKey_GamepadLStickLeft", 581},
+                {"ImGuiKey_GamepadLStickRight", 582},
+                {"ImGuiKey_GamepadLStickUp", 583},
+                {"ImGuiKey_GamepadLStickDown", 584},
+                {"ImGuiKey_GamepadRStickLeft", 585},
+                {"ImGuiKey_GamepadRStickRight", 586},
+                {"ImGuiKey_GamepadRStickUp", 587},
+                {"ImGuiKey_GamepadRStickDown", 588},
+                {"ImGuiKey_MouseLeft", 589},
+                {"ImGuiKey_ReservedForModCtrl", 590},
+                {"ImGuiKey_NamedKey_END", 591},
+            };
+            n = (int)(sizeof(d)/sizeof(d[0])); return d;
+        }
+
+        inline const FlagDef* FlagTable_InputFlags(int& n)
+        {
+            static const FlagDef d[] = {
+                {"ImGuiInputFlags_None", 0},
+                {"ImGuiInputFlags_Repeat", 1},
+                {"ImGuiInputFlags_RouteActive", 1024},
+                {"ImGuiInputFlags_RouteFocused", 2048},
+                {"ImGuiInputFlags_RouteGlobal", 4096},
+                {"ImGuiInputFlags_RouteAlways", 8192},
+                {"ImGuiInputFlags_RouteOverFocused", 16384},
+                {"ImGuiInputFlags_RouteOverActive", 32768},
+                {"ImGuiInputFlags_RouteUnlessBgFocused", 65536},
+                {"ImGuiInputFlags_RouteFromRootWindow", 131072},
+                {"ImGuiInputFlags_Tooltip", 262144},
+            };
+            n = (int)(sizeof(d)/sizeof(d[0])); return d;
+        }
+
+        inline const FlagDef* FlagTable_ConfigFlags(int& n)
+        {
+            static const FlagDef d[] = {
+                {"ImGuiConfigFlags_None", 0},
+                {"ImGuiConfigFlags_NavEnableKeyboard", 1},
+                {"ImGuiConfigFlags_NavEnableGamepad", 2},
+                {"ImGuiConfigFlags_NoMouse", 16},
+                {"ImGuiConfigFlags_NoMouseCursorChange", 32},
+                {"ImGuiConfigFlags_NoKeyboard", 64},
+                {"ImGuiConfigFlags_IsSRGB", 1048576},
+                {"ImGuiConfigFlags_IsTouchScreen", 2097152},
+                {"ImGuiConfigFlags_NavEnableSetMousePos", 4},
+                {"ImGuiConfigFlags_NavNoCaptureKeyboard", 8},
+            };
+            n = (int)(sizeof(d)/sizeof(d[0])); return d;
+        }
+
+        inline const FlagDef* FlagTable_BackendFlags(int& n)
+        {
+            static const FlagDef d[] = {
+                {"ImGuiBackendFlags_None", 0},
+                {"ImGuiBackendFlags_HasGamepad", 1},
+                {"ImGuiBackendFlags_HasMouseCursors", 2},
+                {"ImGuiBackendFlags_HasSetMousePos", 4},
+                {"ImGuiBackendFlags_RendererHasVtxOffset", 8},
+            };
+            n = (int)(sizeof(d)/sizeof(d[0])); return d;
+        }
+
+        inline const FlagDef* FlagTable_Col(int& n)
+        {
+            static const FlagDef d[] = {
+                {"ImGuiCol_TabActive", 0},
+                {"ImGuiCol_TabUnfocused", 0},
+                {"ImGuiCol_TabUnfocusedActive", 0},
+                {"ImGuiCol_NavHighlight", 0},
+                {"ImGuiCol_Text", 0},
+                {"ImGuiCol_TextDisabled", 1},
+                {"ImGuiCol_WindowBg", 2},
+                {"ImGuiCol_ChildBg", 3},
+                {"ImGuiCol_PopupBg", 4},
+                {"ImGuiCol_Border", 5},
+                {"ImGuiCol_BorderShadow", 6},
+                {"ImGuiCol_FrameBg", 7},
+                {"ImGuiCol_FrameBgHovered", 8},
+                {"ImGuiCol_FrameBgActive", 9},
+                {"ImGuiCol_TitleBg", 10},
+                {"ImGuiCol_TitleBgActive", 11},
+                {"ImGuiCol_TitleBgCollapsed", 12},
+                {"ImGuiCol_MenuBarBg", 13},
+                {"ImGuiCol_ScrollbarBg", 14},
+                {"ImGuiCol_ScrollbarGrab", 15},
+                {"ImGuiCol_ScrollbarGrabHovered", 16},
+                {"ImGuiCol_ScrollbarGrabActive", 17},
+                {"ImGuiCol_CheckMark", 18},
+                {"ImGuiCol_SliderGrab", 19},
+                {"ImGuiCol_SliderGrabActive", 20},
+                {"ImGuiCol_Button", 21},
+                {"ImGuiCol_ButtonHovered", 22},
+                {"ImGuiCol_ButtonActive", 23},
+                {"ImGuiCol_Header", 24},
+                {"ImGuiCol_HeaderHovered", 25},
+                {"ImGuiCol_HeaderActive", 26},
+                {"ImGuiCol_Separator", 27},
+                {"ImGuiCol_SeparatorHovered", 28},
+                {"ImGuiCol_SeparatorActive", 29},
+                {"ImGuiCol_ResizeGrip", 30},
+                {"ImGuiCol_ResizeGripHovered", 31},
+                {"ImGuiCol_ResizeGripActive", 32},
+                {"ImGuiCol_TabHovered", 33},
+                {"ImGuiCol_Tab", 34},
+                {"ImGuiCol_TabSelected", 35},
+                {"ImGuiCol_TabSelectedOverline", 36},
+                {"ImGuiCol_TabDimmed", 37},
+                {"ImGuiCol_TabDimmedSelected", 38},
+                {"ImGuiCol_TabDimmedSelectedOverline", 39},
+                {"ImGuiCol_PlotLines", 40},
+                {"ImGuiCol_PlotLinesHovered", 41},
+                {"ImGuiCol_PlotHistogram", 42},
+                {"ImGuiCol_PlotHistogramHovered", 43},
+                {"ImGuiCol_TableHeaderBg", 44},
+                {"ImGuiCol_TableBorderStrong", 45},
+                {"ImGuiCol_TableBorderLight", 46},
+                {"ImGuiCol_TableRowBg", 47},
+                {"ImGuiCol_TableRowBgAlt", 48},
+                {"ImGuiCol_TextLink", 49},
+                {"ImGuiCol_TextSelectedBg", 50},
+                {"ImGuiCol_DragDropTarget", 51},
+                {"ImGuiCol_NavCursor", 52},
+                {"ImGuiCol_NavWindowingHighlight", 53},
+                {"ImGuiCol_NavWindowingDimBg", 54},
+                {"ImGuiCol_ModalWindowDimBg", 55},
+                {"ImGuiCol_COUNT", 56},
+            };
+            n = (int)(sizeof(d)/sizeof(d[0])); return d;
+        }
+
+        inline const FlagDef* FlagTable_StyleVar(int& n)
+        {
+            static const FlagDef d[] = {
+                {"ImGuiStyleVar_Alpha", 0},
+                {"ImGuiStyleVar_DisabledAlpha", 1},
+                {"ImGuiStyleVar_WindowPadding", 2},
+                {"ImGuiStyleVar_WindowRounding", 3},
+                {"ImGuiStyleVar_WindowBorderSize", 4},
+                {"ImGuiStyleVar_WindowMinSize", 5},
+                {"ImGuiStyleVar_WindowTitleAlign", 6},
+                {"ImGuiStyleVar_ChildRounding", 7},
+                {"ImGuiStyleVar_ChildBorderSize", 8},
+                {"ImGuiStyleVar_PopupRounding", 9},
+                {"ImGuiStyleVar_PopupBorderSize", 10},
+                {"ImGuiStyleVar_FramePadding", 11},
+                {"ImGuiStyleVar_FrameRounding", 12},
+                {"ImGuiStyleVar_FrameBorderSize", 13},
+                {"ImGuiStyleVar_ItemSpacing", 14},
+                {"ImGuiStyleVar_ItemInnerSpacing", 15},
+                {"ImGuiStyleVar_IndentSpacing", 16},
+                {"ImGuiStyleVar_CellPadding", 17},
+                {"ImGuiStyleVar_ScrollbarSize", 18},
+                {"ImGuiStyleVar_ScrollbarRounding", 19},
+                {"ImGuiStyleVar_GrabMinSize", 20},
+                {"ImGuiStyleVar_GrabRounding", 21},
+                {"ImGuiStyleVar_TabRounding", 22},
+                {"ImGuiStyleVar_TabBorderSize", 23},
+                {"ImGuiStyleVar_TabBarBorderSize", 24},
+                {"ImGuiStyleVar_TabBarOverlineSize", 25},
+                {"ImGuiStyleVar_TableAngledHeadersAngle", 26},
+                {"ImGuiStyleVar_TableAngledHeadersTextAlign", 27},
+                {"ImGuiStyleVar_ButtonTextAlign", 28},
+                {"ImGuiStyleVar_SelectableTextAlign", 29},
+                {"ImGuiStyleVar_SeparatorTextBorderSize", 30},
+                {"ImGuiStyleVar_SeparatorTextAlign", 31},
+                {"ImGuiStyleVar_SeparatorTextPadding", 32},
+            };
+            n = (int)(sizeof(d)/sizeof(d[0])); return d;
+        }
+
+        inline const FlagDef* FlagTable_ButtonFlags(int& n)
+        {
+            static const FlagDef d[] = {
+                {"ImGuiButtonFlags_None", 0},
+                {"ImGuiButtonFlags_MouseButtonLeft", 1},
+                {"ImGuiButtonFlags_MouseButtonRight", 2},
+                {"ImGuiButtonFlags_MouseButtonMiddle", 4},
+                {"ImGuiButtonFlags_MouseButtonMask_", 7},
+                {"ImGuiButtonFlags_EnableNav", 8},
+            };
+            n = (int)(sizeof(d)/sizeof(d[0])); return d;
+        }
+
+        inline const FlagDef* FlagTable_ColorEditFlags(int& n)
+        {
+            static const FlagDef d[] = {
+                {"ImGuiColorEditFlags_None", 0},
+                {"ImGuiColorEditFlags_NoAlpha", 2},
+                {"ImGuiColorEditFlags_NoPicker", 4},
+                {"ImGuiColorEditFlags_NoOptions", 8},
+                {"ImGuiColorEditFlags_NoSmallPreview", 16},
+                {"ImGuiColorEditFlags_NoInputs", 32},
+                {"ImGuiColorEditFlags_NoTooltip", 64},
+                {"ImGuiColorEditFlags_NoLabel", 128},
+                {"ImGuiColorEditFlags_NoSidePreview", 256},
+                {"ImGuiColorEditFlags_NoDragDrop", 512},
+                {"ImGuiColorEditFlags_NoBorder", 1024},
+                {"ImGuiColorEditFlags_AlphaBar", 65536},
+                {"ImGuiColorEditFlags_AlphaPreview", 131072},
+                {"ImGuiColorEditFlags_AlphaPreviewHalf", 262144},
+                {"ImGuiColorEditFlags_HDR", 524288},
+                {"ImGuiColorEditFlags_DisplayRGB", 1048576},
+                {"ImGuiColorEditFlags_DisplayHSV", 2097152},
+                {"ImGuiColorEditFlags_DisplayHex", 4194304},
+                {"ImGuiColorEditFlags_Uint8", 8388608},
+                {"ImGuiColorEditFlags_Float", 16777216},
+                {"ImGuiColorEditFlags_PickerHueBar", 33554432},
+                {"ImGuiColorEditFlags_PickerHueWheel", 67108864},
+                {"ImGuiColorEditFlags_InputRGB", 134217728},
+                {"ImGuiColorEditFlags_InputHSV", 268435456},
+                {"ImGuiColorEditFlags_DefaultOptions_", 177209344},
+                {"ImGuiColorEditFlags_DisplayMask_", 7340032},
+                {"ImGuiColorEditFlags_DataTypeMask_", 25165824},
+                {"ImGuiColorEditFlags_PickerMask_", 100663296},
+                {"ImGuiColorEditFlags_InputMask_", 402653184},
+            };
+            n = (int)(sizeof(d)/sizeof(d[0])); return d;
+        }
+
+        inline const FlagDef* FlagTable_SliderFlags(int& n)
+        {
+            static const FlagDef d[] = {
+                {"ImGuiSliderFlags_None", 0},
+                {"ImGuiSliderFlags_Logarithmic", 32},
+                {"ImGuiSliderFlags_NoRoundToFormat", 64},
+                {"ImGuiSliderFlags_NoInput", 128},
+                {"ImGuiSliderFlags_WrapAround", 256},
+                {"ImGuiSliderFlags_ClampOnInput", 512},
+                {"ImGuiSliderFlags_ClampZeroRange", 1024},
+                {"ImGuiSliderFlags_AlwaysClamp", 1536},
+                {"ImGuiSliderFlags_InvalidMask_", 1879048207},
+            };
+            n = (int)(sizeof(d)/sizeof(d[0])); return d;
+        }
+
+        inline const FlagDef* FlagTable_MouseButton(int& n)
+        {
+            static const FlagDef d[] = {
+                {"ImGuiMouseButton_Left", 0},
+                {"ImGuiMouseButton_Right", 1},
+                {"ImGuiMouseButton_Middle", 2},
+                {"ImGuiMouseButton_COUNT", 5},
+            };
+            n = (int)(sizeof(d)/sizeof(d[0])); return d;
+        }
+
+        inline const FlagDef* FlagTable_MouseCursor(int& n)
+        {
+            static const FlagDef d[] = {
+                {"ImGuiMouseCursor_None", -1},
+                {"ImGuiMouseCursor_Arrow", 0},
+                {"ImGuiMouseCursor_TextInput", 1},
+                {"ImGuiMouseCursor_ResizeAll", 2},
+                {"ImGuiMouseCursor_ResizeNS", 3},
+                {"ImGuiMouseCursor_ResizeEW", 4},
+                {"ImGuiMouseCursor_ResizeNESW", 5},
+                {"ImGuiMouseCursor_ResizeNWSE", 6},
+                {"ImGuiMouseCursor_Hand", 7},
+                {"ImGuiMouseCursor_NotAllowed", 8},
+            };
+            n = (int)(sizeof(d)/sizeof(d[0])); return d;
+        }
+
+        inline const FlagDef* FlagTable_MouseSource(int& n)
+        {
+            static const FlagDef d[] = {
+                {"ImGuiMouseSource_Mouse", 0},
+                {"ImGuiMouseSource_TouchScreen", 1},
+                {"ImGuiMouseSource_Pen", 2},
+            };
+            n = (int)(sizeof(d)/sizeof(d[0])); return d;
+        }
+
+        inline const FlagDef* FlagTable_Cond(int& n)
+        {
+            static const FlagDef d[] = {
+                {"ImGuiCond_None", 0},
+                {"ImGuiCond_Always", 1},
+                {"ImGuiCond_Once", 2},
+                {"ImGuiCond_FirstUseEver", 4},
+                {"ImGuiCond_Appearing", 8},
+            };
+            n = (int)(sizeof(d)/sizeof(d[0])); return d;
+        }
+
+        inline const FlagDef* FlagTable_TableFlags(int& n)
+        {
+            static const FlagDef d[] = {
+                {"ImGuiTableFlags_None", 0},
+                {"ImGuiTableFlags_Resizable", 1},
+                {"ImGuiTableFlags_Reorderable", 2},
+                {"ImGuiTableFlags_Hideable", 4},
+                {"ImGuiTableFlags_Sortable", 8},
+                {"ImGuiTableFlags_NoSavedSettings", 16},
+                {"ImGuiTableFlags_ContextMenuInBody", 32},
+                {"ImGuiTableFlags_RowBg", 64},
+                {"ImGuiTableFlags_BordersInnerH", 128},
+                {"ImGuiTableFlags_BordersOuterH", 256},
+                {"ImGuiTableFlags_BordersInnerV", 512},
+                {"ImGuiTableFlags_BordersOuterV", 1024},
+                {"ImGuiTableFlags_BordersH", 384},
+                {"ImGuiTableFlags_BordersV", 1536},
+                {"ImGuiTableFlags_BordersInner", 640},
+                {"ImGuiTableFlags_BordersOuter", 1280},
+                {"ImGuiTableFlags_Borders", 1920},
+                {"ImGuiTableFlags_NoBordersInBody", 2048},
+                {"ImGuiTableFlags_NoBordersInBodyUntilResize", 4096},
+                {"ImGuiTableFlags_SizingFixedFit", 8192},
+                {"ImGuiTableFlags_SizingFixedSame", 16384},
+                {"ImGuiTableFlags_SizingStretchProp", 24576},
+                {"ImGuiTableFlags_SizingStretchSame", 32768},
+                {"ImGuiTableFlags_NoHostExtendX", 65536},
+                {"ImGuiTableFlags_NoHostExtendY", 131072},
+                {"ImGuiTableFlags_NoKeepColumnsVisible", 262144},
+                {"ImGuiTableFlags_PreciseWidths", 524288},
+                {"ImGuiTableFlags_NoClip", 1048576},
+                {"ImGuiTableFlags_PadOuterX", 2097152},
+                {"ImGuiTableFlags_NoPadOuterX", 4194304},
+                {"ImGuiTableFlags_NoPadInnerX", 8388608},
+                {"ImGuiTableFlags_ScrollX", 16777216},
+                {"ImGuiTableFlags_ScrollY", 33554432},
+                {"ImGuiTableFlags_SortMulti", 67108864},
+                {"ImGuiTableFlags_SortTristate", 134217728},
+                {"ImGuiTableFlags_HighlightHoveredColumn", 268435456},
+                {"ImGuiTableFlags_SizingMask_", 57344},
+            };
+            n = (int)(sizeof(d)/sizeof(d[0])); return d;
+        }
+
+        inline const FlagDef* FlagTable_TableColumnFlags(int& n)
+        {
+            static const FlagDef d[] = {
+                {"ImGuiTableColumnFlags_None", 0},
+                {"ImGuiTableColumnFlags_Disabled", 1},
+                {"ImGuiTableColumnFlags_DefaultHide", 2},
+                {"ImGuiTableColumnFlags_DefaultSort", 4},
+                {"ImGuiTableColumnFlags_WidthStretch", 8},
+                {"ImGuiTableColumnFlags_WidthFixed", 16},
+                {"ImGuiTableColumnFlags_NoResize", 32},
+                {"ImGuiTableColumnFlags_NoReorder", 64},
+                {"ImGuiTableColumnFlags_NoHide", 128},
+                {"ImGuiTableColumnFlags_NoClip", 256},
+                {"ImGuiTableColumnFlags_NoSort", 512},
+                {"ImGuiTableColumnFlags_NoSortAscending", 1024},
+                {"ImGuiTableColumnFlags_NoSortDescending", 2048},
+                {"ImGuiTableColumnFlags_NoHeaderLabel", 4096},
+                {"ImGuiTableColumnFlags_NoHeaderWidth", 8192},
+                {"ImGuiTableColumnFlags_PreferSortAscending", 16384},
+                {"ImGuiTableColumnFlags_PreferSortDescending", 32768},
+                {"ImGuiTableColumnFlags_IndentEnable", 65536},
+                {"ImGuiTableColumnFlags_IndentDisable", 131072},
+                {"ImGuiTableColumnFlags_AngledHeader", 262144},
+                {"ImGuiTableColumnFlags_IsEnabled", 16777216},
+                {"ImGuiTableColumnFlags_IsVisible", 33554432},
+                {"ImGuiTableColumnFlags_IsSorted", 67108864},
+                {"ImGuiTableColumnFlags_IsHovered", 134217728},
+                {"ImGuiTableColumnFlags_WidthMask_", 24},
+                {"ImGuiTableColumnFlags_IndentMask_", 196608},
+                {"ImGuiTableColumnFlags_StatusMask_", 251658240},
+                {"ImGuiTableColumnFlags_NoDirectResize_", 1073741824},
+            };
+            n = (int)(sizeof(d)/sizeof(d[0])); return d;
+        }
+
+        inline const FlagDef* FlagTable_TableRowFlags(int& n)
+        {
+            static const FlagDef d[] = {
+                {"ImGuiTableRowFlags_None", 0},
+                {"ImGuiTableRowFlags_Headers", 1},
+            };
+            n = (int)(sizeof(d)/sizeof(d[0])); return d;
+        }
+
+        inline const FlagDef* FlagTable_TableBgTarget(int& n)
+        {
+            static const FlagDef d[] = {
+                {"ImGuiTableBgTarget_None", 0},
+                {"ImGuiTableBgTarget_RowBg0", 1},
+                {"ImGuiTableBgTarget_RowBg1", 2},
+                {"ImGuiTableBgTarget_CellBg", 3},
+            };
+            n = (int)(sizeof(d)/sizeof(d[0])); return d;
+        }
+
+        inline const FlagDef* FlagTable_MultiSelectFlags(int& n)
+        {
+            static const FlagDef d[] = {
+                {"ImGuiMultiSelectFlags_None", 0},
+                {"ImGuiMultiSelectFlags_SingleSelect", 1},
+                {"ImGuiMultiSelectFlags_NoSelectAll", 2},
+                {"ImGuiMultiSelectFlags_NoRangeSelect", 4},
+                {"ImGuiMultiSelectFlags_NoAutoSelect", 8},
+                {"ImGuiMultiSelectFlags_NoAutoClear", 16},
+                {"ImGuiMultiSelectFlags_NoAutoClearOnReselect", 32},
+                {"ImGuiMultiSelectFlags_BoxSelect1d", 64},
+                {"ImGuiMultiSelectFlags_BoxSelect2d", 128},
+                {"ImGuiMultiSelectFlags_BoxSelectNoScroll", 256},
+                {"ImGuiMultiSelectFlags_ClearOnEscape", 512},
+                {"ImGuiMultiSelectFlags_ClearOnClickVoid", 1024},
+                {"ImGuiMultiSelectFlags_ScopeWindow", 2048},
+                {"ImGuiMultiSelectFlags_ScopeRect", 4096},
+                {"ImGuiMultiSelectFlags_SelectOnClick", 8192},
+                {"ImGuiMultiSelectFlags_SelectOnClickRelease", 16384},
+                {"ImGuiMultiSelectFlags_NavWrapX", 65536},
+            };
+            n = (int)(sizeof(d)/sizeof(d[0])); return d;
+        }
+
+        inline const FlagDef* FlagTable_SelectionRequestType(int& n)
+        {
+            static const FlagDef d[] = {
+                {"ImGuiSelectionRequestType_None", 0},
+                {"ImGuiSelectionRequestType_SetAll", 1},
+                {"ImGuiSelectionRequestType_SetRange", 2},
+            };
+            n = (int)(sizeof(d)/sizeof(d[0])); return d;
+        }
+
+        inline const FlagDef* FlagTable_ViewportFlags(int& n)
+        {
+            static const FlagDef d[] = {
+                {"ImGuiViewportFlags_None", 0},
+                {"ImGuiViewportFlags_IsPlatformWindow", 1},
+                {"ImGuiViewportFlags_IsPlatformMonitor", 2},
+                {"ImGuiViewportFlags_OwnedByApp", 4},
+            };
+            n = (int)(sizeof(d)/sizeof(d[0])); return d;
+        }
+
+        inline const FlagDef* FlagTable_ModFlags(int& n)
+        {
+            static const FlagDef d[] = {
+                {"ImGuiModFlags_None", 0},
+                {"ImGuiModFlags_Ctrl", 0},
+                {"ImGuiModFlags_Shift", 0},
+                {"ImGuiModFlags_Alt", 0},
+                {"ImGuiModFlags_Super", 0},
+            };
+            n = (int)(sizeof(d)/sizeof(d[0])); return d;
+        }
+
+        inline const FlagDef* FlagTable_KeyModFlags(int& n)
+        {
+            static const FlagDef d[] = {
+                {"ImGuiKeyModFlags_None", 0},
+                {"ImGuiKeyModFlags_Ctrl", 0},
+                {"ImGuiKeyModFlags_Shift", 0},
+                {"ImGuiKeyModFlags_Alt", 0},
+                {"ImGuiKeyModFlags_Super", 0},
+            };
+            n = (int)(sizeof(d)/sizeof(d[0])); return d;
+        }
+
+        // Table of every table: (group title, resolver fn) for the reference browser
+        // and for import flag resolution.
+        struct FlagGroup { const char* title; const FlagDef* (*fn)(int&); };
+        inline int FlagGroupCount();
+        #define IMGUIED_FLAG_GROUP(title_, fn_) { title_, fn_ },
+
+        inline const FlagGroup* AllFlagGroups(int& n)
+        {
+            static const FlagGroup g[] = {
+                {"ImGuiWindowFlags_", FlagTable_WindowFlags},
+                {"ImGuiChildFlags_", FlagTable_ChildFlags},
+                {"ImGuiItemFlags_", FlagTable_ItemFlags},
+                {"ImGuiInputTextFlags_", FlagTable_InputTextFlags},
+                {"ImGuiTreeNodeFlags_", FlagTable_TreeNodeFlags},
+                {"ImGuiPopupFlags_", FlagTable_PopupFlags},
+                {"ImGuiSelectableFlags_", FlagTable_SelectableFlags},
+                {"ImGuiComboFlags_", FlagTable_ComboFlags},
+                {"ImGuiTabBarFlags_", FlagTable_TabBarFlags},
+                {"ImGuiTabItemFlags_", FlagTable_TabItemFlags},
+                {"ImGuiFocusedFlags_", FlagTable_FocusedFlags},
+                {"ImGuiHoveredFlags_", FlagTable_HoveredFlags},
+                {"ImGuiDragDropFlags_", FlagTable_DragDropFlags},
+                {"ImGuiDataType_", FlagTable_DataType},
+                {"ImGuiDir", FlagTable_Dir},
+                {"ImGuiSortDirection", FlagTable_SortDirection},
+                {"ImGuiKey", FlagTable_Key},
+                {"ImGuiInputFlags_", FlagTable_InputFlags},
+                {"ImGuiConfigFlags_", FlagTable_ConfigFlags},
+                {"ImGuiBackendFlags_", FlagTable_BackendFlags},
+                {"ImGuiCol_", FlagTable_Col},
+                {"ImGuiStyleVar_", FlagTable_StyleVar},
+                {"ImGuiButtonFlags_", FlagTable_ButtonFlags},
+                {"ImGuiColorEditFlags_", FlagTable_ColorEditFlags},
+                {"ImGuiSliderFlags_", FlagTable_SliderFlags},
+                {"ImGuiMouseButton_", FlagTable_MouseButton},
+                {"ImGuiMouseCursor_", FlagTable_MouseCursor},
+                {"ImGuiMouseSource", FlagTable_MouseSource},
+                {"ImGuiCond_", FlagTable_Cond},
+                {"ImGuiTableFlags_", FlagTable_TableFlags},
+                {"ImGuiTableColumnFlags_", FlagTable_TableColumnFlags},
+                {"ImGuiTableRowFlags_", FlagTable_TableRowFlags},
+                {"ImGuiTableBgTarget_", FlagTable_TableBgTarget},
+                {"ImGuiMultiSelectFlags_", FlagTable_MultiSelectFlags},
+                {"ImGuiSelectionRequestType", FlagTable_SelectionRequestType},
+                {"ImGuiViewportFlags_", FlagTable_ViewportFlags},
+                {"ImGuiModFlags_", FlagTable_ModFlags},
+                {"ImGuiKeyModFlags_", FlagTable_KeyModFlags},
+            };
+            n = (int)(sizeof(g)/sizeof(g[0])); return g;
+        }
+
+        // Resolve a fully-qualified ImGui flag/enum name (e.g. "ImGuiWindowFlags_NoResize")
+        // to its value. Returns false if unknown.
+        inline bool ImGuiEdResolveName(const char* q, int& out_val)
+        {
+            int n = 0;
+            const FlagGroup* gs = AllFlagGroups(n);
+            for (int gi = 0; gi < n; gi++)
+            {
+                int m = 0;
+                const FlagDef* d = gs[gi].fn(m);
+                for (int i = 0; i < m; i++)
+                    if (strcmp(d[i].name, q) == 0) { out_val = d[i].value; return true; }
+            }
+            return false;
+        }
+
+
+        IMGUIED_EOF
+
+        mkdir -p "$(dirname 'app/src/main/cpp/editor_import.cpp')"
+        cat > 'app/src/main/cpp/editor_import.cpp' <<'IMGUIED_EOF'
+        // editor_import.cpp - Project importer: scans an imported folder (copied to
+        // cacheDir/import by MainActivity via SAF), parses C/C++/header files, and
+        // rebuilds an editor document from the REAL ImGui calls it finds.
+        //
+        // Structure/nesting: ImGui::Begin/BeginChild/BeginTabBar/BeginTabItem/
+        // BeginMenu/BeginCollapsingHeader/BeginTable + matching End* form a stack,
+        // so nested layouts inside one window become a proper node tree.
+        //
+        // Every flag argument (e.g. ImGuiWindowFlags_NoResize|ImGuiWindowFlags_MenuBar)
+        // is resolved BY NAME via editor_flags.h (all 589 enum entries), so imported
+        // flags round-trip exactly.
+        //
+        // Non-ImGui report: any .cpp/.h/.cc file is scanned; calls that are NOT ImGui
+        // API are ignored, and lines that use other well-known libraries are logged
+        // (file:line: the call) in the "not related to imgui" report, shown in the
+        // in-app console AND exported to Downloads.
+        #pragma once
+        #include "editor_nodes.h"
+        #include "editor_flags.h"
+        #include <dirent.h>
+        #include <sys/stat.h>
+        #include <algorithm>
+        #include <vector>
+        #include <string>
+
+        // ---------------------------------------------------------------------------
+        // Import state + report
+        // ---------------------------------------------------------------------------
+        struct ImportReport
+        {
+            int                  files_scanned = 0;
+            int                  files_with_imgui = 0;
+            int                  nodes_imported = 0;
+            int                  calls_unresolved = 0;
+            std::vector<std::string> lines;      // report lines (console + export)
+            std::vector<std::string> non_imgui; // "file:line: [lib] code" entries
+            Node*                imported_root = nullptr;
+        };
+
+        static ImportReport g_import;
+
+        // ---------------------------------------------------------------------------
+        // Small helpers
+        // ---------------------------------------------------------------------------
+        static bool HasSuffixCI(const char* s, const char* suf)
+        {
+            size_t ls = strlen(s), lf = strlen(suf);
+            if (ls < lf) return false;
+            for (size_t i = 0; i < lf; i++)
+            {
+                char a = s[ls - lf + i], b = suf[i];
+                if (a >= 'A' && a <= 'Z') a += 32;
+                if (b >= 'A' && b <= 'Z') b += 32;
+                if (a != b) return false;
+            }
+            return true;
+        }
+
+        static bool IsSourceFile(const char* name)
+        {
+            return HasSuffixCI(name, ".cpp") || HasSuffixCI(name, ".cc") || HasSuffixCI(name, ".cxx") ||
+                   HasSuffixCI(name, ".h") || HasSuffixCI(name, ".hpp") || HasSuffixCI(name, ".inl") ||
+                   HasSuffixCI(name, ".c");
+        }
+
+        static std::string ReadFileText(const char* path)
+        {
+            FILE* f = fopen(path, "rb");
+            if (!f) return "";
+            std::string s;
+            char buf[4096]; size_t r;
+            while ((r = fread(buf, 1, sizeof(buf), f)) > 0) s.append(buf, r);
+            fclose(f);
+            return s;
+        }
+
+        static void Unescape(std::string& s)
+        {
+            std::string o; o.reserve(s.size());
+            for (size_t i = 0; i < s.size(); i++)
+            {
+                if (s[i] == '\\' && i + 1 < s.size())
+                {
+                    char c = s[++i];
+                    if (c == 'n') o += '\n';
+                    else if (c == 't') o += '\t';
+                    else if (c == 'r') o += '\r';
+                    else o += c;
+                }
+                else o += s[i];
+            }
+            s.swap(o);
+        }
+
+        // Split a call's argument list on top-level commas (parens/braces/strings ok).
+        static void SplitArgs(const std::string& args, std::vector<std::string>& out)
+        {
+            int depth = 0; bool in_str = false; size_t start = 0;
+            for (size_t i = 0; i <= args.size(); i++)
+            {
+                char c = (i < args.size()) ? args[i] : ',';
+                if (in_str)
+                {
+                    if (c == '\\') { i++; continue; }
+                    if (i < args.size() && c == '"') in_str = false;
+                    continue;
+                }
+                if (c == '"') { in_str = true; continue; }
+                if (c == '(' || c == '{' || c == '[') depth++;
+                else if (c == ')' || c == '}' || c == ']') depth--;
+                if (c == ',' && depth <= 0)
+                {
+                    std::string a = args.substr(start, i - start);
+                    size_t b = a.find_first_not_of(" \t\r\n");
+                    size_t e = a.find_last_not_of(" \t\r\n");
+                    if (b != std::string::npos) out.push_back(a.substr(b, e - b + 1));
+                    start = i + 1;
+                    depth = std::max(depth, 0);
+                }
+            }
+        }
+
+        static bool FirstStringLiteral(const std::string& e, std::string& out)
+        {
+            size_t q = e.find('"');
+            if (q == std::string::npos) return false;
+            std::string s;
+            for (size_t i = q + 1; i < e.size(); i++)
+            {
+                if (e[i] == '\\') { s += e[i]; if (i + 1 < e.size()) s += e[++i]; continue; }
+                if (e[i] == '"') break;
+                s += e[i];
+            }
+            Unescape(s);
+            out = s;
+            return true;
+        }
+
+        static bool FirstNumber(const std::string& e, float& out)
+        {
+            size_t i = 0;
+            while (i < e.size() && !(isdigit((unsigned char)e[i]) || e[i] == '-' || e[i] == '+')) i++;
+            if (i >= e.size()) return false;
+            const char* p = e.c_str() + i;
+            char* end = nullptr;
+            double v = strtod(p, &end);
+            if (end == p) return false;
+            out = (float)v;
+            return true;
+        }
+
+        // Parse "ImVec2(x, y)" (or the two first numbers after a possible label)
+        // into x/y. Handles: ImVec2(60, 40), ImVec2(w, 300), {-1, 0}.
+        static bool ParseVec2Expr(const std::string& e, float& x, float& y)
+        {
+            size_t p = e.find('(');
+            if (p == std::string::npos) p = e.find('{');
+            std::string inner = (p != std::string::npos) ? e.substr(p + 1) : e;
+            size_t cm = inner.find(',');
+            std::string xs = (cm != std::string::npos) ? inner.substr(0, cm) : inner;
+            std::string ys = (cm != std::string::npos) ? inner.substr(cm + 1) : std::string();
+            bool ok = false;
+            if (FirstNumber(xs, x)) ok = true; else x = 0;
+            if (cm != std::string::npos) { if (FirstNumber(ys, y)) ok = true; else y = 0; }
+            else y = 0;
+            return ok;
+        }
+
+        // Resolve "ImGuiWindowFlags_NoResize | ImGuiWindowFlags_MenuBar" (names, int
+        // literals, or mixed) to a single int. Unknown tokens increment unresolved.
+        static int ResolveFlagsExpr(const std::string& e, int& unresolved)
+        {
+            int val = 0;
+            size_t i = 0;
+            while (i < e.size())
+            {
+                while (i < e.size() && (isspace((unsigned char)e[i]) || e[i] == '|' || e[i] == '(' || e[i] == ')')) i++;
+                if (i >= e.size()) break;
+                size_t s = i;
+                while (i < e.size() && (isalnum((unsigned char)e[i]) || e[i] == '_' || e[i] == '.')) i++;
+                std::string tok = e.substr(s, i - s);
+                if (tok.empty()) { i = s + 1; continue; } // always advance: guard vs stall
+                if (tok == "0") { /* keep 0 */ }
+                else
+                {
+                    int v;
+                    if (ImGuiEdResolveName(tok.c_str(), v)) val |= v;
+                    else if (tok[0] >= '0' && tok[0] <= '9') val |= atoi(tok.c_str());
+                    else unresolved++;
+                }
+            }
+            return val;
+        }
+
+        // Recursively collect source files under dir (depth-limited, cycle-safe).
+        static void CollectFiles(const std::string& dir, std::vector<std::string>& files, int depth = 0)
+        {
+            if (depth > 8) return;
+            DIR* d = opendir(dir.c_str());
+            if (!d) return;
+            struct dirent* e;
+            while ((e = readdir(d)) != nullptr)
+            {
+                if (!strcmp(e->d_name, ".") || !strcmp(e->d_name, "..")) continue;
+                std::string p = dir + "/" + e->d_name;
+                struct stat st;
+                if (stat(p.c_str(), &st) != 0) continue;
+                if (S_ISDIR(st.st_mode)) CollectFiles(p, files, depth + 1);
+                else if (IsSourceFile(e->d_name)) files.push_back(p);
+            }
+            closedir(d);
+        }
+
+        // ---------------------------------------------------------------------------
+        // Non-ImGui detection: tokens of other libraries in code lines.
+        // ---------------------------------------------------------------------------
+        struct NonImguiRule { const char* lib; const char* token; };
+        static const NonImguiRule kNonImguiRules[] = {
+            { "DirectX",      "D3D" },          { "DirectX",      "ID3D" },
+            { "DirectX",      "IDXGISwapChain" },
+            { "OpenGL",       "glBegin" },      { "OpenGL",       "glClear" },
+            { "OpenGL",       "glGenTextures" },{ "OpenGL",       "glTexParameteri" },
+            { "OpenGL",       "wgl" },
+            { "Vulkan",       "vkCreate" },    { "Vulkan",        "VkInstance" },
+            { "SDL",          "SDL_" },
+            { "GLFW",         "glfw" },
+            { "Win32",        "MessageBox" },   { "Win32",        "CreateWindow" },
+            { "Win32",        "RegisterClass" },
+            { "nt-internals", "ReadProcessMemory" }, { "nt-internals", "WriteProcessMemory" },
+            { "nt-internals", "VirtualProtect" },
+            { "threads",      "std::thread" },  { "threads",      "CreateThread" },
+            { "input",        "GetAsyncKeyState" },
+            { "input",        "keybd_event" },
+            { "network",      "recv(" },        { "network",      "send(" },
+            { "network",      "socket(" },
+            { "fs",           "fopen(" },      { "fs",           "ifstream" },
+            { "fs",           "ofstream" },
+            { "std",          "std::" },
+            { "math",         "sqrt(" },        { "math",         "sin(" },
+        };
+
+        // ---------------------------------------------------------------------------
+        // Parser state
+        // ---------------------------------------------------------------------------
+        struct StackEntry { Node* node; };
+        static std::vector<StackEntry> g_istack;
+        static ImVec2 g_pending_size(0, 0);   // SetNextWindowSize/Pos applied to next Begin
+        static ImVec2 g_pending_pos(0, 0);
+        static int     g_pending_cond = 0;
+
+        static Node* ICur()
+        {
+            return g_istack.empty() ? nullptr : g_istack.back().node;
+        }
+        static void IPush(Node* n)
+        {
+            if (n) g_istack.push_back({ n });
+        }
+        static void IPop(int count = 1)
+        {
+            for (int i = 0; i < count && !g_istack.empty(); i++) g_istack.pop_back();
+        }
+
+        static Node* IMake(int kind)
+        {
+            Node* n = Node_New(kind);
+            Node_MakeDefault(n, kind); // Node_New already applies defaults
+            return n;
+        }
+
+        // Attach under current container; if none (file has no Begin), auto-create
+        // a window for that file's widgets so nothing is silently dropped.
+        static const char* g_cur_fname = nullptr;
+        static Node* g_file_win = nullptr;
+        static void IAttach(Node* n)
+        {
+            Node* p = ICur();
+            if (p) { Node_AddChild(p, n); return; }
+            if (!g_file_win)
+            {
+                g_file_win = IMake(NWindow);
+                snprintf(g_file_win->name, sizeof(g_file_win->name), "%s",
+                         g_cur_fname ? g_cur_fname : "Imported");
+            }
+            Node_AddChild(g_file_win, n);
+        }
+
+        // Set node name/value from first string literal of an arg.
+        static void ISetName(Node* n, const std::string& arg)
+        {
+            std::string s;
+            if (FirstStringLiteral(arg, s))
+            {
+                strncpy(n->name, s.c_str(), 63); n->name[63] = 0;
+                strncpy(n->value_str, s.c_str(), 63); n->value_str[63] = 0;
+            }
+        }
+
+        // ---------------------------------------------------------------------------
+        // HandleCall: one parsed ImGui:: call -> node tree ops.
+        // meth/args are pre-extracted for single-line calls; for accumulated
+        // multi-line calls they are re-extracted inside.
+        // ---------------------------------------------------------------------------
+        static void HandleCall(const std::string& code, int line_no,
+                                Node*& root, ImportReport& rep, const char* fname)
+        {
+            // extract "ImGui::<meth>(<args>)" from the start of the FIRST ImGui:: in code
+            size_t ip = code.find("ImGui::");
+            if (ip == std::string::npos) return;
+            size_t ns = ip + 7;
+            while (ns < code.size() && isspace((unsigned char)code[ns])) ns++;
+            size_t ne = ns;
+            while (ne < code.size() && (isalnum((unsigned char)code[ne]) || code[ne] == '_')) ne++;
+            if (ne == ns) return;
+            std::string meth = code.substr(ns, ne - ns);
+            size_t call = code.find('(', ne);
+            if (call == std::string::npos) return;
+            int depth = 0; bool in_str = false; size_t end = std::string::npos;
+            for (size_t i = call; i < code.size(); i++)
+            {
+                if (in_str) { if (code[i] == '\\') i++; else if (code[i] == '"') in_str = false; continue; }
+                if (code[i] == '"') { in_str = true; continue; }
+                if (code[i] == '(') depth++;
+                else if (code[i] == ')') { depth--; if (depth == 0) { end = i; break; } }
+            }
+            if (end == std::string::npos) return;
+            std::string args = code.substr(call + 1, end - call - 1);
+
+            std::vector<std::string> a;
+            SplitArgs(args, a);
+            int NA = (int)a.size();
+
+            auto arg = [&](int i) -> const std::string& {
+                static std::string empty;
+                return (i >= 0 && i < NA) ? a[i] : empty;
+            };
+
+            // ---------- container opens ----------
+            if (meth == "Begin" && NA >= 1)
+            {
+                Node* n = IMake(NWindow);
+                ISetName(n, arg(0));
+                if (NA >= 3) { int un = 0; n->flags = ResolveFlagsExpr(arg(2), un); rep.calls_unresolved += un; }
+                // pending SetNextWindow* values
+                if (g_pending_size.x != 0 || g_pending_size.y != 0)
+                {
+                    n->w = g_pending_size.x; n->h = g_pending_size.y;
+                    g_pending_size = ImVec2(0, 0);
+                }
+                if (g_pending_pos.x != 0 || g_pending_pos.y != 0)
+                {
+                    n->pos_x = g_pending_pos.x; n->pos_y = g_pending_pos.y;
+                    n->pos_cond = g_pending_cond ? g_pending_cond : ImGuiCond_Once;
+                    g_pending_pos = ImVec2(0, 0);
+                    g_pending_cond = 0;
+                }
+                if (!root) root = n;
+                else { Node* p = ICur(); if (p) Node_AddChild(p, n); }
+                IPush(n);
+                rep.nodes_imported++;
+            }
+            else if (meth == "BeginChild" && NA >= 1)
+            {
+                Node* n = IMake(NChild);
+                ISetName(n, arg(0));
+                if (NA >= 4) { int un = 0; n->flags = ResolveFlagsExpr(arg(3), un); rep.calls_unresolved += un; }
+                if (NA >= 2) { float w = 0, h = 0; ParseVec2Expr(arg(1), w, h); n->w = w; n->h = h; }
+                IAttach(n); IPush(n);
+                rep.nodes_imported++;
+            }
+            else if (meth == "BeginTabBar" && NA >= 1)
+            {
+                Node* n = IMake(NTabBar);
+                ISetName(n, arg(0));
+                if (NA >= 2) { int un = 0; n->flags = ResolveFlagsExpr(arg(1), un); rep.calls_unresolved += un; }
+                IAttach(n); IPush(n);
+                rep.nodes_imported++;
+            }
+            else if (meth == "BeginTabItem" && NA >= 1)
+            {
+                Node* n = IMake(NTabItem);
+                ISetName(n, arg(0));
+                if (NA >= 3) { int un = 0; n->flags = ResolveFlagsExpr(arg(2), un); rep.calls_unresolved += un; }
+                IAttach(n); IPush(n);
+                rep.nodes_imported++;
+            }
+            else if (meth == "BeginMenu" && NA >= 1)
+            {
+                Node* n = IMake(NMenu);
+                ISetName(n, arg(0));
+                if (NA >= 2) { int un = 0; n->flags = ResolveFlagsExpr(arg(1), un); rep.calls_unresolved += un; }
+                IAttach(n); IPush(n);
+                rep.nodes_imported++;
+            }
+            else if (meth == "BeginCollapsingHeader" && NA >= 1)
+            {
+                Node* n = IMake(NCollapsingHeader);
+                ISetName(n, arg(0));
+                if (NA >= 2) { int un = 0; n->flags = ResolveFlagsExpr(arg(1), un); rep.calls_unresolved += un; }
+                IAttach(n); IPush(n);
+                rep.nodes_imported++;
+            }
+            else if (meth == "BeginTable" && NA >= 2)
+            {
+                Node* n = IMake(NTable);
+                ISetName(n, arg(0));
+                float cols = 3; FirstNumber(arg(1), cols); n->v_int = (int)cols;
+                if (NA >= 3) { int un = 0; n->flags = ResolveFlagsExpr(arg(2), un); rep.calls_unresolved += un; }
+                IAttach(n); IPush(n);
+                rep.nodes_imported++;
+            }
+            else if (meth == "BeginPopupModal" && NA >= 1)
+            {
+                Node* n = IMake(NPopupModal);
+                ISetName(n, arg(0));
+                if (NA >= 3) { int un = 0; n->flags = ResolveFlagsExpr(arg(2), un); rep.calls_unresolved += un; }
+                IAttach(n); IPush(n);
+                rep.nodes_imported++;
+            }
+            else if (meth == "BeginTooltip")
+            {
+                Node* n = IMake(NTooltip);
+                IAttach(n); IPush(n);
+                rep.nodes_imported++;
+            }
+            // ---------- container closes ----------
+            else if (meth == "End" || meth == "EndChild" || meth == "EndTabBar" ||
+                     meth == "EndTabItem" || meth == "EndMenu" || meth == "EndTable" ||
+                     meth == "EndPopup" || meth == "EndCollapsingHeader")
+            {
+                // End* pops one container regardless of type mismatch (tolerant)
+                IPop();
+            }
+            // ---------- menu bar ----------
+            else if (meth == "BeginMenuBar")
+            {
+                Node* n = IMake(NMenuBar);
+                IAttach(n); IPush(n);
+                rep.nodes_imported++;
+            }
+            else if (meth == "EndMenuBar") { IPop(); }
+            // ---------- leaf widgets ----------
+            else if (meth == "Text" || meth == "TextV" || meth == "TextUnformatted")
+            {
+                Node* n = IMake(NText);
+                ISetName(n, arg(0));
+                IAttach(n);
+                rep.nodes_imported++;
+            }
+            else if (meth == "TextWrapped")
+            {
+                Node* n = IMake(NTextWrapped);
+                ISetName(n, arg(0));
+                IAttach(n);
+                rep.nodes_imported++;
+            }
+            else if (meth == "TextDisabled")
+            {
+                Node* n = IMake(NTextDisabled);
+                ISetName(n, arg(0));
+                IAttach(n);
+                rep.nodes_imported++;
+            }
+            else if (meth == "BulletText")
+            {
+                Node* n = IMake(NBulletText);
+                ISetName(n, arg(0));
+                IAttach(n);
+                rep.nodes_imported++;
+            }
+            else if (meth == "SeparatorText")
+            {
+                Node* n = IMake(NSeparatorText);
+                ISetName(n, arg(0));
+                IAttach(n);
+                rep.nodes_imported++;
+            }
+            else if (meth == "Separator")
+            {
+                Node* n = IMake(NSeparator);
+                IAttach(n);
+                rep.nodes_imported++;
+            }
+            else if (meth == "Button" && NA >= 1)
+            {
+                Node* n = IMake(NButton);
+                ISetName(n, arg(0));
+                if (NA >= 2) { float w = 0, h = 0; ParseVec2Expr(arg(1), w, h); n->w = w; n->h = h; }
+                IAttach(n);
+                rep.nodes_imported++;
+            }
+            else if (meth == "SmallButton")
+            {
+                Node* n = IMake(NSmallButton);
+                ISetName(n, arg(0));
+                IAttach(n);
+                rep.nodes_imported++;
+            }
+            else if (meth == "ArrowButton" && NA >= 2)
+            {
+                Node* n = IMake(NArrowButton);
+                ISetName(n, arg(0));
+                float d = 0; if (FirstNumber(arg(1), d)) n->arrow_dir = (int)d;
+                IAttach(n);
+                rep.nodes_imported++;
+            }
+            else if (meth == "Checkbox" && NA >= 2)
+            {
+                Node* n = IMake(NCheckbox);
+                ISetName(n, arg(0));
+                IAttach(n);
+                rep.nodes_imported++;
+            }
+            else if (meth == "RadioButton" && NA >= 2)
+            {
+                Node* n = IMake(NRadioButton);
+                ISetName(n, arg(0));
+                IAttach(n);
+                rep.nodes_imported++;
+            }
+            else if (meth == "Combo" || meth == "BeginCombo")
+            {
+                Node* n = IMake(NCombo);
+                ISetName(n, arg(0));
+                if (NA >= 3)
+                {
+                    // items given as Selectable pairs inside BeginCombo/EndCombo: we
+                    // take the preview (arg1) and known items list if literal
+                }
+                if (NA >= 4 && meth == "BeginCombo") { int un = 0; n->flags = ResolveFlagsExpr(arg(3), un); rep.calls_unresolved += un; }
+                IAttach(n);
+                if (meth == "BeginCombo") IPush(n); // Selectables inside become items
+                rep.nodes_imported++;
+            }
+            else if (meth == "EndCombo") { IPop(); }
+            else if (meth == "ListBox" || meth == "BeginListBox")
+            {
+                Node* n = IMake(NListBox);
+                ISetName(n, arg(0));
+                if (meth == "BeginListBox") { IAttach(n); IPush(n); }
+                else IAttach(n);
+                rep.nodes_imported++;
+            }
+            else if (meth == "EndListBox") { IPop(); }
+            else if (meth == "InputText" || meth == "InputTextWithHint")
+            {
+                Node* n = IMake(NInputText);
+                ISetName(n, arg(0));
+                if (meth == "InputTextWithHint" && NA >= 2) ISetName(n, arg(1));
+                if (NA >= 2) { std::string s; if (FirstStringLiteral(arg(1), s)) strncpy(n->value_str, s.c_str(), 63); }
+                if (NA >= 4) { int un = 0; n->flags = ResolveFlagsExpr(arg(3), un); rep.calls_unresolved += un; }
+                IAttach(n);
+                rep.nodes_imported++;
+            }
+            else if (meth == "InputTextMultiline")
+            {
+                Node* n = IMake(NInputTextMultiline);
+                ISetName(n, arg(0));
+                if (NA >= 2) { std::string s; if (FirstStringLiteral(arg(1), s)) strncpy(n->value_str, s.c_str(), 63); }
+                if (NA >= 5) { int un = 0; n->flags = ResolveFlagsExpr(arg(4), un); rep.calls_unresolved += un; }
+                IAttach(n);
+                rep.nodes_imported++;
+            }
+            else if (meth == "InputInt" && NA >= 2)
+            {
+                Node* n = IMake(NInputInt);
+                ISetName(n, arg(0));
+                if (NA >= 5) { int un = 0; n->flags = ResolveFlagsExpr(arg(4), un); rep.calls_unresolved += un; }
+                IAttach(n);
+                rep.nodes_imported++;
+            }
+            else if (meth == "InputFloat" && NA >= 2)
+            {
+                Node* n = IMake(NInputFloat);
+                ISetName(n, arg(0));
+                if (NA >= 6) { int un = 0; n->flags = ResolveFlagsExpr(arg(5), un); rep.calls_unresolved += un; }
+                IAttach(n);
+                rep.nodes_imported++;
+            }
+            else if (meth == "DragInt" && NA >= 2)
+            {
+                Node* n = IMake(NDragInt);
+                ISetName(n, arg(0));
+                if (NA >= 3) { float sp = 1; if (FirstNumber(arg(2), sp)) n->v_speed = sp; }
+                if (NA >= 4) { float mn = 0; if (FirstNumber(arg(3), mn)) n->v_min = mn; }
+                if (NA >= 5) { float mx = 0; if (FirstNumber(arg(4), mx)) n->v_max = mx; }
+                if (NA >= 6) { int un = 0; n->flags = ResolveFlagsExpr(arg(5), un); rep.calls_unresolved += un; }
+                IAttach(n);
+                rep.nodes_imported++;
+            }
+            else if (meth == "DragFloat" && NA >= 2)
+            {
+                Node* n = IMake(NDragFloat);
+                ISetName(n, arg(0));
+                if (NA >= 3) { float sp = 1; if (FirstNumber(arg(2), sp)) n->v_speed = sp; }
+                if (NA >= 4) { float mn = 0; if (FirstNumber(arg(3), mn)) n->v_min = mn; }
+                if (NA >= 5) { float mx = 1; if (FirstNumber(arg(4), mx)) n->v_max = mx; }
+                if (NA >= 6) { int un = 0; n->flags = ResolveFlagsExpr(arg(5), un); rep.calls_unresolved += un; }
+                IAttach(n);
+                rep.nodes_imported++;
+            }
+            else if (meth == "SliderInt" && NA >= 4)
+            {
+                Node* n = IMake(NSliderInt);
+                ISetName(n, arg(0));
+                float mn = 0, mx = 100;
+                FirstNumber(arg(2), mn); FirstNumber(arg(3), mx);
+                n->v_min = mn; n->v_max = mx;
+                if (NA >= 5) { int un = 0; n->flags = ResolveFlagsExpr(arg(4), un); rep.calls_unresolved += un; }
+                IAttach(n);
+                rep.nodes_imported++;
+            }
+            else if (meth == "SliderFloat" && NA >= 4)
+            {
+                Node* n = IMake(NSliderFloat);
+                ISetName(n, arg(0));
+                float mn = 0, mx = 1;
+                FirstNumber(arg(2), mn); FirstNumber(arg(3), mx);
+                n->v_min = mn; n->v_max = mx;
+                if (NA >= 5) { int un = 0; n->flags = ResolveFlagsExpr(arg(4), un); rep.calls_unresolved += un; }
+                IAttach(n);
+                rep.nodes_imported++;
+            }
+            else if (meth == "ProgressBar" && NA >= 1)
+            {
+                Node* n = IMake(NProgressBar);
+                float fr = 0.7f; if (NA >= 1) FirstNumber(arg(0), fr);
+                n->fraction = fr;
+                IAttach(n);
+                rep.nodes_imported++;
+            }
+            else if (meth == "ColorEdit3" || meth == "ColorEdit4")
+            {
+                Node* n = IMake(meth == "ColorEdit3" ? NColorEdit3 : NColorEdit4);
+                ISetName(n, arg(0));
+                if (NA >= 3) { int un = 0; n->flags = ResolveFlagsExpr(arg(2), un); rep.calls_unresolved += un; }
+                IAttach(n);
+                rep.nodes_imported++;
+            }
+            else if (meth == "PlotLines" || meth == "PlotHistogram")
+            {
+                Node* n = IMake(meth == "PlotLines" ? NPlotLines : NPlotHistogram);
+                ISetName(n, arg(0));
+                IAttach(n);
+                rep.nodes_imported++;
+            }
+            else if (meth == "MenuItem" && NA >= 1)
+            {
+                Node* n = IMake(NMenuItem);
+                ISetName(n, arg(0));
+                if (NA >= 2) { std::string s; if (FirstStringLiteral(arg(1), s)) strncpy(n->shortcut, s.c_str(), 23); }
+                IAttach(n);
+                rep.nodes_imported++;
+            }
+            else if (meth == "Selectable")
+            {
+                Node* n = IMake(NSelectable);
+                ISetName(n, arg(0));
+                if (NA >= 4) { int un = 0; n->flags = ResolveFlagsExpr(arg(3), un); rep.calls_unresolved += un; }
+                IAttach(n);
+                rep.nodes_imported++;
+            }
+            else if (meth == "TableNextRow")
+            {
+                // begin a new row under the current Table node
+                Node* t = ICur();
+                if (t && t->kind == NTable)
+                {
+                    Node* row = IMake(NTreeNode /*row placeholder kind=TableRow below*/);
+                    row->kind = NTableRow;
+                    Node_AddChild(t, row);
+                    IPush(row);
+                    rep.nodes_imported++;
+                }
+            }
+            else if (meth == "TableSetupColumn" || meth == "TableSetupScrollFreeze" ||
+                     meth == "TableHeadersRow")
+            {
+                // table detail calls: noted, structure stays rows/cells
+            }
+            // pre-window setters (applied to the NEXT Begin in same file)
+            else if (meth == "SetNextWindowSize")
+            {
+                float w = 0, h = 0;
+                ParseVec2Expr(arg(0), w, h);
+                g_pending_size = ImVec2(w, h);
+            }
+            else if (meth == "SetNextWindowPos")
+            {
+                float x = 0, y = 0;
+                ParseVec2Expr(arg(0), x, y);
+                g_pending_pos = ImVec2(x, y);
+            }
+            else if (meth == "SetNextWindowCond")
+            {
+                int un = 0;
+                int c = ResolveFlagsExpr(arg(0), un);
+                g_pending_cond = c;
+            }
+            // rest: silently ignored (style, drawlist, io config etc.)
+        }
+
+        // ---------------------------------------------------------------------------
+        // File scan + folder import
+        // ---------------------------------------------------------------------------
+        static void ParseImguiFile(const std::string& path, const std::string& text, Node*& root, ImportReport& rep)
+        {
+            const char* fname = strrchr(path.c_str(), '/');
+            fname = fname ? fname + 1 : path.c_str();
+            g_cur_fname = fname;
+            g_file_win = nullptr; // per-file auto-window
+
+            // split into lines; accumulate multi-line calls (bounded)
+            std::vector<std::string> lines_v;
+            {
+                size_t p = 0;
+                while (true)
+                {
+                    size_t nl = text.find('\n', p);
+                    lines_v.push_back(text.substr(p, (nl == std::string::npos ? text.size() : nl) - p));
+                    if (nl == std::string::npos) break;
+                    p = nl + 1;
+                }
+            }
+
+            std::string acc; int acc_line = 0, acc_lines = 0;
+            for (int li = 0; li < (int)lines_v.size(); li++)
+            {
+                const std::string& raw = lines_v[li];
+
+                // non-ImGui detection on the raw line
+                for (auto& r : kNonImguiRules)
+                {
+                    if (raw.find(r.token) != std::string::npos)
+                    {
+                        char where[512];
+                        snprintf(where, sizeof(where), "%s:%d: [%s] %s",
+                                 fname, li + 1, r.lib, raw.substr(0, 100).c_str());
+                        rep.non_imgui.push_back(where);
+                        break;
+                    }
+                }
+
+                if (!acc.empty())
+                {
+                    acc += " "; acc += raw; acc_lines++;
+                    int opens = 0, closes = 0;
+                    for (char c : acc) { if (c == '(') opens++; else if (c == ')') closes++; }
+                    if (closes >= opens && closes > 0)
+                    {
+                        HandleCall(acc, acc_line, root, rep, fname);
+                        acc.clear();
+                    }
+                    else if (acc_lines > 20) acc.clear();
+                    continue;
+                }
+
+                // strip // comments outside strings
+                std::string code = raw;
+                {
+                    bool in_str = false; size_t cq = std::string::npos;
+                    for (size_t i = 0; i < code.size(); i++)
+                    {
+                        if (code[i] == '"') in_str = !in_str;
+                        if (!in_str && code[i] == '/' && i + 1 < code.size() && code[i+1] == '/') { cq = i; break; }
+                    }
+                    if (cq != std::string::npos) code = code.substr(0, cq);
+                }
+
+                size_t ip = code.find("ImGui::");
+                if (ip == std::string::npos) continue;
+                // find matching close paren of the first call on this line
+                size_t call = code.find('(', ip + 7);
+                if (call == std::string::npos) continue;
+                int depth = 0; bool in_str = false; size_t end = std::string::npos;
+                for (size_t i = call; i < code.size(); i++)
+                {
+                    if (in_str) { if (code[i] == '\\') i++; else if (code[i] == '"') in_str = false; continue; }
+                    if (code[i] == '"') { in_str = true; continue; }
+                    if (code[i] == '(') depth++;
+                    else if (code[i] == ')') { depth--; if (depth == 0) { end = i; break; } }
+                }
+                if (end == std::string::npos)
+                {
+                    acc = code; acc_line = li + 1; acc_lines = 0;
+                    continue;
+                }
+                // single-line call: dispatch from ip to end
+                HandleCall(code.substr(0, end + 1), li + 1, root, rep, fname);
+            }
+        }
+
+
+        // Console accessors (used by editor_chrome.cpp, defined before this include)
+        void ImportReportClear() { g_import.lines.clear(); g_import.non_imgui.clear(); }
+        int  ImportReportScanned()      { return g_import.files_scanned; }
+        int  ImportReportNodes()        { return g_import.nodes_imported; }
+        int  ImportReportFilesWithImgui(){ return g_import.files_with_imgui; }
+        int  ImportReportNonImguiCount(){ return (int)g_import.non_imgui.size(); }
+        const char* ImportReportNonImguiLine(int i)
+        { return (i >= 0 && i < (int)g_import.non_imgui.size()) ? g_import.non_imgui[i].c_str() : ""; }
+
+        // Import a whole folder tree. Returns the new root (or null).
+        // Hard 8-second budget: pathological/huge folders can never hang the app.
+        #include <time.h>
+        static Node* ImportFolder(const char* folder, ImportReport& rep)
+        {
+            struct timespec ts0; clock_gettime(CLOCK_MONOTONIC, &ts0);
+            auto elapsed_s = [&]() {
+                struct timespec t; clock_gettime(CLOCK_MONOTONIC, &t);
+                return (float)(t.tv_sec - ts0.tv_sec) + (t.tv_nsec - ts0.tv_nsec) / 1e9f;
+            };
+
+            std::vector<std::string> files;
+            CollectFiles(folder, files, 0);
+            rep.files_scanned = (int)files.size();
+            std::sort(files.begin(), files.end()); // deterministic order
+
+            Node* root = nullptr;
+            g_istack.clear();
+            g_pending_size = ImVec2(0, 0);
+            g_pending_pos  = ImVec2(0, 0);
+            g_pending_cond = 0;
+
+            for (auto& f : files)
+            {
+                if (elapsed_s() > 8.0f) { rep.lines.push_back("import budget exhausted; stopped early"); break; }
+                std::string text = ReadFileText(f.c_str());
+                if (text.empty()) continue;
+                bool had_root = (root != nullptr);
+                ParseImguiFile(f, text, root, rep);
+                // reset stack between files; adopt this file's auto-window (if any)
+                g_istack.clear();
+                if (g_file_win)
+                {
+                    if (!root) root = g_file_win;
+                    else Node_AddChild(root, g_file_win); // multi-window document
+                    g_file_win = nullptr;
+                }
+                if (text.find("ImGui::") != std::string::npos) rep.files_with_imgui++;
+            }
+            if (root) Node_ResyncIds(root);
+            rep.imported_root = root;
+            rep.nodes_imported = Node_TotalCount(root);
+            return root;
         }
 
         IMGUIED_EOF
