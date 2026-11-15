@@ -178,7 +178,7 @@ jobs:
                 targetCompatibility JavaVersion.VERSION_17
             }
             kotlinOptions {
-                jvmTarget '17'
+                jvmTarget = '17'
             }
 
             externalNativeBuild {
@@ -211,9 +211,11 @@ jobs:
         # Dear ImGui sources live in app/src/main/cpp/imgui/ (fetched in CI step)
         set(IMGUI_DIR ${CMAKE_CURRENT_SOURCE_DIR}/imgui)
 
+        # NOTE: editor_nodes.cpp is NOT compiled standalone: main.cpp includes it
+        # directly (#include "editor_nodes.cpp"), same as the other editor modules.
+        # Compiling it separately would create duplicate symbols at link time.
         add_library(${CMAKE_PROJECT_NAME} SHARED
           main.cpp
-          editor_nodes.cpp
           ${IMGUI_DIR}/imgui.cpp
           ${IMGUI_DIR}/imgui_demo.cpp
           ${IMGUI_DIR}/imgui_draw.cpp
