@@ -1,124 +1,2224 @@
-name: Fix Linker Options
-on:
-  push:
+name: Build ImGui Menu Editor APK
+'on':
+  push: null
+  workflow_dispatch: null
+  pull_request:
     branches:
-      - main
-      - master
-  workflow_dispatch:
-
+    - main
 permissions:
-  contents: write
-
+  contents: read
+env:
+  IMGUI_VERSION_TAG: v1.91.5
+  GRADLE_VERSION: '8.9'
+  AGP_VERSION: 8.5.2
+  NDK_VERSION: 27.0.12077973
+  CMAKE_VERSION: 3.22.1
 jobs:
   build:
-    runs-on: ubuntu-latest
+    name: Build APK (Kotlin + C++ NDK, real Dear ImGui)
+    runs-on: ubuntu-22.04
+    timeout-minutes: 60
     steps:
-      - name: Checkout
-        uses: actions/checkout@v4
-        with:
-          fetch-depth: 0
-          persist-credentials: true
+    - name: Checkout
+      uses: actions/checkout@v4
+    - name: Set up JDK 17
+      uses: actions/setup-java@v4
+      with:
+        distribution: temurin
+        java-version: '17'
+    - name: Generate project tree (all sources embedded in this workflow)
+      run: |-
+        set -euo pipefail
 
-      - name: Fix CMakeLists linker options
-        run: |
-          cat > android/app/src/main/cpp/CMakeLists.txt <<'CMAKE'
-          cmake_minimum_required(VERSION 3.22)
-          project(imguieditor)
-          set(CMAKE_CXX_STANDARD 17)
+        mkdir -p app/src/main/java/com/imguied/menueditor app/src/main/cpp gradle/wrapper
 
-          set(GLUE_DIR "")
-          foreach(c "${ANDROID_NDK}/sources/android/native_app_glue" "${CMAKE_ANDROID_NDK}/sources/android/native_app_glue")
-              if(EXISTS "${c}/android_native_app_glue.c")
-                  set(GLUE_DIR "${c}")
-                  break()
-              endif()
-          endforeach()
+        mkdir -p "$(dirname 'app/src/main/java/com/imguied/menueditor/MainActivity.kt')"
+        cat > 'app/src/main/java/com/imguied/menueditor/MainActivity.kt' <<'IMGUIED_EOF'
+        package com.imguied.menueditor
 
-          if(NOT GLUE_DIR)
-              message(FATAL_ERROR "native_app_glue not found in NDK")
-          endif()
+        import android.app.NativeActivity
+        import android.os.Bundle
+        import android.content.Context
+        import android.view.inputmethod.InputMethodManager
+        import android.view.KeyEvent
+        import java.util.concurrent.LinkedBlockingQueue
 
-          set(IMGUI_DIR "${CMAKE_CURRENT_SOURCE_DIR}/vendor/imgui")
+        class MainActivity : NativeActivity() {
+            public override fun onCreate(savedInstanceState: Bundle?) {
+                super.onCreate(savedInstanceState)
+            }
 
-          add_library(imgui STATIC
-              ${IMGUI_DIR}/imgui.cpp
-              ${IMGUI_DIR}/imgui_draw.cpp
-              ${IMGUI_DIR}/imgui_tables.cpp
-              ${IMGUI_DIR}/imgui_widgets.cpp
-              ${IMGUI_DIR}/backends/imgui_impl_android.cpp
-              ${IMGUI_DIR}/backends/imgui_impl_opengl3.cpp
-              ${IMGUI_DIR}/misc/cpp/imgui_stdlib.cpp
-          )
-          target_include_directories(imgui PUBLIC
-              ${IMGUI_DIR}
-              ${IMGUI_DIR}/backends
-              ${IMGUI_DIR}/misc/cpp
-          )
+            fun showSoftInput() {
+                val inputMethodManager = getSystemService(Context.INPUT_METHOD_SERVICE) as InputMethodManager
+                inputMethodManager.showSoftInput(this.window.decorView, 0)
+            }
 
-          add_library(imguieditor SHARED
-              android_main.cpp
-              widget_model.cpp
-              ${GLUE_DIR}/android_native_app_glue.c
-          )
-          target_include_directories(imguieditor PRIVATE
-              ${CMAKE_CURRENT_SOURCE_DIR}
-              ${GLUE_DIR}
-          )
+            fun hideSoftInput() {
+                val inputMethodManager = getSystemService(Context.INPUT_METHOD_SERVICE) as InputMethodManager
+                inputMethodManager.hideSoftInputFromWindow(this.window.decorView.windowToken, 0)
+            }
 
-          find_library(log-lib log)
-          target_link_libraries(imguieditor imgui android EGL GLESv3 ${log-lib})
+            // Queue for the Unicode characters to be polled from native code (via pollUnicodeChar())
+            private var unicodeCharacterQueue: LinkedBlockingQueue<Int> = LinkedBlockingQueue()
 
-          target_link_options(imguieditor PRIVATE
-              "LINKER:-u,ANativeActivity_onCreate"
-              "LINKER:-u,android_main"
-          )
-          CMAKE
-          echo "CMakeLists.txt rewritten with LINKER: prefix"
-          grep -A3 target_link_options android/app/src/main/cpp/CMakeLists.txt
+            // We assume dispatchKeyEvent() of the NativeActivity is actually called for every
+            // KeyEvent and not consumed by any View before it reaches here
+            override fun dispatchKeyEvent(event: KeyEvent): Boolean {
+                if (event.action == KeyEvent.ACTION_DOWN) {
+                    unicodeCharacterQueue.offer(event.getUnicodeChar(event.metaState))
+                }
+                return super.dispatchKeyEvent(event)
+            }
 
-      - name: Commit fix
-        run: |
-          git config user.name "ImGui Engine Bot"
-          git config user.email "bot@imgui-engine.local"
-          git add -A
-          if git diff --staged --quiet; then
-            echo "Nothing to commit"
-          else
-            git commit -m "fix(linker): use LINKER prefix to avoid dedup bug"
-            git push
-          fi
-        env:
-          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+            fun pollUnicodeChar(): Int {
+                return unicodeCharacterQueue.poll() ?: 0
+            }
+        }
 
-      - name: Set up JDK 17
-        uses: actions/setup-java@v4
-        with:
-          distribution: temurin
-          java-version: "17"
+        IMGUIED_EOF
 
-      - name: Set up Android SDK
-        uses: android-actions/setup-android@v3
-        with:
-          packages: platforms;android-34 build-tools;34.0.0
-          accept-android-sdk-licenses: true
+        mkdir -p "$(dirname 'app/src/main/AndroidManifest.xml')"
+        cat > 'app/src/main/AndroidManifest.xml' <<'IMGUIED_EOF'
+        <?xml version="1.0" encoding="utf-8"?>
+        <manifest xmlns:android="http://schemas.android.com/apk/res/android">
 
-      - name: Install NDK
-        run: |
-          echo "y" | sdkmanager --install "ndk;26.1.10909125"
-          echo "ANDROID_NDK_HOME=$ANDROID_HOME/ndk/26.1.10909125" >> $GITHUB_ENV
+            <application
+                android:label="ImGui Menu Editor"
+                android:allowBackup="false"
+                android:fullBackupContent="false"
+                android:hasCode="true"
+                android:icon="@android:drawable/sym_def_app_icon">
 
-      - name: Set up Gradle
-        uses: gradle/actions/setup-gradle@v3
+                <activity
+                    android:name="com.imguied.menueditor.MainActivity"
+                    android:theme="@android:style/Theme.NoTitleBar.Fullscreen"
+                    android:configChanges="orientation|keyboardHidden|screenSize"
+                    android:exported="true">
+                    <meta-data android:name="android.app.lib_name"
+                        android:value="ImGuiMenuEditor" />
 
-      - name: Build APK
-        run: |
-          cd android
-          if [ ! -f ./gradlew ]; then gradle wrapper --gradle-version 8.4; fi
-          ./gradlew assembleDebug --no-daemon
+                    <intent-filter>
+                        <action android:name="android.intent.action.MAIN" />
+                        <category android:name="android.intent.category.LAUNCHER" />
+                    </intent-filter>
+                </activity>
+            </application>
+        </manifest>
 
-      - name: Upload APK
-        uses: actions/upload-artifact@v4
-        with:
-          name: ImGui-Visual-Engine
-          path: android/app/build/outputs/apk/debug/*.apk
-          if-no-files-found: error
+        IMGUIED_EOF
+
+        mkdir -p "$(dirname 'settings.gradle')"
+        cat > 'settings.gradle' <<'IMGUIED_EOF'
+        pluginManagement {
+            repositories {
+                google()
+                mavenCentral()
+                gradlePluginPortal()
+            }
+        }
+        dependencyResolutionManagement {
+            repositories {
+                google()
+                mavenCentral()
+            }
+        }
+        rootProject.name = "ImGuiMenuEditor"
+        include ':app'
+
+        IMGUIED_EOF
+
+        mkdir -p "$(dirname 'build.gradle')"
+        cat > 'build.gradle' <<'IMGUIED_EOF'
+        // Top-level build file.
+        plugins {
+            id 'com.android.application' version '8.5.2' apply false
+            id 'org.jetbrains.kotlin.android' version '1.9.24' apply false
+        }
+
+        IMGUIED_EOF
+
+        mkdir -p "$(dirname 'gradle.properties')"
+        cat > 'gradle.properties' <<'IMGUIED_EOF'
+        org.gradle.jvmargs=-Xmx2048m
+        android.useAndroidX=true
+        android.nonTransitiveRClass=true
+        kotlin.code.style=official
+
+        IMGUIED_EOF
+
+        mkdir -p "$(dirname 'app/build.gradle')"
+        cat > 'app/build.gradle' <<'IMGUIED_EOF'
+        apply plugin: 'com.android.application'
+        apply plugin: 'kotlin-android'
+
+        android {
+            compileSdk 34
+            ndkVersion "27.0.12077973"
+
+            defaultConfig {
+                applicationId "com.imguied.menueditor"
+                namespace "com.imguied.menueditor"
+                minSdk 24
+                targetSdk 34
+                versionCode 1
+                versionName "1.0"
+            }
+
+            buildTypes {
+                release {
+                    minifyEnabled false
+                }
+                debug {
+                    minifyEnabled false
+                }
+            }
+
+            compileOptions {
+                sourceCompatibility JavaVersion.VERSION_17
+                targetCompatibility JavaVersion.VERSION_17
+            }
+            kotlinOptions {
+                jvmTarget '17'
+            }
+
+            externalNativeBuild {
+                cmake {
+                    path "src/main/cpp/CMakeLists.txt"
+                    version '3.22.1'
+                }
+            }
+        }
+
+        repositories {
+            mavenCentral()
+        }
+        dependencies {
+            implementation "org.jetbrains.kotlin:kotlin-stdlib:1.9.24"
+        }
+
+        IMGUIED_EOF
+
+        mkdir -p "$(dirname 'app/src/main/cpp/CMakeLists.txt')"
+        cat > 'app/src/main/cpp/CMakeLists.txt' <<'IMGUIED_EOF'
+        cmake_minimum_required(VERSION 3.22.1)
+
+        project(ImGuiMenuEditor)
+
+        set(CMAKE_CXX_STANDARD 17)
+        set(CMAKE_CXX_STANDARD_REQUIRED ON)
+        set(CMAKE_CXX_EXTENSIONS OFF)
+
+        # Dear ImGui sources live in app/src/main/cpp/imgui/ (fetched in CI step)
+        set(IMGUI_DIR ${CMAKE_CURRENT_SOURCE_DIR}/imgui)
+
+        add_library(${CMAKE_PROJECT_NAME} SHARED
+          main.cpp
+          editor_nodes.cpp
+          ${IMGUI_DIR}/imgui.cpp
+          ${IMGUI_DIR}/imgui_demo.cpp
+          ${IMGUI_DIR}/imgui_draw.cpp
+          ${IMGUI_DIR}/imgui_tables.cpp
+          ${IMGUI_DIR}/imgui_widgets.cpp
+          ${IMGUI_DIR}/backends/imgui_impl_android.cpp
+          ${IMGUI_DIR}/backends/imgui_impl_opengl3.cpp
+          ${ANDROID_NDK}/sources/android/native_app_glue/android_native_app_glue.c
+        )
+
+        set(CMAKE_SHARED_LINKER_FLAGS
+          "${CMAKE_SHARED_LINKER_FLAGS} -u ANativeActivity_onCreate"
+        )
+
+        target_compile_definitions(${CMAKE_PROJECT_NAME} PRIVATE
+          IMGUI_IMPL_OPENGL_ES3
+        )
+
+        target_include_directories(${CMAKE_PROJECT_NAME} PRIVATE
+          ${CMAKE_CURRENT_SOURCE_DIR}
+          ${IMGUI_DIR}
+          ${IMGUI_DIR}/backends
+          ${ANDROID_NDK}/sources/android/native_app_glue
+        )
+
+        target_link_libraries(${CMAKE_PROJECT_NAME} PRIVATE
+          android
+          EGL
+          GLESv3
+          log
+        )
+
+        IMGUIED_EOF
+
+        mkdir -p "$(dirname 'app/src/main/cpp/main.cpp')"
+        cat > 'app/src/main/cpp/main.cpp' <<'IMGUIED_EOF'
+        // main.cpp - Android entry point for the visual Dear ImGui menu editor/engine.
+        // Real Dear ImGui (v1.91.5) with the official Android + OpenGL ES 3 backends.
+        #include <android/log.h>
+        #include <android/input.h>
+        #include <android/keycode.h>
+        #include <android_native_app_glue.h>
+        #include <android/asset_manager.h>
+        #include <jni.h>
+        #include <EGL/egl.h>
+        #include <GLES3/gl3.h>
+        #include <string>
+        #include <vector>
+
+        #include "imgui.h"
+        #include "imgui_impl_android.h"
+        #include "imgui_impl_opengl3.h"
+        #include <string>
+        #include <vector>
+
+        #include "editor_nodes.h"
+
+        // Editor modules (single TU style: include .cpp for simplicity on CI)
+        #include "editor_nodes.cpp"
+        #include "editor_render.cpp"
+        #include "editor_chrome.cpp"
+
+        // ---------------------------------------------------------------------------
+        // Data
+        // ---------------------------------------------------------------------------
+        static EGLDisplay           g_EglDisplay = EGL_NO_DISPLAY;
+        static EGLSurface           g_EglSurface = EGL_NO_SURFACE;
+        static EGLContext           g_EglContext = EGL_NO_CONTEXT;
+        static struct android_app*  g_App = nullptr;
+        static bool                 g_Initialized = false;
+        static char                  g_LogTag[] = "ImGuiMenuEditor";
+        static std::string           g_IniFilename = "";
+        static std::string           g_DocFilename = "";
+        static std::string           g_SaveBuf = "";
+
+        // JNI helpers -------------------------------------------------------------
+        static JNIEnv* GetJEnv()
+        {
+            JNIEnv* env = nullptr;
+            if (g_App->activity->vm->GetEnv((void**)&env, JNI_VERSION_1_6) == JNI_OK)
+                return env;
+            if (g_App->activity->vm->AttachCurrentThread(&env, nullptr) == JNI_OK)
+                return env; // caller detaches not needed: NativeActivity thread stays attached
+            return nullptr;
+        }
+
+        static int ShowSoftKeyboardInput()
+        {
+            JNIEnv* env = GetJEnv(); if (!env) return -1;
+            jclass cl = env->GetObjectClass(g_App->activity->clazz);
+            jmethodID m = env->GetMethodID(cl, "showSoftInput", "()V");
+            if (m) env->CallVoidMethod(g_App->activity->clazz, m);
+            return 0;
+        }
+
+        static int PollUnicodeChars()
+        {
+            JNIEnv* env = GetJEnv(); if (!env) return -1;
+            jclass cl = env->GetObjectClass(g_App->activity->clazz);
+            jmethodID m = env->GetMethodID(cl, "pollUnicodeChar", "()I");
+            if (!m) return -2;
+            ImGuiIO& io = ImGui::GetIO();
+            jint c;
+            int n = 0;
+            while ((c = env->CallIntMethod(g_App->activity->clazz, m)) != 0)
+                io.AddInputCharacter((unsigned)c), n++;
+            return n;
+        }
+
+        // File I/O via internal storage -------------------------------------------
+        static bool SaveDoc(const char* text)
+        {
+            if (!g_App) return false;
+            std::string path = std::string(g_App->activity->internalDataPath) + "/menu.gmz";
+            FILE* f = fopen(path.c_str(), "w");
+            if (!f) return false;
+            fwrite(text, 1, strlen(text), f);
+            fclose(f);
+            return true;
+        }
+        static std::string LoadDoc()
+        {
+            std::string path = std::string(g_App->activity->internalDataPath) + "/menu.gmz";
+            FILE* f = fopen(path.c_str(), "r");
+            if (!f) return "";
+            std::string s;
+            char buf[1024]; size_t r;
+            while ((r = fread(buf, 1, sizeof(buf), f)) > 0) s.append(buf, r);
+            fclose(f);
+            return s;
+        }
+
+        // ---------------------------------------------------------------------------
+        // Default starter document: a full-featured example menu tree.
+        // ---------------------------------------------------------------------------
+        static Node* MakeDefaultDocument()
+        {
+            Node* win = Node_New(NWindow);
+            strncpy(win->name, "My Menu", 63); win->w = 420; win->h = 340;
+
+            Node* mb = Node_New(NMenuBar);
+            Node_AddChild(win, mb);
+            Node* m_file = Node_New(NMenu); strncpy(m_file->name, "File", 63);
+            Node_AddChild(mb, m_file);
+            const char* mis[] = {"New", "Open...", "Save", "Exit"};
+            for (const char* t : mis)
+            {
+                Node* mi = Node_New(NMenuItem); strncpy(mi->name, t, 63);
+                Node_AddChild(m_file, mi);
+            }
+            Node* m_help = Node_New(NMenu); strncpy(m_help->name, "Help", 63);
+            Node_AddChild(mb, m_help);
+            Node* mi_about = Node_New(NMenuItem); strncpy(mi_about->name, "About", 63);
+            Node_AddChild(m_help, mi_about);
+
+            Node* hdr = Node_New(NCollapsingHeader); strncpy(hdr->name, "Settings", 63);
+            Node_AddChild(win, hdr);
+
+            Node* tb = Node_New(NTabBar); Node_AddChild(hdr, tb);
+            Node* t1 = Node_New(NTabItem); strncpy(t1->name, "Display", 63); Node_AddChild(tb, t1);
+
+            Node* chk = Node_New(NCheckbox); strncpy(chk->name, "Fullscreen", 63); Node_AddChild(t1, chk);
+            Node* vs = Node_New(NSliderFloat); strncpy(vs->name, "Brightness", 63);
+            vs->v_float = 0.8f; vs->v_min = 0; vs->v_max = 1; Node_AddChild(t1, vs);
+            Node* vi = Node_New(NSliderInt); strncpy(vi->name, "Resolution", 63);
+            vi->v_int = 2; vi->v_min = 0; vi->v_max = 3; Node_AddChild(t1, vi);
+            Node* cmb = Node_New(NCombo); strncpy(cmb->name, "Quality", 63);
+            strncpy(cmb->value_str, "Low,Medium,High,Ultra", 63); cmb->combo_i = 2; Node_AddChild(t1, vi->parent == t1 ? t1 : t1), Node_AddChild(t1, cmb);
+
+            Node* t2 = Node_New(NTabItem); strncpy(t2->name, "Audio", 63); Node_AddChild(tb, t2);
+            Node* vol = Node_New(NSliderFloat); strncpy(vol->name, "Volume", 63);
+            vol->v_float = 0.5f; vol->v_min = 0; vol->v_max = 1; Node_AddChild(t2, vol);
+            Node* plot = Node_New(NPlotLines); strncpy(plot->name, "Waveform", 63);
+            plot->v_int = 90; plot->w = -1; plot->h = 60; Node_AddChild(t2, plot);
+
+            Node* tbl_hdr = Node_New(NCollapsingHeader); strncpy(tbl_hdr->name, "Players", 63);
+            Node_AddChild(win, tbl_hdr);
+            Node* tbl = Node_New(NTable); tbl->v_int = 3;
+            Node_AddChild(tbl_hdr, tbl);
+            for (int r = 0; r < 3; r++)
+            {
+                Node* row = Node_New(NTableRow); Node_AddChild(tbl, row);
+                char cell[32];
+                snprintf(cell, sizeof(cell), "Player %d", r + 1);
+                Node* c1 = Node_New(NText); strncpy(c1->name, cell, 63); Node_AddChild(row, c1);
+                Node* c2 = Node_New(NText); strncpy(c2->name, "100", 63); Node_AddChild(row, c2);
+                Node* c3 = Node_New(NProgressBar); c3->fraction = 0.3f + 0.3f * r; Node_AddChild(row, c3);
+            }
+
+            Node* tipbox = Node_New(NTooltip); strncpy(tipbox->value_str, "Tap any item in the palette to edit it.", 63);
+            Node_AddChild(win, tipbox);
+
+            return win;
+        }
+
+        // ---------------------------------------------------------------------------
+        // App lifecycle
+        // ---------------------------------------------------------------------------
+        static void Init(struct android_app* app)
+        {
+            if (g_Initialized) return;
+            g_App = app;
+            ANativeWindow_acquire(g_App->window);
+
+            g_EglDisplay = eglGetDisplay(EGL_DEFAULT_DISPLAY);
+            eglInitialize(g_EglDisplay, 0, 0);
+            const EGLint egl_attributes[] = { EGL_BLUE_SIZE, 8, EGL_GREEN_SIZE, 8, EGL_RED_SIZE, 8, EGL_DEPTH_SIZE, 24, EGL_SURFACE_TYPE, EGL_WINDOW_BIT, EGL_NONE };
+            EGLint num_configs = 0;
+            if (eglChooseConfig(g_EglDisplay, egl_attributes, nullptr, 0, &num_configs) != EGL_TRUE || num_configs == 0)
+                __android_log_print(ANDROID_LOG_ERROR, g_LogTag, "%s", "eglChooseConfig() failed");
+            EGLConfig egl_config;
+            eglChooseConfig(g_EglDisplay, egl_attributes, &egl_config, 1, &num_configs);
+            EGLint egl_format;
+            eglGetConfigAttrib(g_EglDisplay, egl_config, EGL_NATIVE_VISUAL_ID, &egl_format);
+            ANativeWindow_setBuffersGeometry(g_App->window, 0, 0, egl_format);
+            const EGLint egl_context_attributes[] = { EGL_CONTEXT_CLIENT_VERSION, 3, EGL_NONE };
+            g_EglContext = eglCreateContext(g_EglDisplay, egl_config, EGL_NO_CONTEXT, egl_context_attributes);
+            g_EglSurface = eglCreateWindowSurface(g_EglDisplay, egl_config, g_App->window, nullptr);
+            eglMakeCurrent(g_EglDisplay, g_EglSurface, g_EglSurface, g_EglContext);
+
+            IMGUI_CHECKVERSION();
+            ImGui::CreateContext();
+            ImGuiIO& io = ImGui::GetIO();
+            g_IniFilename = std::string(app->activity->internalDataPath) + "/imgui.ini";
+            io.IniFilename = g_IniFilename.c_str();
+            ImGui::StyleColorsDark();
+
+            ImGui_ImplAndroid_Init(g_App->window);
+            ImGui_ImplOpenGL3_Init("#version 300 es");
+
+            ImFontConfig font_cfg;
+            font_cfg.SizePixels = 22.0f;
+            io.Fonts->AddFontDefault(&font_cfg);
+            ImGui::GetStyle().ScaleAllSizes(2.6f);
+
+            // Load saved document or default
+            std::string saved = LoadDoc();
+            if (!saved.empty())
+                g_ed.root = LoadTreeFromString(saved);
+            if (!g_ed.root) g_ed.root = MakeDefaultDocument();
+            g_ed.sel = g_ed.root ? g_ed.root->id : -1;
+
+            g_Initialized = true;
+        }
+
+        static void Shutdown()
+        {
+            if (!g_Initialized) return;
+            ImGui_ImplOpenGL3_Shutdown();
+            ImGui_ImplAndroid_Shutdown();
+            ImGui::DestroyContext();
+            if (g_EglDisplay != EGL_NO_DISPLAY)
+            {
+                eglMakeCurrent(g_EglDisplay, EGL_NO_SURFACE, EGL_NO_SURFACE, EGL_NO_CONTEXT);
+                if (g_EglContext != EGL_NO_CONTEXT) eglDestroyContext(g_EglDisplay, g_EglContext);
+                if (g_EglSurface != EGL_NO_SURFACE) eglDestroySurface(g_EglDisplay, g_EglSurface);
+                eglTerminate(g_EglDisplay);
+            }
+            g_EglDisplay = EGL_NO_DISPLAY; g_EglContext = EGL_NO_CONTEXT; g_EglSurface = EGL_NO_SURFACE;
+            ANativeWindow_release(g_App->window);
+            g_Initialized = false;
+        }
+
+        // ---------------------------------------------------------------------------
+        // Frame
+        // ---------------------------------------------------------------------------
+        static void MainLoopStep()
+        {
+            ImGuiIO& io = ImGui::GetIO();
+            if (g_EglDisplay == EGL_NO_DISPLAY) return;
+
+            PollUnicodeChars();
+
+            static bool WantTextInputLast = false;
+            if (io.WantTextInput && !WantTextInputLast) ShowSoftKeyboardInput();
+            WantTextInputLast = io.WantTextInput;
+
+            ImGui_ImplOpenGL3_NewFrame();
+            ImGui_ImplAndroid_NewFrame();
+            ImGui::NewFrame();
+
+            // touch-tap selection in the palette area (edit mode only): consume taps
+            // that didn't land on editor chrome. We detect via a tap released in the
+            // middle palette region this frame and no editor window under it.
+            if (g_ed.edit_mode && g_ed.root)
+            {
+                // A tap: mouse pressed then released. Select the hit node if the
+                // release point lies in the central palette region (outside the
+                // editor chrome drawers/boxes).
+                static ImVec2 press_pos(-1, -1);
+                if (ImGui::IsMouseClicked(ImGuiMouseButton_Left))
+                    press_pos = io.MousePos;
+                if (ImGui::IsMouseReleased(ImGuiMouseButton_Left) && press_pos.x >= 0)
+                {
+                    int hit = HitTest((int)press_pos.x, (int)press_pos.y);
+                    if (hit > 0)
+                    {
+                        float W = io.DisplaySize.x, H = io.DisplaySize.y;
+                        bool in_palette = press_pos.x > 210 && press_pos.x < W - 270 &&
+                                          press_pos.y > 70 && press_pos.y < H - 120;
+                        bool chrome_hovered = ImGui::IsWindowHovered(ImGuiHoveredFlags_AnyWindow);
+                        if (in_palette && !chrome_hovered)
+                            g_ed.sel = hit;
+                    }
+                    press_pos = ImVec2(-1, -1);
+                }
+            }
+
+            // 1. Palette in the middle: render the user's document (real widgets).
+            if (g_ed.root)
+            {
+                HitClear();
+                RenderNode(g_ed.root, g_ed.edit_mode, g_ed.sel);
+            }
+
+            // 2. Editor chrome (drawers + boxes + lock) in edit mode.
+            if (g_ed.edit_mode)
+            {
+                DrawTopBox();
+                DrawAddPalette();
+                DrawTree();
+                DrawProps();
+                DrawBottomBox();
+                DrawLockButton();
+            }
+            else
+            {
+                DrawLockedOverlay();
+                if (g_ed.show_demo_test)
+                    ImGui::ShowDemoWindow(&g_ed.show_demo_test);
+            }
+
+            // Render
+            ImGui::Render();
+            glViewport(0, 0, (int)io.DisplaySize.x, (int)io.DisplaySize.y);
+            glClearColor(0.10f, 0.12f, 0.14f, 1.00f);
+            glClear(GL_COLOR_BUFFER_BIT);
+            ImGui_ImplOpenGL3_RenderDrawData(ImGui::GetDrawData());
+            eglSwapBuffers(g_EglDisplay, g_EglSurface);
+
+            // Autosave (every ~5 s)
+            static double last_save = 0.0;
+            if (ImGui::GetTime() - last_save > 5.0)
+            {
+                last_save = ImGui::GetTime();
+                SaveDoc(SaveTreeToString(g_ed.root).c_str());
+            }
+        }
+
+        static void handleAppCmd(struct android_app* app, int32_t appCmd)
+        {
+            switch (appCmd)
+            {
+            case APP_CMD_INIT_WINDOW: Init(app); break;
+            case APP_CMD_TERM_WINDOW: Shutdown(); break;
+            default: break;
+            }
+        }
+        static int32_t handleInputEvent(struct android_app* app, AInputEvent* inputEvent)
+        {
+            return ImGui_ImplAndroid_HandleInputEvent(inputEvent);
+        }
+
+        void android_main(struct android_app* app)
+        {
+            app->onAppCmd = handleAppCmd;
+            app->onInputEvent = handleInputEvent;
+
+            while (true)
+            {
+                int out_events;
+                struct android_poll_source* out_data;
+                while (ALooper_pollOnce(g_Initialized ? 0 : -1, nullptr, &out_events, (void**)&out_data) >= 0)
+                {
+                    if (out_data != nullptr) out_data->process(app, out_data);
+                    if (app->destroyRequested != 0)
+                    {
+                        if (!g_Initialized) Shutdown();
+                        return;
+                    }
+                }
+                MainLoopStep();
+            }
+        }
+
+        IMGUIED_EOF
+
+        mkdir -p "$(dirname 'app/src/main/cpp/editor_nodes.h')"
+        cat > 'app/src/main/cpp/editor_nodes.h' <<'IMGUIED_EOF'
+        // editor_nodes.h - Node model for the visual Dear ImGui menu editor/engine.
+        // Defines every widget type, its per-node options, flag sets, style overrides,
+        // tree structure (parent/child), and (de)serialization to a compact text format.
+        #pragma once
+
+        #include "imgui.h"
+        #include "imgui_internal.h"   // ImRect, ImMax, ImVec2 ops
+        #include <vector>
+        #include <string>
+        #include <cstring>
+        #include <cstdlib>
+        #include <cstdio>
+
+        // ---------------------------------------------------------------------------
+        // Node type: every Dear ImGui menu-building element the editor supports.
+        // ---------------------------------------------------------------------------
+        enum NodeKind
+        {
+            NWindow = 0, NMenuBar, NMenu, NMenuItem, NCollapsingHeader, NTreeNode,
+            NTabBar, NTabItem, NGroup, NChild, NTable, NTableRow, NText, NTextWrapped,
+            NTextDisabled, NSeparator, NSeparatorText, NBulletText, NButton, NSmallButton,
+            NArrowButton, NCheckbox, NCheckboxFlags, NRadioButton, NCombo, NListBox,
+            NInputText, NInputTextMultiline, NInputInt, NInputFloat, NDragInt, NDragFloat,
+            NSliderInt, NSliderFloat, NColorEdit3, NColorEdit4, NProgressBar, NPlotLines,
+            NPlotHistogram, NImage, NSelectable, NTooltip, NPopupModal, NKIND_COUNT
+        };
+
+        inline const char* NodeKindName(int k)
+        {
+            static const char* names[NKIND_COUNT] = {
+                "Window","MenuBar","Menu","MenuItem","CollapsingHeader","TreeNode",
+                "TabBar","TabItem","Group","Child","Table","TableRow",
+                "Text","TextWrapped","TextDisabled","Separator","SeparatorText","BulletText",
+                "Button","SmallButton","ArrowButton","Checkbox","CheckboxFlags","RadioButton",
+                "Combo","ListBox","InputText","InputTextMultiline","InputInt","InputFloat",
+                "DragInt","DragFloat","SliderInt","SliderFloat","ColorEdit3","ColorEdit4",
+                "ProgressBar","PlotLines","PlotHistogram","Image","Selectable",
+                "Tooltip","PopupModal"
+            };
+            return (k >= 0 && k < NKIND_COUNT) ? names[k] : "?";
+        }
+
+        inline int NodeKindFromName(const char* n)
+        {
+            for (int i = 0; i < NKIND_COUNT; i++) if (strcmp(NodeKindName(i), n) == 0) return i;
+            return -1;
+        }
+
+        // Which node kinds may parent which children (drives the tree structure UI).
+        inline bool NodeAcceptsChildren(int k)
+        {
+            switch (k)
+            {
+            case NWindow: case NMenuBar: case NMenu: case NCollapsingHeader: case NTreeNode:
+            case NTabItem: case NGroup: case NChild: case NTable: case NTableRow:
+            case NPopupModal: case NTooltip: case NListBox:
+                return true;
+            default: return false;
+            }
+        }
+        inline bool NodeIsContainerish(int k) // containers shown open in palette by default
+        {
+            switch (k)
+            {
+            case NWindow: case NMenuBar: case NMenu: case NCollapsingHeader: case NTreeNode:
+            case NTabItem: case NGroup: case NChild: case NPopupModal:
+                return true;
+            default: return false;
+            }
+        }
+
+        // ---------------------------------------------------------------------------
+        // Node: one menu element with ALL its configurable options.
+        // ---------------------------------------------------------------------------
+        struct Node
+        {
+            int             kind = NText;
+            int             id = 0;              // stable id, used for selection
+            char            name[64] = "Item";    // window title / button label / id string
+            char            value_str[64] = "";   // text content, combo items (csv), shortcut...
+            bool            open = true;         // container open state in palette/preview
+            bool            visible = true;       // item enabled/visible
+            bool            selected = false;     // radio/selected state preview
+            bool            p_open_flag = true;  // window/tab close-button flag
+            int             flags = 0;            // per-kind ImGui flags (window/input/slider...)
+            int             flags2 = 0;           // secondary set (table row: row flags; etc.)
+            int             arrow_dir = 0;        // ArrowButton dir, 0..3
+            int             v_int = 0, v_int2 = 0;
+            float           v_float = 0.0f, v_float2 = 0.0f, v_float3 = 1.0f, v_float4 = 0.0f;
+            float           v_min = 0.0f, v_max = 1.0f, v_speed = 1.0f;
+            float           w = 0.0f, h = 0.0f;   // explicit size (child/table/graph/image)
+            float           colors[4] = {0.26f, 0.59f, 0.98f, 1.0f};
+            float           fraction = 0.7f;      // progress bar
+            int             combo_i = 0;          // current combo/listbox/radio index
+            char            fmt[24] = "%.3f";     // numeric format string
+            char            shortcut[24] = "";   // menu item shortcut text
+            bool            round_to_int = false;// drag display
+            // style overrides applied to this subtree entry
+            bool            st_alpha_used = false;  float st_alpha = 1.0f;
+            bool            st_col_used[3] = {false,false,false};
+            int             st_col_id[3] = {0,0,0};
+            float           st_col_v[3][4] = {{0},{0},{0}};
+            // layout
+            bool            same_line = false;    // start on same line as previous item
+            float           indent = 0.0f;
+            // runtime (not serialized)
+            bool            palette_open = true;
+            Node*           parent = nullptr;
+            std::vector<Node*> children;
+
+            ~Node() { for (Node* c : children) delete c; }
+        };
+
+        // ---------------------------------------------------------------------------
+        // Flag descriptor tables: full set of relevant ImGui flags per kind.
+        // ---------------------------------------------------------------------------
+        struct FlagDef { const char* name; int value; };
+
+        inline const FlagDef* FlagTableWindow(int& n)
+        {
+            static const FlagDef d[] = {
+                {"NoTitleBar", ImGuiWindowFlags_NoTitleBar},
+                {"NoResize", ImGuiWindowFlags_NoResize},
+                {"NoMove", ImGuiWindowFlags_NoMove},
+                {"NoScrollbar", ImGuiWindowFlags_NoScrollbar},
+                {"NoScrollWithMouse", ImGuiWindowFlags_NoScrollWithMouse},
+                {"NoCollapse", ImGuiWindowFlags_NoCollapse},
+                {"AlwaysAutoResize", ImGuiWindowFlags_AlwaysAutoResize},
+                {"NoBackground", ImGuiWindowFlags_NoBackground},
+                {"NoSavedSettings", ImGuiWindowFlags_NoSavedSettings},
+                {"NoMouseInputs", ImGuiWindowFlags_NoMouseInputs},
+                {"MenuBar", ImGuiWindowFlags_MenuBar},
+                {"HorizontalScrollbar", ImGuiWindowFlags_HorizontalScrollbar},
+                {"NoFocusOnAppearing", ImGuiWindowFlags_NoFocusOnAppearing},
+                {"NoBringToFrontOnFocus", ImGuiWindowFlags_NoBringToFrontOnFocus},
+                {"AlwaysVerticalScrollbar", ImGuiWindowFlags_AlwaysVerticalScrollbar},
+                {"AlwaysHorizontalScrollbar", ImGuiWindowFlags_AlwaysHorizontalScrollbar},
+                {"NoNavInputs", ImGuiWindowFlags_NoNavInputs},
+                {"NoNavFocus", ImGuiWindowFlags_NoNavFocus},
+                {"UnsavedDocument", ImGuiWindowFlags_UnsavedDocument},
+            };
+            n = (int)(sizeof(d)/sizeof(d[0])); return d;
+        }
+
+        inline const FlagDef* FlagTableChild(int& n)
+        {
+            static const FlagDef d[] = {
+                {"Borders", ImGuiChildFlags_Borders},
+                {"AlwaysUseWindowPadding", ImGuiChildFlags_AlwaysUseWindowPadding},
+                {"ResizeX", ImGuiChildFlags_ResizeX},
+                {"ResizeY", ImGuiChildFlags_ResizeY},
+                {"AutoResizeX", ImGuiChildFlags_AutoResizeX},
+                {"AutoResizeY", ImGuiChildFlags_AutoResizeY},
+                {"AlwaysAutoResize", ImGuiChildFlags_AlwaysAutoResize},
+                {"FrameStyle", ImGuiChildFlags_FrameStyle},
+                {"NavFlattened", ImGuiChildFlags_NavFlattened},
+            };
+            n = (int)(sizeof(d)/sizeof(d[0])); return d;
+        }
+
+        inline const FlagDef* FlagTableTreeNode(int& n)
+        {
+            static const FlagDef d[] = {
+                {"Selected", ImGuiTreeNodeFlags_Selected},
+                {"Framed", ImGuiTreeNodeFlags_Framed},
+                {"AllowOverlap", ImGuiTreeNodeFlags_AllowOverlap},
+                {"NoTreePushOnOpen", ImGuiTreeNodeFlags_NoTreePushOnOpen},
+                {"NoAutoOpenOnLog", ImGuiTreeNodeFlags_NoAutoOpenOnLog},
+                {"DefaultOpen", ImGuiTreeNodeFlags_DefaultOpen},
+                {"OpenOnDoubleClick", ImGuiTreeNodeFlags_OpenOnDoubleClick},
+                {"OpenOnArrow", ImGuiTreeNodeFlags_OpenOnArrow},
+                {"Leaf", ImGuiTreeNodeFlags_Leaf},
+                {"Bullet", ImGuiTreeNodeFlags_Bullet},
+                {"FramePadding", ImGuiTreeNodeFlags_FramePadding},
+                {"SpanAvailWidth", ImGuiTreeNodeFlags_SpanAvailWidth},
+                {"SpanFullWidth", ImGuiTreeNodeFlags_SpanFullWidth},
+                {"SpanTextWidth", ImGuiTreeNodeFlags_SpanTextWidth},
+                {"SpanAllColumns", ImGuiTreeNodeFlags_SpanAllColumns},
+                {"NavLeftJumpsBackHere", ImGuiTreeNodeFlags_NavLeftJumpsBackHere},
+            };
+            n = (int)(sizeof(d)/sizeof(d[0])); return d;
+        }
+
+        inline const FlagDef* FlagTableInputText(int& n)
+        {
+            static const FlagDef d[] = {
+                {"CharsDecimal", ImGuiInputTextFlags_CharsDecimal},
+                {"CharsHexadecimal", ImGuiInputTextFlags_CharsHexadecimal},
+                {"CharsScientific", ImGuiInputTextFlags_CharsScientific},
+                {"CharsUppercase", ImGuiInputTextFlags_CharsUppercase},
+                {"CharsNoBlank", ImGuiInputTextFlags_CharsNoBlank},
+                {"AllowTabInput", ImGuiInputTextFlags_AllowTabInput},
+                {"EnterReturnsTrue", ImGuiInputTextFlags_EnterReturnsTrue},
+                {"EscapeClearsAll", ImGuiInputTextFlags_EscapeClearsAll},
+                {"CtrlEnterForNewLine", ImGuiInputTextFlags_CtrlEnterForNewLine},
+                {"ReadOnly", ImGuiInputTextFlags_ReadOnly},
+                {"Password", ImGuiInputTextFlags_Password},
+                {"AlwaysOverwrite", ImGuiInputTextFlags_AlwaysOverwrite},
+                {"AutoSelectAll", ImGuiInputTextFlags_AutoSelectAll},
+                {"ParseEmptyRefVal", ImGuiInputTextFlags_ParseEmptyRefVal},
+                {"DisplayEmptyRefVal", ImGuiInputTextFlags_DisplayEmptyRefVal},
+                {"NoHorizontalScroll", ImGuiInputTextFlags_NoHorizontalScroll},
+                {"NoUndoRedo", ImGuiInputTextFlags_NoUndoRedo},
+            };
+            n = (int)(sizeof(d)/sizeof(d[0])); return d;
+        }
+
+        inline const FlagDef* FlagTableSlider(int& n)
+        {
+            static const FlagDef d[] = {
+                {"Logarithmic", ImGuiSliderFlags_Logarithmic},
+                {"NoRoundToFormat", ImGuiSliderFlags_NoRoundToFormat},
+                {"NoInput", ImGuiSliderFlags_NoInput},
+                {"WrapAround", ImGuiSliderFlags_WrapAround},
+                {"ClampOnInput", ImGuiSliderFlags_ClampOnInput},
+                {"ClampZeroRange", ImGuiSliderFlags_ClampZeroRange},
+                {"AlwaysClamp", ImGuiSliderFlags_AlwaysClamp},
+            };
+            n = (int)(sizeof(d)/sizeof(d[0])); return d;
+        }
+
+        inline const FlagDef* FlagTableCombo(int& n)
+        {
+            static const FlagDef d[] = {
+                {"PopupAlignLeft", ImGuiComboFlags_PopupAlignLeft},
+                {"HeightSmall", ImGuiComboFlags_HeightSmall},
+                {"HeightRegular", ImGuiComboFlags_HeightRegular},
+                {"HeightLarge", ImGuiComboFlags_HeightLarge},
+                {"HeightLargest", ImGuiComboFlags_HeightLargest},
+                {"NoArrowButton", ImGuiComboFlags_NoArrowButton},
+                {"NoPreview", ImGuiComboFlags_NoPreview},
+                {"WidthFitPreview", ImGuiComboFlags_WidthFitPreview},
+            };
+            n = (int)(sizeof(d)/sizeof(d[0])); return d;
+        }
+
+        inline const FlagDef* FlagTableSelectable(int& n)
+        {
+            static const FlagDef d[] = {
+                {"NoAutoClosePopups", ImGuiSelectableFlags_NoAutoClosePopups},
+                {"SpanAllColumns", ImGuiSelectableFlags_SpanAllColumns},
+                {"AllowDoubleClick", ImGuiSelectableFlags_AllowDoubleClick},
+                {"Disabled", ImGuiSelectableFlags_Disabled},
+                {"AllowOverlap", ImGuiSelectableFlags_AllowOverlap},
+                {"Highlight", ImGuiSelectableFlags_Highlight},
+            };
+            n = (int)(sizeof(d)/sizeof(d[0])); return d;
+        }
+
+        inline const FlagDef* FlagTableTabBar(int& n)
+        {
+            static const FlagDef d[] = {
+                {"Reorderable", ImGuiTabBarFlags_Reorderable},
+                {"AutoSelectNewTabs", ImGuiTabBarFlags_AutoSelectNewTabs},
+                {"TabListPopupButton", ImGuiTabBarFlags_TabListPopupButton},
+                {"NoCloseWithMiddleMouseButton", ImGuiTabBarFlags_NoCloseWithMiddleMouseButton},
+                {"NoTabListScrollingButtons", ImGuiTabBarFlags_NoTabListScrollingButtons},
+                {"NoTooltip", ImGuiTabBarFlags_NoTooltip},
+                {"DrawSelectedOverline", ImGuiTabBarFlags_DrawSelectedOverline},
+                {"FittingPolicyScroll", ImGuiTabBarFlags_FittingPolicyScroll},
+                {"FittingPolicyResizeDown", ImGuiTabBarFlags_FittingPolicyResizeDown},
+            };
+            n = (int)(sizeof(d)/sizeof(d[0])); return d;
+        }
+
+        inline const FlagDef* FlagTableTabItem(int& n)
+        {
+            static const FlagDef d[] = {
+                {"UnsavedDocument", ImGuiTabItemFlags_UnsavedDocument},
+                {"SetSelected", ImGuiTabItemFlags_SetSelected},
+                {"NoCloseWithMiddleMouseButton", ImGuiTabItemFlags_NoCloseWithMiddleMouseButton},
+                {"NoPushId", ImGuiTabItemFlags_NoPushId},
+                {"NoTooltip", ImGuiTabItemFlags_NoTooltip},
+                {"NoReorder", ImGuiTabItemFlags_NoReorder},
+                {"Leading", ImGuiTabItemFlags_Leading},
+                {"Trailing", ImGuiTabItemFlags_Trailing},
+                {"NoAssumedClosure", ImGuiTabItemFlags_NoAssumedClosure},
+            };
+            n = (int)(sizeof(d)/sizeof(d[0])); return d;
+        }
+
+        inline const FlagDef* FlagTableTable(int& n)
+        {
+            static const FlagDef d[] = {
+                {"Resizable", ImGuiTableFlags_Resizable},
+                {"Reorderable", ImGuiTableFlags_Reorderable},
+                {"Hideable", ImGuiTableFlags_Hideable},
+                {"Sortable", ImGuiTableFlags_Sortable},
+                {"NoSavedSettings", ImGuiTableFlags_NoSavedSettings},
+                {"ContextMenuInBody", ImGuiTableFlags_ContextMenuInBody},
+                {"RowBg", ImGuiTableFlags_RowBg},
+                {"BordersInnerH", ImGuiTableFlags_BordersInnerH},
+                {"BordersOuterH", ImGuiTableFlags_BordersOuterH},
+                {"BordersInnerV", ImGuiTableFlags_BordersInnerV},
+                {"BordersOuterV", ImGuiTableFlags_BordersOuterV},
+                {"NoBordersInBody", ImGuiTableFlags_NoBordersInBody},
+                {"NoBordersInBodyUntilResize", ImGuiTableFlags_NoBordersInBodyUntilResize},
+                {"SizingFixedFit", ImGuiTableFlags_SizingFixedFit},
+                {"SizingFixedSame", ImGuiTableFlags_SizingFixedSame},
+                {"SizingStretchProp", ImGuiTableFlags_SizingStretchProp},
+                {"SizingStretchSame", ImGuiTableFlags_SizingStretchSame},
+                {"NoHostExtendX", ImGuiTableFlags_NoHostExtendX},
+                {"NoHostExtendY", ImGuiTableFlags_NoHostExtendY},
+                {"NoKeepColumnsVisible", ImGuiTableFlags_NoKeepColumnsVisible},
+                {"PreciseWidths", ImGuiTableFlags_PreciseWidths},
+                {"NoClip", ImGuiTableFlags_NoClip},
+                {"PadOuterX", ImGuiTableFlags_PadOuterX},
+                {"NoPadOuterX", ImGuiTableFlags_NoPadOuterX},
+                {"NoPadInnerX", ImGuiTableFlags_NoPadInnerX},
+                {"ScrollX", ImGuiTableFlags_ScrollX},
+                {"ScrollY", ImGuiTableFlags_ScrollY},
+                {"SortMulti", ImGuiTableFlags_SortMulti},
+                {"SortTristate", ImGuiTableFlags_SortTristate},
+                {"HighlightHoveredColumn", ImGuiTableFlags_HighlightHoveredColumn},
+            };
+            n = (int)(sizeof(d)/sizeof(d[0])); return d;
+        }
+
+        inline const FlagDef* FlagTableTableColumn(int& n)
+        {
+            static const FlagDef d[] = {
+                {"Disabled", ImGuiTableColumnFlags_Disabled},
+                {"DefaultHide", ImGuiTableColumnFlags_DefaultHide},
+                {"DefaultSort", ImGuiTableColumnFlags_DefaultSort},
+                {"WidthStretch", ImGuiTableColumnFlags_WidthStretch},
+                {"WidthFixed", ImGuiTableColumnFlags_WidthFixed},
+                {"NoResize", ImGuiTableColumnFlags_NoResize},
+                {"NoReorder", ImGuiTableColumnFlags_NoReorder},
+                {"NoHide", ImGuiTableColumnFlags_NoHide},
+                {"NoClip", ImGuiTableColumnFlags_NoClip},
+                {"NoSort", ImGuiTableColumnFlags_NoSort},
+                {"NoSortAscending", ImGuiTableColumnFlags_NoSortAscending},
+                {"NoSortDescending", ImGuiTableColumnFlags_NoSortDescending},
+                {"NoHeaderLabel", ImGuiTableColumnFlags_NoHeaderLabel},
+                {"NoHeaderWidth", ImGuiTableColumnFlags_NoHeaderWidth},
+                {"PreferSortAscending", ImGuiTableColumnFlags_PreferSortAscending},
+                {"PreferSortDescending", ImGuiTableColumnFlags_PreferSortDescending},
+                {"IndentEnable", ImGuiTableColumnFlags_IndentEnable},
+                {"IndentDisable", ImGuiTableColumnFlags_IndentDisable},
+                {"AngledHeader", ImGuiTableColumnFlags_AngledHeader},
+            };
+            n = (int)(sizeof(d)/sizeof(d[0])); return d;
+        }
+
+        inline const FlagDef* FlagTableColorEdit(int& n)
+        {
+            static const FlagDef d[] = {
+                {"NoAlpha", ImGuiColorEditFlags_NoAlpha},
+                {"NoPicker", ImGuiColorEditFlags_NoPicker},
+                {"NoOptions", ImGuiColorEditFlags_NoOptions},
+                {"NoSmallPreview", ImGuiColorEditFlags_NoSmallPreview},
+                {"NoInputs", ImGuiColorEditFlags_NoInputs},
+                {"NoTooltip", ImGuiColorEditFlags_NoTooltip},
+                {"NoDragDrop", ImGuiColorEditFlags_NoDragDrop},
+                {"NoBorder", ImGuiColorEditFlags_NoBorder},
+                {"AlphaBar", ImGuiColorEditFlags_AlphaBar},
+                {"AlphaPreview", ImGuiColorEditFlags_AlphaPreview},
+                {"AlphaPreviewHalf", ImGuiColorEditFlags_AlphaPreviewHalf},
+                {"HDR", ImGuiColorEditFlags_HDR},
+                {"DisplayRGB", ImGuiColorEditFlags_DisplayRGB},
+                {"DisplayHSV", ImGuiColorEditFlags_DisplayHSV},
+                {"DisplayHex", ImGuiColorEditFlags_DisplayHex},
+                {"InputRGB", ImGuiColorEditFlags_InputRGB},
+                {"InputHSV", ImGuiColorEditFlags_InputHSV},
+                {"PickerHueBar", ImGuiColorEditFlags_PickerHueBar},
+                {"PickerHueWheel", ImGuiColorEditFlags_PickerHueWheel},
+            };
+            n = (int)(sizeof(d)/sizeof(d[0])); return d;
+        }
+
+        inline const FlagDef* FlagTableTableRow(int& n)
+        {
+            static const FlagDef d[] = {
+                {"Headers", ImGuiTableRowFlags_Headers},
+            };
+            n = (int)(sizeof(d)/sizeof(d[0])); return d;
+        }
+
+        // Table of table-column flags lives on TableRow nodes (flags2): each TableRow's
+        // children are the cells; flags2 describes per-column setup options.
+        inline const FlagDef* FlagTableFor(int kind, int& n)
+        {
+            switch (kind)
+            {
+            case NWindow: case NPopupModal: return FlagTableWindow(n);
+            case NChild: return FlagTableChild(n);
+            case NCollapsingHeader: case NTreeNode: return FlagTableTreeNode(n);
+            case NInputText: case NInputTextMultiline: case NInputInt: case NInputFloat:
+                return FlagTableInputText(n);
+            case NSliderInt: case NSliderFloat: case NDragInt: case NDragFloat:
+                return FlagTableSlider(n);
+            case NCombo: return FlagTableCombo(n);
+            case NSelectable: return FlagTableSelectable(n);
+            case NTabBar: return FlagTableTabBar(n);
+            case NTabItem: return FlagTableTabItem(n);
+            case NTable: return FlagTableTable(n);
+            case NTableRow: return FlagTableTableRow(n);
+            case NColorEdit3: case NColorEdit4: return FlagTableColorEdit(n);
+            default: n = 0; return nullptr;
+            }
+        }
+
+        // ---------------------------------------------------------------------------
+        // Style color names (all 51 ImGuiCol_ entries usable as overrides).
+        // ---------------------------------------------------------------------------
+        inline const char* StyleColName(int i)
+        {
+            static const char* names[] = {
+                "Text","TextDisabled","WindowBg","ChildBg","PopupBg","Border","BorderShadow",
+                "FrameBg","FrameBgHovered","FrameBgActive","TitleBg","TitleBgActive","TitleBgCollapsed",
+                "MenuBarBg","ScrollbarBg","ScrollbarGrab","ScrollbarGrabHovered","ScrollbarGrabActive",
+                "CheckMark","SliderGrab","SliderGrabActive","Button","ButtonHovered","ButtonActive",
+                "Header","HeaderHovered","HeaderActive","Separator","SeparatorHovered","SeparatorActive",
+                "ResizeGrip","ResizeGripHovered","ResizeGripActive","TabHovered","Tab","TabSelected",
+                "TabDimmed","TabDimmedSelected","PlotLines","PlotLinesHovered","PlotHistogram",
+                "PlotHistogramHovered","TableHeaderBg","TableBorderStrong","TableBorderLight",
+                "TableRowBg","TableRowBgAlt","TextLink","TextSelectedBg","DragDropTarget",
+                "NavCursor","NavWindowingHighlight","NavWindowingDimBg","ModalWindowDimBg"
+            };
+            int cnt = (int)(sizeof(names)/sizeof(names[0]));
+            return (i >= 0 && i < cnt) ? names[i] : "?";
+        }
+        inline int StyleColCount() { static int c = -1; if (c < 0) { c = 0; while (strcmp(StyleColName(c), "?") != 0) c++; } return c; }
+
+        // Style float/vec variables (pushable per node).
+        enum StyleVarSlot { SV_Float = 0, SV_Vec2, SV_COUNT };
+        struct StyleVarDef { const char* name; int var; int type; };
+        inline const StyleVarDef* StyleVarTable(int& n)
+        {
+            static const StyleVarDef d[] = {
+                {"Alpha", ImGuiStyleVar_Alpha, SV_Float},
+                {"DisabledAlpha", ImGuiStyleVar_DisabledAlpha, SV_Float},
+                {"WindowPadding", ImGuiStyleVar_WindowPadding, SV_Vec2},
+                {"WindowRounding", ImGuiStyleVar_WindowRounding, SV_Float},
+                {"WindowBorderSize", ImGuiStyleVar_WindowBorderSize, SV_Float},
+                {"WindowMinSize", ImGuiStyleVar_WindowMinSize, SV_Vec2},
+                {"WindowTitleAlign", ImGuiStyleVar_WindowTitleAlign, SV_Vec2},
+                {"ChildRounding", ImGuiStyleVar_ChildRounding, SV_Float},
+                {"ChildBorderSize", ImGuiStyleVar_ChildBorderSize, SV_Float},
+                {"PopupRounding", ImGuiStyleVar_PopupRounding, SV_Float},
+                {"PopupBorderSize", ImGuiStyleVar_PopupBorderSize, SV_Float},
+                {"FramePadding", ImGuiStyleVar_FramePadding, SV_Vec2},
+                {"FrameRounding", ImGuiStyleVar_FrameRounding, SV_Float},
+                {"FrameBorderSize", ImGuiStyleVar_FrameBorderSize, SV_Float},
+                {"ItemSpacing", ImGuiStyleVar_ItemSpacing, SV_Vec2},
+                {"ItemInnerSpacing", ImGuiStyleVar_ItemInnerSpacing, SV_Vec2},
+                {"IndentSpacing", ImGuiStyleVar_IndentSpacing, SV_Float},
+                {"CellPadding", ImGuiStyleVar_CellPadding, SV_Vec2},
+                {"ScrollbarSize", ImGuiStyleVar_ScrollbarSize, SV_Float},
+                {"ScrollbarRounding", ImGuiStyleVar_ScrollbarRounding, SV_Float},
+                {"GrabMinSize", ImGuiStyleVar_GrabMinSize, SV_Float},
+                {"GrabRounding", ImGuiStyleVar_GrabRounding, SV_Float},
+                {"TabRounding", ImGuiStyleVar_TabRounding, SV_Float},
+                {"TabBorderSize", ImGuiStyleVar_TabBorderSize, SV_Float},
+                {"ButtonTextAlign", ImGuiStyleVar_ButtonTextAlign, SV_Vec2},
+                {"SelectableTextAlign", ImGuiStyleVar_SelectableTextAlign, SV_Vec2},
+                {"SeparatorTextBorderSize", ImGuiStyleVar_SeparatorTextBorderSize, SV_Float},
+                {"SeparatorTextAlign", ImGuiStyleVar_SeparatorTextAlign, SV_Vec2},
+                {"SeparatorTextPadding", ImGuiStyleVar_SeparatorTextPadding, SV_Vec2},
+            };
+            n = (int)(sizeof(d)/sizeof(d[0])); return d;
+        }
+
+        // ---------------------------------------------------------------------------
+        // Document = tree of nodes + selection + edit-mode flags.
+        // ---------------------------------------------------------------------------
+        struct EditorState; // fwd (editor.h layer)
+
+        struct Node; // (already above)
+
+        struct Node* Node_New(int kind);
+        void Node_Delete(Node* n);
+        Node* Node_Clone(const Node* src, Node* parent);
+        Node* Node_FindById(Node* root, int id);
+        int  Node_NextId();
+        void Node_AddChild(Node* p, Node* c, int pos = -1);
+        void Node_RemoveFromParent(Node* n);
+        int  Node_IndexInParent(const Node* n);
+        int  Node_TotalCount(const Node* n);
+        const char* Node_ShortLabel(const Node* n); // "kind: name"
+        void Node_MakeDefault(Node* n, int kind);    // fill sensible defaults per kind
+
+        // Serialization: "key=value ; " pairs per node, one line per node with indent depth.
+        void SerializeNode(const Node* n, std::string& out, int depth);
+        Node* DeserializeTree(const std::string& text); // returns root of tree or null
+        std::string SaveTreeToString(const Node* root);
+        Node* LoadTreeFromString(const std::string& text);
+
+        IMGUIED_EOF
+
+        mkdir -p "$(dirname 'app/src/main/cpp/editor_nodes.cpp')"
+        cat > 'app/src/main/cpp/editor_nodes.cpp' <<'IMGUIED_EOF'
+        // editor_nodes.cpp - Node CRUD, defaults, clone, serialize/deserialize.
+        #include "editor_nodes.h"
+
+        static int g_next_id = 1;
+        int Node_NextId() { return g_next_id++; }
+
+        void Node_MakeDefault(Node* n, int kind)
+        {
+            n->kind = kind;
+            n->id = Node_NextId();
+            switch (kind)
+            {
+            case NWindow:      strncpy(n->name, "My Window", 63); break;
+            case NMenuBar:     strncpy(n->name, "MenuBar", 63); break;
+            case NMenu:        strncpy(n->name, "File", 63); break;
+            case NMenuItem:    strncpy(n->name, "Open...", 63); strncpy(n->shortcut, "Ctrl+O", 23); break;
+            case NCollapsingHeader: strncpy(n->name, "Header", 63); break;
+            case NTreeNode:    strncpy(n->name, "Node", 63); break;
+            case NTabBar:      strncpy(n->name, "Tabs", 63); break;
+            case NTabItem:     strncpy(n->name, "Tab", 63); break;
+            case NGroup:       strncpy(n->name, "Group", 63); break;
+            case NChild:       strncpy(n->name, "Child", 63); n->w = 200; n->h = 150; break;
+            case NTable:       strncpy(n->name, "Table", 63); n->v_int = 3; n->flags = ImGuiTableFlags_Borders | ImGuiTableFlags_RowBg; break;
+            case NTableRow:    strncpy(n->name, "Row", 63); break;
+            case NText:        strncpy(n->value_str, "Some text", 63); break;
+            case NTextWrapped: strncpy(n->value_str, "Wrapped text will wrap when the end of line is reached", 63); break;
+            case NTextDisabled: strncpy(n->value_str, "Disabled text", 63); break;
+            case NSeparator:   break;
+            case NSeparatorText: strncpy(n->name, "Section", 63); break;
+            case NBulletText:  strncpy(n->value_str, "Bullet point", 63); break;
+            case NButton:      strncpy(n->name, "Button", 63); break;
+            case NSmallButton: strncpy(n->name, "Small", 63); break;
+            case NArrowButton: strncpy(n->name, "Arrow", 63); n->arrow_dir = 0; break;
+            case NCheckbox:    strncpy(n->name, "Checkbox", 63); n->v_int = 1; break;
+            case NCheckboxFlags: strncpy(n->name, "Flag", 63); break;
+            case NRadioButton: strncpy(n->name, "Radio", 63); break;
+            case NCombo:       strncpy(n->name, "Combo", 63); strncpy(n->value_str, "Option A,Option B,Option C", 63); break;
+            case NListBox:     strncpy(n->name, "List", 63); strncpy(n->value_str, "Item 1,Item 2,Item 3", 63); break;
+            case NInputText:   strncpy(n->name, "Text", 63); strncpy(n->value_str, "hello", 63); break;
+            case NInputTextMultiline: strncpy(n->name, "Multiline", 63); strncpy(n->value_str, "line one", 63); n->w = -200; n->h = 100; break;
+            case NInputInt:    strncpy(n->name, "Int", 63); n->v_int = 42; n->v_min = 0; n->v_max = 100; break;
+            case NInputFloat:  strncpy(n->name, "Float", 63); n->v_float = 1.23f; break;
+            case NDragInt:     strncpy(n->name, "Drag Int", 63); n->v_int = 5; n->v_min = 0; n->v_max = 100; break;
+            case NDragFloat:   strncpy(n->name, "Drag Float", 63); n->v_float = 0.5f; n->v_min = 0; n->v_max = 1; break;
+            case NSliderInt:   strncpy(n->name, "Slider Int", 63); n->v_int = 30; n->v_min = 0; n->v_max = 100; break;
+            case NSliderFloat: strncpy(n->name, "Slider Float", 63); n->v_float = 0.4f; n->v_min = 0; n->v_max = 1; break;
+            case NColorEdit3:  strncpy(n->name, "Color3", 63); break;
+            case NColorEdit4:  strncpy(n->name, "Color4", 63); break;
+            case NProgressBar: n->fraction = 0.7f; n->w = -50; break;
+            case NPlotLines:       strncpy(n->name, "Lines", 63); n->v_int = 60; n->v_min = -1; n->v_max = 1; n->w = -60; n->h = 80; break;
+            case NPlotHistogram:  strncpy(n->name, "Hist", 63); n->v_int = 60; n->v_min = 0; n->v_max = 1; n->w = -60; n->h = 80; break;
+            case NImage:       strncpy(n->name, "Image", 63); n->w = 100; n->h = 100; break;
+            case NSelectable:  strncpy(n->name, "Selectable", 63); break;
+            case NTooltip:     strncpy(n->name, "Tooltip", 63); break;
+            case NPopupModal:  strncpy(n->name, "Modal", 63); break;
+            default: break;
+            }
+        }
+
+        Node* Node_New(int kind)
+        {
+            Node* n = new Node();
+            Node_MakeDefault(n, kind);
+            return n;
+        }
+
+        void Node_Delete(Node* n) { delete n; }
+
+        Node* Node_Clone(const Node* src, Node* parent)
+        {
+            Node* n = new Node(*src);
+            n->id = Node_NextId();
+            n->parent = parent;
+            n->children.clear();
+            for (Node* c : src->children)
+                n->children.push_back(Node_Clone(c, n));
+            return n;
+        }
+
+        Node* Node_FindById(Node* root, int id)
+        {
+            if (!root) return nullptr;
+            if (root->id == id) return root;
+            for (Node* c : root->children)
+                if (Node* f = Node_FindById(c, id)) return f;
+            return nullptr;
+        }
+
+        void Node_AddChild(Node* p, Node* c, int pos)
+        {
+            if (!p || !c) return;
+            c->parent = p;
+            if (pos < 0 || pos >= (int)p->children.size())
+                p->children.push_back(c);
+            else
+                p->children.insert(p->children.begin() + pos, c);
+        }
+
+        void Node_RemoveFromParent(Node* n)
+        {
+            if (!n || !n->parent) return;
+            auto& v = n->parent->children;
+            for (auto it = v.begin(); it != v.end(); ++it)
+                if (*it == n) { v.erase(it); break; }
+            n->parent = nullptr;
+        }
+
+        int Node_IndexInParent(const Node* n)
+        {
+            if (!n || !n->parent) return -1;
+            auto& v = n->parent->children;
+            for (size_t i = 0; i < v.size(); i++) if (v[i] == n) return (int)i;
+            return -1;
+        }
+
+        int Node_TotalCount(const Node* n)
+        {
+            if (!n) return 0;
+            int c = 1;
+            for (Node* ch : n->children) c += Node_TotalCount(ch);
+            return c;
+        }
+
+        const char* Node_ShortLabel(const Node* n)
+        {
+            static char buf[128];
+            if ((n->kind == NText) || (n->kind == NTextWrapped) || (n->kind == NTextDisabled) || (n->kind == NBulletText))
+                snprintf(buf, sizeof(buf), "%s: %s", NodeKindName(n->kind), n->value_str);
+            else
+                snprintf(buf, sizeof(buf), "%s: %s", NodeKindName(n->kind), n->name);
+            return buf;
+        }
+
+        // ---------------------------------------------------------------------------
+        // Serialization
+        // ---------------------------------------------------------------------------
+        static void Esc(std::string& out, const char* s)
+        {
+            for (const char* p = s; *p; p++)
+            {
+                if (*p == '\n') out += "\\n";
+                else if (*p == '\\' || *p == ';') { out += '\\'; out += *p; }
+                else out += *p;
+            }
+        }
+        static const char* Unesc(const char* s, char* out, size_t outsz)
+        {
+            size_t j = 0;
+            for (const char* p = s; *p && j + 1 < outsz; p++)
+            {
+                if (*p == '\\' && p[1])
+                {
+                    p++;
+                    if (*p == 'n') out[j++] = '\n';
+                    else out[j++] = *p;
+                }
+                else out[j++] = *p;
+            }
+            out[j] = 0;
+            return out;
+        }
+
+        void SerializeNode(const Node* n, std::string& out, int depth)
+        {
+            char line[1024], tmp[256];
+            snprintf(line, sizeof(line), "%d {k=%s; n=%s; v=%s; o=%d; vis=%d; sel=%d; pf=%d; f1=%d; f2=%d; ad=%d; "
+                     "i1=%d; i2=%d; fA=%.4g; fB=%.4g; fC=%.4g; fD=%.4g; mn=%.4g; mx=%.4g; sp=%.4g; w=%.4g; h=%.4g; "
+                     "c0=%.3f,%.3f,%.3f,%.3f; fr=%.3g; ci=%d; fmt=%s; sc=%s; sl=%d; ind=%.4g; "
+                     "sa=%d; sav=%.3g; cU=%d%d%d; cI=%d,%d,%d; cV=%s",
+                     depth, NodeKindName(n->kind), n->name, n->value_str, n->open?1:0, n->visible?1:0, n->selected?1:0,
+                     n->p_open_flag?1:0, n->flags, n->flags2, n->arrow_dir,
+                     n->v_int, n->v_int2, n->v_float, n->v_float2, n->v_float3, n->v_float4, n->v_min, n->v_max, n->v_speed, n->w, n->h,
+                     n->colors[0], n->colors[1], n->colors[2], n->colors[3], n->fraction, n->combo_i, n->fmt, n->shortcut,
+                     n->same_line?1:0, n->indent,
+                     n->st_alpha_used?1:0, n->st_alpha,
+                     n->st_col_used[0]?1:0, n->st_col_used[1]?1:0, n->st_col_used[2]?1:0,
+                     n->st_col_id[0], n->st_col_id[1], n->st_col_id[2],
+                     tmp);
+            // colors overrides: serialize 3 slots as hex after cV marker
+            char cols[256]; cols[0] = 0;
+            for (int i = 0; i < 3; i++)
+            {
+                char cbuf[32];
+                if (n->st_col_used[i])
+                {
+                    unsigned r = (unsigned)(n->st_col_v[i][0]*255.0f+0.5f), g = (unsigned)(n->st_col_v[i][1]*255.0f+0.5f),
+                             b = (unsigned)(n->st_col_v[i][2]*255.0f+0.5f), a = (unsigned)(n->st_col_v[i][3]*255.0f+0.5f);
+                    snprintf(cbuf, sizeof(cbuf), "%02X%02X%02X%02X", r, g, b, a);
+                }
+                else snprintf(cbuf, sizeof(cbuf), "-");
+                strcat(cols, i ? "," : ""); strcat(cols, cbuf);
+            }
+            strcat(line, cols);
+            strcat(line, "}\n");
+            out += line;
+            for (Node* c : n->children)
+                SerializeNode(c, out, depth + 1);
+        }
+
+        std::string SaveTreeToString(const Node* root)
+        {
+            std::string s;
+            s += "#IMGUI_MENU_V1\n";
+            if (root) SerializeNode(root, s, 0);
+            return s;
+        }
+
+        // --- parse helpers ---
+        static std::string GetField(const char* body, const char* key)
+        {
+            char pat[64]; snprintf(pat, sizeof(pat), "%s=", key);
+            const char* p = strstr(body, pat);
+            if (!p) return "";
+            p += strlen(pat);
+            std::string v;
+            while (*p && *p != ';') v += *p++;
+            return v;
+        }
+
+        static Node* ParseNodeLine(const char* line)
+        {
+            // line: "DEPTH { fields }"
+            int depth = atoi(line);
+            const char* b = strchr(line, '{');
+            const char* e = strrchr(line, '}');
+            if (!b || !e || e <= b) return nullptr;
+            std::string body(b + 1, e - b - 1);
+            // split off cV hex list (last field)
+            std::string kv = GetField(body.c_str(), "k");
+            if (kv.empty()) return nullptr;
+            Node* n = new Node();
+            Node_MakeDefault(n, NodeKindFromName(kv.c_str()));
+            char t1[64], t2[64];
+            Unesc(GetField(body.c_str(), "n").c_str(), n->name, sizeof(n->name));
+            Unesc(GetField(body.c_str(), "v").c_str(), n->value_str, sizeof(n->value_str));
+            n->open       = GetField(body.c_str(), "o").c_str()[0] == '1';
+            n->visible    = GetField(body.c_str(), "vis").c_str()[0] == '1';
+            n->selected   = GetField(body.c_str(), "sel").c_str()[0] == '1';
+            n->p_open_flag= GetField(body.c_str(), "pf").c_str()[0] == '1';
+            n->flags      = atoi(GetField(body.c_str(), "f1").c_str());
+            n->flags2     = atoi(GetField(body.c_str(), "f2").c_str());
+            n->arrow_dir  = atoi(GetField(body.c_str(), "ad").c_str());
+            n->v_int      = atoi(GetField(body.c_str(), "i1").c_str());
+            n->v_int2     = atoi(GetField(body.c_str(), "i2").c_str());
+            n->v_float    = (float)atof(GetField(body.c_str(), "fA").c_str());
+            n->v_float2   = (float)atof(GetField(body.c_str(), "fB").c_str());
+            n->v_float3   = (float)atof(GetField(body.c_str(), "fC").c_str());
+            n->v_float4   = (float)atof(GetField(body.c_str(), "fD").c_str());
+            n->v_min      = (float)atof(GetField(body.c_str(), "mn").c_str());
+            n->v_max      = (float)atof(GetField(body.c_str(), "mx").c_str());
+            n->v_speed    = (float)atof(GetField(body.c_str(), "sp").c_str());
+            n->w          = (float)atof(GetField(body.c_str(), "w").c_str());
+            n->h          = (float)atof(GetField(body.c_str(), "h").c_str());
+            sscanf(GetField(body.c_str(), "c0").c_str(), "%f,%f,%f,%f", &n->colors[0], &n->colors[1], &n->colors[2], &n->colors[3]);
+            n->fraction   = (float)atof(GetField(body.c_str(), "fr").c_str());
+            n->combo_i    = atoi(GetField(body.c_str(), "ci").c_str());
+            Unesc(GetField(body.c_str(), "fmt").c_str(), n->fmt, sizeof(n->fmt));
+            Unesc(GetField(body.c_str(), "sc").c_str(), n->shortcut, sizeof(n->shortcut));
+            n->same_line  = GetField(body.c_str(), "sl").c_str()[0] == '1';
+            n->indent     = (float)atof(GetField(body.c_str(), "ind").c_str());
+            n->st_alpha_used = GetField(body.c_str(), "sa").c_str()[0] == '1';
+            n->st_alpha   = (float)atof(GetField(body.c_str(), "sav").c_str());
+            std::string cu = GetField(body.c_str(), "cU");
+            if (cu.size() >= 3) { n->st_col_used[0] = cu[0]=='1'; n->st_col_used[1] = cu[1]=='1'; n->st_col_used[2] = cu[2]=='1'; }
+            sscanf(GetField(body.c_str(), "cI").c_str(), "%d,%d,%d", &n->st_col_id[0], &n->st_col_id[1], &n->st_col_id[2]);
+            std::string cv = GetField(body.c_str(), "cV");
+            if (cv.size() >= 3)
+            {
+                char cbuf[256]; strncpy(cbuf, cv.c_str(), 255); cbuf[255] = 0;
+                char* save = nullptr;
+                for (int i = 0; i < 3; i++)
+                {
+                    char* tok = strtok_r(i ? nullptr : cbuf, ",", &save);
+                    if (!tok) break;
+                    if (strcmp(tok, "-") != 0 && strlen(tok) == 8)
+                    {
+                        unsigned rv = 0; sscanf(tok, "%X", &rv);
+                        n->st_col_v[i][0] = ((rv >> 24) & 255) / 255.0f;
+                        n->st_col_v[i][1] = ((rv >> 16) & 255) / 255.0f;
+                        n->st_col_v[i][2] = ((rv >> 8) & 255) / 255.0f;
+                        n->st_col_v[i][3] = (rv & 255) / 255.0f;
+                    }
+                }
+            }
+            (void)t1; (void)t2;
+            return n;
+        }
+
+        Node* LoadTreeFromString(const std::string& text)
+        {
+            if (text.empty() || text.rfind("#IMGUI_MENU_V1", 0) != 0) return nullptr;
+            Node* root = nullptr;
+            std::vector<Node*> stack; // stack[depth] = current open node
+            const char* p = text.c_str();
+            while ((p = strchr(p, '\n')) != nullptr)
+            {
+                p++;
+                if (*p == '\0' || *p == '#') continue;
+                const char* e = strchr(p, '\n');
+                std::string line(p, e ? (size_t)(e - p) : strlen(p));
+                if (line.find('{') == std::string::npos) continue;
+                int depth = atoi(line.c_str());
+                Node* n = ParseNodeLine(line.c_str());
+                if (!n) continue;
+                while ((int)stack.size() > depth + 1) stack.pop_back();
+                if (depth == 0 || stack.empty()) { root = n; stack.clear(); stack.push_back(n); }
+                else { Node_AddChild(stack[depth - 1 < (int)stack.size() ? depth - 1 : (int)stack.size() - 1], n); stack.push_back(n); }
+                if ((int)stack.size() != depth + 1) // tolerate malformed depth
+                {
+                    while ((int)stack.size() < depth + 1) stack.push_back(n); // pad
+                    while ((int)stack.size() > depth + 1) stack.pop_back();
+                    stack[depth] = n;
+                }
+            }
+            return root;
+        }
+
+        IMGUIED_EOF
+
+        mkdir -p "$(dirname 'app/src/main/cpp/editor_render.cpp')"
+        cat > 'app/src/main/cpp/editor_render.cpp' <<'IMGUIED_EOF'
+        // editor_render.cpp - Renders the user's node tree with REAL Dear ImGui calls,
+        // and captures per-node screen rects so a touch anywhere selects that node.
+        #pragma once // included once into main.cpp via #include, keep it header-clean
+        #include "editor_nodes.h"
+        #include <cmath>
+
+        // Hit rect captured this frame: node id -> screen rect.
+        struct HitEntry { int id; ImRect r; };
+        static ImVector<HitEntry> g_hits;
+        static int g_hit_selected = -1;       // set by touch tap in palette mode
+        static int g_hit_hover_id = -1;       // transient
+
+        static void HitClear() { g_hits.clear(); }
+        static void HitAdd(int id, const ImVec2& a, const ImVec2& b)
+        {
+            if (id < 0) return;
+            HitEntry e; e.id = id; e.r = ImRect(a, b);
+            g_hits.push_back(e);
+        }
+        static void HitAddItem(int id) { HitAdd(id, ImGui::GetItemRectMin(), ImGui::GetItemRectMax()); }
+
+        // Find node under a screen point (last/highest wins as "innermost").
+        static int HitTest(int x, int y)
+        {
+            int found = -1;
+            for (int i = 0; i < g_hits.Size; i++)
+                if (g_hits[i].r.Contains(ImVec2((float)x, (float)y)))
+                    found = g_hits[i].id;
+            return found;
+        }
+
+        // ---------------------------------------------------------------------------
+        // Style overrides: push before rendering a node's subtree, pop after.
+        // ---------------------------------------------------------------------------
+        struct StyleOverrideState { int colors; int vars; };
+        static void PushNodeStyle(const Node* n, StyleOverrideState& st)
+        {
+            st.colors = 0; st.vars = 0;
+            if (n->st_alpha_used)
+            {
+                ImGui::PushStyleVar(ImGuiStyleVar_Alpha, n->st_alpha);
+                st.vars++;
+            }
+            for (int i = 0; i < 3; i++)
+                if (n->st_col_used[i] && n->st_col_id[i] >= 0 && n->st_col_id[i] < ImGuiCol_COUNT)
+                {
+                    ImGui::PushStyleColor(n->st_col_id[i], ImVec4(n->st_col_v[i][0], n->st_col_v[i][1], n->st_col_v[i][2], n->st_col_v[i][3]));
+                    st.colors++;
+                }
+        }
+        static void PopNodeStyle(const StyleOverrideState& st)
+        {
+            if (st.colors) ImGui::PopStyleColor(st.colors);
+            if (st.vars) ImGui::PopStyleVar(st.vars);
+        }
+
+        // ---------------------------------------------------------------------------
+        // Split "A,B,C" csv into items.
+        // ---------------------------------------------------------------------------
+        static void SplitCsv(const char* s, ImVector<const char*>& out)
+        {
+            static char buf[512]; // single-threaded UI, ok
+            strncpy(buf, s, 511); buf[511] = 0;
+            char* save = nullptr;
+            for (char* t = strtok_r(buf, ",", &save); t; t = strtok_r(nullptr, ",", &save))
+                out.push_back(t);
+        }
+
+        // procedural data for plots
+        static float PlotValue(void*, int i) { return 0.5f + 0.4f * sinf((float)i * 0.13f); }
+        static float HistValue(void*, int i) { return 0.3f + 0.6f * fabsf(sinf((float)i * 0.21f)); }
+
+        // ---------------------------------------------------------------------------
+        // Render one node (and children). In edit_mode we also record hit rects and
+        // show selection highlight. The rendered widgets are REAL ImGui widgets.
+        // ---------------------------------------------------------------------------
+        static void RenderNode(Node* n, bool edit_mode, int selected_id)
+        {
+            // pre-layout: indent / same-line
+            if (n->indent != 0.0f) ImGui::Indent(n->indent);
+            if (n->same_line) ImGui::SameLine();
+
+            StyleOverrideState st;
+            PushNodeStyle(n, st);
+
+            bool vis = n->visible;
+            if (!vis) ImGui::BeginDisabled(true);
+            bool is_sel = (edit_mode && n->id == selected_id);
+
+            switch (n->kind)
+            {
+            case NWindow:
+            {
+                if (!vis) { /* still Begin to keep structure, disabled look */ }
+                ImGui::SetNextWindowSize(ImVec2(n->w > 0 ? n->w : 300, n->h > 0 ? n->h : 200), n->w > 0 ? ImGuiCond_FirstUseEver : ImGuiCond_Appearing);
+                bool open = ImGui::Begin(n->name, n->p_open_flag ? &n->p_open_flag : nullptr, n->flags);
+                HitAdd(n->id, ImGui::GetWindowPos(), ImVec2(ImGui::GetWindowPos().x + ImGui::GetWindowSize().x, ImGui::GetWindowPos().y + ImGui::GetWindowSize().y));
+                if (open)
+                {
+                    for (Node* c : n->children) RenderNode(c, edit_mode, selected_id);
+                    HitAdd(n->id, ImGui::GetWindowPos(), ImVec2(ImGui::GetWindowPos().x + ImGui::GetWindowSize().x, ImGui::GetWindowPos().y + ImGui::GetWindowSize().y)); // innermost update
+                }
+                ImGui::End();
+                break;
+            }
+            case NMenuBar:
+                if (ImGui::BeginMenuBar())
+                {
+                    HitAddItem(n->id);
+                    for (Node* c : n->children) RenderNode(c, edit_mode, selected_id);
+                    ImGui::EndMenuBar();
+                }
+                break;
+            case NMenu:
+                if (ImGui::BeginMenu(n->name, vis))
+                {
+                    HitAddItem(n->id);
+                    for (Node* c : n->children) RenderNode(c, edit_mode, selected_id);
+                    ImGui::EndMenu();
+                }
+                break;
+            case NMenuItem:
+                if (n->shortcut[0]) ImGui::MenuItem(n->name, n->shortcut, n->selected, vis);
+                else                 ImGui::MenuItem(n->name, nullptr, n->selected, vis);
+                HitAddItem(n->id);
+                break;
+            case NCollapsingHeader:
+            {
+                ImGuiTreeNodeFlags f = n->flags | (n->selected ? ImGuiTreeNodeFlags_Selected : 0);
+                if (n->p_open_flag)
+                    ImGui::CollapsingHeader(n->name, &n->p_open_flag, f);
+                else
+                    ImGui::CollapsingHeader(n->name, f);
+                HitAddItem(n->id);
+                if (n->open && n->p_open_flag)
+                    for (Node* c : n->children) RenderNode(c, edit_mode, selected_id);
+                break;
+            }
+            case NTreeNode:
+            {
+                ImGuiTreeNodeFlags f = n->flags | (n->selected ? ImGuiTreeNodeFlags_Selected : 0);
+                bool open = ImGui::TreeNodeEx(n->name, f);
+                HitAddItem(n->id);
+                if (open)
+                {
+                    for (Node* c : n->children) RenderNode(c, edit_mode, selected_id);
+                    ImGui::TreePop();
+                }
+                break;
+            }
+            case NTabBar:
+                if (ImGui::BeginTabBar(n->name, n->flags))
+                {
+                    HitAddItem(n->id);
+                    for (Node* c : n->children) RenderNode(c, edit_mode, selected_id);
+                    ImGui::EndTabBar();
+                }
+                break;
+            case NTabItem:
+                if (ImGui::BeginTabItem(n->name, n->p_open_flag ? &n->p_open_flag : nullptr, n->flags))
+                {
+                    HitAddItem(n->id);
+                    for (Node* c : n->children) RenderNode(c, edit_mode, selected_id);
+                    ImGui::EndTabItem();
+                }
+                break;
+            case NGroup:
+                ImGui::BeginGroup();
+                for (Node* c : n->children) RenderNode(c, edit_mode, selected_id);
+                ImGui::EndGroup();
+                HitAddItem(n->id);
+                break;
+            case NChild:
+            {
+                bool open = ImGui::BeginChild(n->name, ImVec2(n->w, n->h), n->flags, n->flags2);
+                HitAdd(n->id, ImGui::GetWindowPos(), ImVec2(ImGui::GetWindowPos().x + ImGui::GetWindowSize().x, ImGui::GetWindowPos().y + ImGui::GetWindowSize().y));
+                if (open) for (Node* c : n->children) RenderNode(c, edit_mode, selected_id);
+                ImGui::EndChild();
+                break;
+            }
+            case NTable:
+            {
+                // children: NTableRow nodes. Each TableRow's children = cells (rendered
+                // as text of cell nodes, using their name or value_str).
+                bool open = ImGui::BeginTable(n->name, n->v_int, n->flags,
+                             ImVec2(n->w != 0 ? n->w : 0.0f, n->h != 0 ? n->h : 0.0f));
+                if (open)
+                {
+                    HitAdd(n->id, ImGui::GetWindowPos(), ImVec2(ImGui::GetWindowPos().x + ImGui::GetWindowSize().x, ImGui::GetWindowPos().y + ImGui::GetWindowSize().y));
+                    int col = 0;
+                    for (Node* row : n->children)
+                    {
+                        ImGui::TableNextRow(ImGuiTableRowFlags_None);
+                        HitAddItem(row->id);
+                        col = 0;
+                        for (Node* cell : row->children)
+                        {
+                            ImGui::TableSetColumnIndex(col % ImMax(n->v_int, 1));
+                            ImGui::TextUnformatted(cell->name[0] ? cell->name : (cell->value_str[0] ? cell->value_str : " "));
+                            HitAddItem(cell->id);
+                            col++;
+                        }
+                    }
+                    ImGui::EndTable();
+                }
+                break;
+            }
+            case NText:        ImGui::TextUnformatted(n->value_str); HitAddItem(n->id); break;
+            case NTextWrapped: ImGui::TextWrapped("%s", n->value_str); HitAddItem(n->id); break;
+            case NTextDisabled: ImGui::TextDisabled("%s", n->value_str); HitAddItem(n->id); break;
+            case NSeparator:   ImGui::Separator(); HitAddItem(n->id); break;
+            case NSeparatorText: ImGui::SeparatorText(n->name); HitAddItem(n->id); break;
+            case NBulletText: ImGui::BulletText("%s", n->value_str); HitAddItem(n->id); break;
+            case NButton:     ImGui::Button(n->name, ImVec2(n->w, n->h)); HitAddItem(n->id); break;
+            case NSmallButton: ImGui::SmallButton(n->name); HitAddItem(n->id); break;
+            case NArrowButton: ImGui::ArrowButton(n->name, (ImGuiDir)n->arrow_dir); HitAddItem(n->id); break;
+            case NCheckbox:   { bool b = n->v_int != 0; ImGui::Checkbox(n->name, &b); n->v_int = b ? 1 : 0; HitAddItem(n->id); } break;
+            case NCheckboxFlags: { int f = n->flags; ImGui::CheckboxFlags(n->name, &f, 1); n->flags = f; HitAddItem(n->id); } break;
+            case NRadioButton:
+            {
+                bool on = (n->v_int == n->combo_i);
+                ImGui::RadioButton(n->name, &on); if (on != (n->v_int == n->combo_i)) {}
+                if (on) n->v_int = n->combo_i;
+                HitAddItem(n->id);
+                break;
+            }
+            case NCombo:
+            {
+                ImVector<const char*> items; SplitCsv(n->value_str, items);
+                const char* preview = items.Size ? items[ImClamp(n->combo_i, 0, items.Size - 1)] : "";
+                if (ImGui::BeginCombo(n->name, preview, n->flags))
+                {
+                    HitAddItem(n->id);
+                    for (int i = 0; i < items.Size; i++)
+                        if (ImGui::Selectable(items[i], n->combo_i == i))
+                            n->combo_i = i;
+                    ImGui::EndCombo();
+                }
+                else HitAddItem(n->id);
+                break;
+            }
+            case NListBox:
+            {
+                ImVector<const char*> items; SplitCsv(n->value_str, items);
+                if (ImGui::BeginListBox(n->name, ImVec2(n->w, n->h)))
+                {
+                    for (int i = 0; i < items.Size; i++)
+                        if (ImGui::Selectable(items[i], n->combo_i == i))
+                            n->combo_i = i;
+                    ImGui::EndListBox();
+                }
+                HitAddItem(n->id);
+                break;
+            }
+            case NInputText:
+            {
+                static char live[64]; strncpy(live, n->value_str, 63); live[63] = 0;
+                if (ImGui::InputText(n->name, live, sizeof(live), n->flags))
+                    strncpy(n->value_str, live, 63);
+                HitAddItem(n->id);
+                break;
+            }
+            case NInputTextMultiline:
+            {
+                static char live[256]; strncpy(live, n->value_str, 255); live[255] = 0;
+                if (ImGui::InputTextMultiline(n->name, live, sizeof(live), ImVec2(n->w, n->h), n->flags))
+                    strncpy(n->value_str, live, 63);
+                HitAddItem(n->id);
+                break;
+            }
+            case NInputInt:
+            {
+                int v = n->v_int;
+                ImGui::InputInt(n->name, &v, n->v_int2 ? n->v_int2 : 1, 100, n->flags);
+                n->v_int = v;
+                HitAddItem(n->id);
+                break;
+            }
+            case NInputFloat:
+            {
+                float v = n->v_float;
+                ImGui::InputFloat(n->name, &v, n->v_speed, 0.0f, n->fmt[0] ? n->fmt : "%.3f", n->flags);
+                n->v_float = v;
+                HitAddItem(n->id);
+                break;
+            }
+            case NDragInt:
+            {
+                int v = n->v_int;
+                ImGui::DragInt(n->name, &v, n->v_speed, (int)n->v_min, (int)n->v_max, n->fmt[0] ? n->fmt : "%d", n->flags);
+                n->v_int = v;
+                HitAddItem(n->id);
+                break;
+            }
+            case NDragFloat:
+            {
+                float v = n->v_float;
+                ImGui::DragFloat(n->name, &v, n->v_speed, n->v_min, n->v_max, n->fmt[0] ? n->fmt : "%.3f", n->flags);
+                n->v_float = v;
+                HitAddItem(n->id);
+                break;
+            }
+            case NSliderInt:
+            {
+                int v = n->v_int;
+                ImGui::SliderInt(n->name, &v, (int)n->v_min, (int)n->v_max, n->fmt[0] ? n->fmt : "%d", n->flags);
+                n->v_int = v;
+                HitAddItem(n->id);
+                break;
+            }
+            case NSliderFloat:
+            {
+                float v = n->v_float;
+                ImGui::SliderFloat(n->name, &v, n->v_min, n->v_max, n->fmt[0] ? n->fmt : "%.3f", n->flags);
+                n->v_float = v;
+                HitAddItem(n->id);
+                break;
+            }
+            case NColorEdit3: ImGui::ColorEdit3(n->name, n->colors, (ImGuiColorEditFlags)n->flags); HitAddItem(n->id); break;
+            case NColorEdit4: ImGui::ColorEdit4(n->name, n->colors, (ImGuiColorEditFlags)n->flags); HitAddItem(n->id); break;
+            case NProgressBar: ImGui::ProgressBar(n->fraction, ImVec2(n->w, n->h), n->value_str[0] ? n->value_str : nullptr); HitAddItem(n->id); break;
+            case NPlotLines:
+                ImGui::PlotLines(n->name, PlotValue, nullptr, n->v_int, 0, n->value_str[0] ? n->value_str : nullptr,
+                                 n->v_min, n->v_max, ImVec2(n->w, n->h));
+                HitAddItem(n->id); break;
+            case NPlotHistogram:
+                ImGui::PlotHistogram(n->name, HistValue, nullptr, n->v_int, 0, n->value_str[0] ? n->value_str : nullptr,
+                                     n->v_min, n->v_max, ImVec2(n->w, n->h));
+                HitAddItem(n->id); break;
+            case NImage:
+                // placeholder textured quad via the standard Image() call on the font atlas tex
+                ImGui::Image(ImGui::GetIO().Fonts->TexID, ImVec2(n->w, n->h),
+                             ImVec2(0, 0), ImVec2(0.25f, 0.25f),
+                             ImVec4(n->colors[0], n->colors[1], n->colors[2], n->colors[3]),
+                             ImVec4(0, 0, 0, 0));
+                HitAddItem(n->id);
+                break;
+            case NSelectable:
+                ImGui::Selectable(n->name, n->selected, n->flags, ImVec2(n->w, n->h));
+                HitAddItem(n->id);
+                break;
+            case NTooltip:
+                if (ImGui::IsItemHovered() || edit_mode)
+                {
+                    if (ImGui::BeginTooltip())
+                    {
+                        ImGui::TextUnformatted(n->value_str[0] ? n->value_str : n->name);
+                        HitAddItem(n->id);
+                        ImGui::EndTooltip();
+                    }
+                }
+                break;
+            case NPopupModal:
+                if (n->open)
+                {
+                    ImGui::SetNextWindowSize(ImVec2(n->w > 0 ? n->w : 300, n->h > 0 ? n->h : 150), ImGuiCond_Appearing);
+                    if (ImGui::BeginPopupModal(n->name, n->p_open_flag ? &n->p_open_flag : nullptr, n->flags))
+                    {
+                        HitAdd(n->id, ImGui::GetWindowPos(), ImVec2(ImGui::GetWindowPos().x + ImGui::GetWindowSize().x, ImGui::GetWindowPos().y + ImGui::GetWindowSize().y));
+                        for (Node* c : n->children) RenderNode(c, edit_mode, selected_id);
+                        ImGui::EndPopup();
+                    }
+                }
+                break;
+            default: break;
+            }
+
+            if (!vis) ImGui::EndDisabled();
+            PopNodeStyle(st);
+
+            if (n->indent != 0.0f) ImGui::Unindent(n->indent);
+
+            // selection highlight ring drawn AFTER item (fg drawlist over everything)
+            if (is_sel)
+            {
+                for (int i = 0; i < g_hits.Size; i++)
+                    if (g_hits[i].id == n->id)
+                    {
+                        ImGui::GetForegroundDrawList()->AddRect(ImVec2(g_hits[i].r.Min.x - 3, g_hits[i].r.Min.y - 3), ImVec2(g_hits[i].r.Max.x + 3, g_hits[i].r.Max.y + 3),
+                                                                IM_COL32(255, 180, 0, 220), 4.0f, 0, 3.0f);
+                    }
+            }
+        }
+
+        IMGUIED_EOF
+
+        mkdir -p "$(dirname 'app/src/main/cpp/editor_chrome.cpp')"
+        cat > 'app/src/main/cpp/editor_chrome.cpp' <<'IMGUIED_EOF'
+        // editor_chrome.cpp - The editor UI itself: tree + drawers + boxes + d-pad + lock.
+        // Runs in edit mode only. All panels are real Dear ImGui windows.
+        #pragma once
+        #include "editor_nodes.h"
+
+        // ---------------------------------------------------------------------------
+        // Editor context shared across chrome + render.
+        // ---------------------------------------------------------------------------
+        struct EditorState
+        {
+            Node*   root = nullptr;         // document root (a Window node)
+            int     sel = -1;               // selected node id
+            bool    edit_mode = true;       // false = locked/fullscreen preview
+            bool    show_demo_test = false; // demo window under lock for testing
+            bool    palette_fullscreen = false;
+            bool    show_tree = true, show_props = true;
+            char    load_buf[64] = "";
+            // d-pad navigation scratch
+            Node* SelNode() { return Node_FindById(root, sel); }
+        };
+
+        static EditorState g_ed;
+        static const char* GetSelPath(Node* n) { static char p[256]; p[0]=0;
+            // build "Root/Child/Sub" path of node
+            const Node* c = n; int i = 254;
+            char tmp[256]; tmp[255]=0;
+            while (c) {
+                const char* lab = (c->kind==NText||c->kind==NTextWrapped||c->kind==NBulletText||c->kind==NTextDisabled) ? c->value_str : c->name;
+                int L = (int)strlen(lab); if (L > 60) L = 60;
+                if (i - L - 1 < 0) break;
+                if (c != n) { tmp[i--] = '/'; }
+                // we build backwards
+                i -= L; for (int j = 0; j < L; j++) tmp[i + 1 + j] = lab[j];
+                c = c->parent;
+            }
+            snprintf(p, 256, "%s", tmp + i + 1);
+            return p; }
+
+        // ---------------------------------------------------------------------------
+        // Add-new palette (left drawer): all node kinds grouped by category.
+        // ---------------------------------------------------------------------------
+        static const char* const KindCategories[] = {
+            "Windows & Layout", "Containers", "Text & Display", "Buttons", "Toggles",
+            "Inputs", "Numeric", "Colors & Plots", "Advanced"
+        };
+        static const int KindCategoryMap[][2] = {
+            {0, NWindow}, {0, NChild}, {0, NGroup},
+            {1, NMenuBar}, {1, NMenu}, {1, NMenuItem}, {1, NCollapsingHeader}, {1, NTreeNode},
+            {1, NTabBar}, {1, NTabItem},
+            {2, NText}, {2, NTextWrapped}, {2, NTextDisabled}, {2, NSeparator}, {2, NSeparatorText}, {2, NBulletText},
+            {3, NButton}, {3, NSmallButton}, {3, NArrowButton},
+            {4, NCheckbox}, {4, NCheckboxFlags}, {4, NRadioButton}, {4, NSelectable},
+            {4, NCombo}, {4, NListBox},
+            {5, NInputText}, {5, NInputTextMultiline},
+            {6, NInputInt}, {6, NInputFloat}, {6, NDragInt}, {6, NDragFloat},
+            {6, NSliderInt}, {6, NSliderFloat}, {6, NProgressBar},
+            {7, NColorEdit3}, {7, NColorEdit4}, {7, NPlotLines}, {7, NPlotHistogram}, {7, NImage},
+            {8, NTable}, {8, NTableRow}, {8, NTooltip}, {8, NPopupModal},
+        };
+
+        static void AddNodeButton(int kind, int target_parent_id)
+        {
+            Node* p = Node_FindById(g_ed.root, target_parent_id);
+            if (!p || !NodeAcceptsChildren(p->kind)) { ImGui::TextDisabled("(select a container)"); return; }
+            Node* n = Node_New(kind);
+            Node_AddChild(p, n);
+            g_ed.sel = n->id;
+        }
+
+        static void DrawAddPalette()
+        {
+            ImGui::SetNextWindowPos(ImVec2(0, 60));
+            ImGui::SetNextWindowSize(ImVec2(200, -1), ImGuiCond_Appearing);
+            ImGui::Begin("Add", nullptr, ImGuiWindowFlags_NoTitleBar | ImGuiWindowFlags_NoResize | ImGuiWindowFlags_NoMove | ImGuiWindowFlags_NoCollapse | ImGuiWindowFlags_NoSavedSettings);
+            ImGui::TextUnformatted("ADD ITEM");
+            ImGui::Separator();
+            Node* sel = g_ed.SelNode();
+            if (!sel) ImGui::TextDisabled("no selection");
+            int pid = (sel && NodeAcceptsChildren(sel->kind)) ? sel->id : (g_ed.root ? g_ed.root->id : -1);
+            char lbl[64];
+            for (int c = 0; c < 9; c++)
+            {
+                if (!ImGui::CollapsingHeader(KindCategories[c])) continue;
+                for (auto& m : KindCategoryMap)
+                {
+                    if (m[0] != c) continue;
+                    snprintf(lbl, sizeof(lbl), "+ %s", NodeKindName(m[1]));
+                    if (ImGui::SmallButton(lbl)) AddNodeButton(m[1], pid);
+                    ImGui::SameLine();
+                }
+                ImGui::NewLine();
+            }
+            ImGui::End();
+        }
+
+        // ---------------------------------------------------------------------------
+        // Tree view (left drawer, below add palette).
+        // ---------------------------------------------------------------------------
+        static void TreeRow(Node* n)
+        {
+            ImGuiTreeNodeFlags fl = ImGuiTreeNodeFlags_OpenOnArrow | ImGuiTreeNodeFlags_SpanFullWidth;
+            if (n->children.empty()) fl |= ImGuiTreeNodeFlags_Leaf;
+            if (n->id == g_ed.sel) fl |= ImGuiTreeNodeFlags_Selected;
+            if (n->palette_open) fl |= ImGuiTreeNodeFlags_DefaultOpen;
+            bool open = ImGui::TreeNodeEx(Node_ShortLabel(n), fl);
+            if (ImGui::IsItemClicked() && !ImGui::IsItemToggledOpen())
+                g_ed.sel = n->id;
+            if (open)
+            {
+                for (Node* c : n->children) TreeRow(c);
+                ImGui::TreePop();
+            }
+        }
+
+        static void DrawTree()
+        {
+            ImGui::SetNextWindowPos(ImVec2(0, 0), ImGuiCond_Appearing);
+            ImGui::SetNextWindowSize(ImVec2(200, 60), ImGuiCond_Appearing);
+            ImGui::Begin("Tree", nullptr, ImGuiWindowFlags_NoMove | ImGuiWindowFlags_NoCollapse | ImGuiWindowFlags_NoSavedSettings);
+            if (!g_ed.root) { ImGui::TextDisabled("(empty)"); }
+            else TreeRow(g_ed.root);
+            ImGui::End();
+        }
+
+        // ---------------------------------------------------------------------------
+        // Node properties (right drawer): every option per kind.
+        // ---------------------------------------------------------------------------
+        static void FlagCheckboxes(int* flags, const FlagDef* defs, int n)
+        {
+            for (int i = 0; i < n; i++)
+            {
+                int v = ((*flags) & defs[i].value) ? 1 : 0;
+                if (ImGui::CheckboxFlags(defs[i].name, flags, defs[i].value)) {}
+            }
+        }
+
+        static void DrawNodeProps(Node* n)
+        {
+            if (!n) { ImGui::TextDisabled("select an item"); return; }
+            char t[80];
+            snprintf(t, sizeof(t), "%s  #%d", NodeKindName(n->kind), n->id);
+            if (ImGui::CollapsingHeader(t, ImGuiTreeNodeFlags_DefaultOpen))
+            {
+                ImGui::InputText("name", n->name, sizeof(n->name));
+                if (n->kind == NText || n->kind == NTextWrapped || n->kind == NTextDisabled ||
+                    n->kind == NBulletText || n->kind == NCombo || n->kind == NListBox || n->kind == NInputText ||
+                    n->kind == NInputTextMultiline || n->kind == NProgressBar || n->kind == NTooltip ||
+                    n->kind == NPlotLines || n->kind == NPlotHistogram)
+                    ImGui::InputText("value", n->value_str, sizeof(n->value_str));
+                if (n->kind == NMenuItem)
+                    ImGui::InputText("shortcut", n->shortcut, sizeof(n->shortcut));
+                ImGui::Checkbox("visible/enabled", &n->visible);
+                ImGui::Checkbox("selected", &n->selected);
+                if (NodeIsContainerish(n->kind) || n->kind == NTabItem)
+                    ImGui::Checkbox("open", &n->p_open_flag);
+                ImGui::DragFloat("indent", &n->indent, 0.5f, 0, 400);
+                ImGui::Checkbox("same line", &n->same_line);
+            }
+
+            // Kind-specific numeric options
+            if (ImGui::CollapsingHeader("Options"))
+            {
+                switch (n->kind)
+                {
+                case NArrowButton:
+                    ImGui::RadioButton("Left", &n->arrow_dir, 0); ImGui::SameLine();
+                    ImGui::RadioButton("Right", &n->arrow_dir, 1); ImGui::SameLine();
+                    ImGui::RadioButton("Up", &n->arrow_dir, 2); ImGui::SameLine();
+                    ImGui::RadioButton("Down", &n->arrow_dir, 3);
+                    break;
+                case NInputInt:
+                    ImGui::InputInt("step", &n->v_int2, 1, 100);
+                    break;
+                case NInputFloat: case NDragInt: case NDragFloat: case NSliderInt: case NSliderFloat:
+                    ImGui::DragFloat("speed", &n->v_speed, 0.01f, 0, 100);
+                    break;
+                case NCombo: case NListBox: case NRadioButton:
+                    ImGui::SliderInt("sel index", &n->combo_i, 0, 12);
+                    break;
+                case NTable:
+                    ImGui::SliderInt("columns", &n->v_int, 1, 8);
+                    break;
+                case NProgressBar:
+                    ImGui::SliderFloat("fraction", &n->fraction, 0, 1);
+                    break;
+                case NPlotLines: case NPlotHistogram:
+                    ImGui::SliderInt("values", &n->v_int, 1, 200);
+                    break;
+                case NInputText: case NInputTextMultiline:
+                    // buffer size fixed; note only
+                    ImGui::TextDisabled("buffer: 64/256 chars");
+                    break;
+                default:
+                    ImGui::TextDisabled("(no numeric options)");
+                    break;
+                }
+                ImGui::DragFloat("w", &n->w, 1, -600, 2000);
+                ImGui::DragFloat("h", &n->h, 1, -600, 2000);
+            }
+
+            // Ranges for numeric widgets
+            if (n->kind == NSliderInt || n->kind == NSliderFloat || n->kind == NDragInt || n->kind == NDragFloat ||
+                n->kind == NInputInt || n->kind == NInputFloat)
+            {
+                if (ImGui::CollapsingHeader("Range & Format"))
+                {
+                    ImGui::DragFloat("min", &n->v_min, 0.5f, -100000, 100000);
+                    ImGui::DragFloat("max", &n->v_max, 0.5f, -100000, 100000);
+                    ImGui::InputText("format", n->fmt, sizeof(n->fmt));
+                }
+            }
+
+            // Flags for this kind
+            int fn = 0; const FlagDef* fd = FlagTableFor(n->kind, fn);
+            if (fd && fn > 0)
+            {
+                if (ImGui::CollapsingHeader("Flags"))
+                    FlagCheckboxes(&n->flags, fd, fn);
+            }
+
+            // Colors edit for ColorEdit nodes + preview colors
+            if (n->kind == NColorEdit3 || n->kind == NColorEdit4)
+            {
+                if (ImGui::CollapsingHeader("Color value", ImGuiTreeNodeFlags_DefaultOpen))
+                {
+                    if (n->kind == NColorEdit3) ImGui::ColorEdit3("##v", n->colors, (ImGuiColorEditFlags)n->flags);
+                    else ImGui::ColorEdit4("##v", n->colors, (ImGuiColorEditFlags)n->flags);
+                }
+            }
+
+            // Style overrides (alpha + 3 color slots)
+            if (ImGui::CollapsingHeader("Style Overrides"))
+            {
+                ImGui::Checkbox("use alpha", &n->st_alpha_used);
+                if (n->st_alpha_used) ImGui::SliderFloat("alpha", &n->st_alpha, 0, 1);
+                for (int i = 0; i < 3; i++)
+                {
+                    char lid[32]; snprintf(lid, sizeof(lid), "slot %d", i);
+                    ImGui::Checkbox(lid, &n->st_col_used[i]);
+                    if (n->st_col_used[i])
+                    {
+                        if (n->st_col_id[i] < 0) n->st_col_id[i] = 0;
+                        if (n->st_col_id[i] >= StyleColCount()) n->st_col_id[i] = 0;
+                        ImGui::PushID(i);
+                        ImGui::Combo("color", &n->st_col_id[i], [](void* data, int idx, const char** out) {
+                            *out = StyleColName(idx); return true; }, nullptr, StyleColCount());
+                        ImGui::ColorEdit4("override", n->st_col_v[i]);
+                        ImGui::PopID();
+                    }
+                }
+            }
+
+            // Node actions
+            if (ImGui::CollapsingHeader("Actions"))
+            {
+                if (ImGui::Button("Duplicate")) { if (n->parent) { Node* c = Node_Clone(n, n->parent); Node_AddChild(n->parent, c, Node_IndexInParent(n) + 1); g_ed.sel = c->id; } }
+                ImGui::SameLine();
+                if (ImGui::Button("Delete")) { if (n->parent) { Node_RemoveFromParent(n); Node_Delete(n); g_ed.sel = -1; } }
+                if (n->parent && ImGui::Button("Move Up")) { int i = Node_IndexInParent(n); if (i > 0) { n->parent->children[i] = n->parent->children[i-1]; n->parent->children[i-1] = n; } }
+                ImGui::SameLine();
+                if (n->parent && ImGui::Button("Move Down")) { int i = Node_IndexInParent(n); if (i < (int)n->parent->children.size()-1) { n->parent->children[i] = n->parent->children[i+1]; n->parent->children[i+1] = n; } }
+            }
+        }
+
+        static void DrawProps()
+        {
+            ImGui::SetNextWindowPos(ImVec2(ImGui::GetMainViewport()->WorkSize.x - 260, 0), ImGuiCond_Appearing);
+            ImGui::SetNextWindowSize(ImVec2(260, -1), ImGuiCond_Appearing);
+            ImGui::Begin("Properties", nullptr, ImGuiWindowFlags_NoMove | ImGuiWindowFlags_NoResize | ImGuiWindowFlags_NoCollapse | ImGuiWindowFlags_NoSavedSettings);
+            Node* n = g_ed.SelNode();
+            if (n)
+            {
+                ImGui::Text("path: %s", GetSelPath(n));
+                ImGui::Separator();
+                DrawNodeProps(n);
+            }
+            else ImGui::TextDisabled("select an item in the palette");
+            ImGui::End();
+        }
+
+        // ---------------------------------------------------------------------------
+        // Top box: document toolbar.
+        // ---------------------------------------------------------------------------
+        static void DrawTopBox()
+        {
+            ImGui::SetNextWindowPos(ImVec2(200, 0), ImGuiCond_Appearing);
+            ImGui::SetNextWindowSize(ImVec2(ImGui::GetMainViewport()->WorkSize.x - 460, 60), ImGuiCond_Appearing);
+            ImGui::Begin("Top", nullptr, ImGuiWindowFlags_NoTitleBar | ImGuiWindowFlags_NoResize | ImGuiWindowFlags_NoMove | ImGuiWindowFlags_NoSavedSettings);
+            ImGui::TextUnformatted("Toolbar:");
+            ImGui::SameLine();
+            if (ImGui::Button("New Window")) { if (g_ed.root) { Node_Delete(g_ed.root); } g_ed.root = Node_New(NWindow); g_ed.sel = g_ed.root->id; }
+            ImGui::SameLine();
+            if (ImGui::Button("Save")) { /* string save handled in main loop via flag */ }
+            ImGui::SameLine();
+            if (ImGui::Button("Load")) { }
+            ImGui::SameLine();
+            ImGui::Text("| selected: %s", g_ed.SelNode() ? NodeKindName(g_ed.SelNode()->kind) : "none");
+            ImGui::End();
+        }
+
+        // ---------------------------------------------------------------------------
+        // Bottom box: 4-way d-pad (left/right/up/down/focus) + tree ops.
+        // ---------------------------------------------------------------------------
+        static void MoveSelSibling(int delta)
+        {
+            Node* n = g_ed.SelNode();
+            if (!n || !n->parent) return;
+            int i = Node_IndexInParent(n) + delta;
+            if (i >= 0 && i < (int)n->parent->children.size()) g_ed.sel = n->parent->children[i]->id;
+        }
+        static void MoveSelParent()
+        {
+            Node* n = g_ed.SelNode();
+            if (n && n->parent) g_ed.sel = n->parent->id;
+        }
+        static void MoveSelFirstChild()
+        {
+            Node* n = g_ed.SelNode();
+            if (n && !n->children.empty()) g_ed.sel = n->children[0]->id;
+        }
+
+        static void DrawBottomBox()
+        {
+            ImGuiIO& io = ImGui::GetIO();
+            float h = 110;
+            ImGui::SetNextWindowPos(ImVec2(0, io.DisplaySize.y - h), ImGuiCond_Always);
+            ImGui::SetNextWindowSize(ImVec2(io.DisplaySize.x, h), ImGuiCond_Always);
+            ImGui::Begin("Bottom", nullptr, ImGuiWindowFlags_NoTitleBar | ImGuiWindowFlags_NoResize | ImGuiWindowFlags_NoMove | ImGuiWindowFlags_NoSavedSettings | ImGuiWindowFlags_NoScrollbar);
+            ImGui::TextUnformatted("Navigate selected item in the menu:");
+            ImGui::Spacing();
+
+            // 4-way pad: grid [up / focus] then [left / right / down]
+            float bw = 56, bh = 34;
+            ImGui::BeginGroup();
+            {
+                ImGui::SetCursorPosX(ImGui::GetCursorPosX() + bw + 8);
+                if (ImGui::Button("Up", ImVec2(bw, bh))) { /* up = to parent */ MoveSelParent(); }
+                ImGui::SameLine(0, 8);
+                if (ImGui::Button("Focus ©", ImVec2(bw + 20, bh))) { /* cycle layers */ static int k = 0; Node* n = g_ed.SelNode(); if (n) { k = (k + 1) % ImMax((int)n->children.size(), 1); if (!n->children.empty()) g_ed.sel = n->children[k]->id; } }
+                ImGui::SetCursorPosX(ImGui::GetCursorPosX());
+                if (ImGui::Button("Left", ImVec2(bw, bh))) MoveSelSibling(-1);
+                ImGui::SameLine(0, 8);
+                if (ImGui::Button("Down", ImVec2(bw, bh))) MoveSelFirstChild();
+                ImGui::SameLine(0, 8);
+                if (ImGui::Button("Right", ImVec2(bw, bh))) MoveSelSibling(+1);
+            }
+            ImGui::EndGroup();
+            ImGui::SameLine(0, 24);
+            ImGui::BeginGroup();
+            ImGui::TextWrapped("Left/Right move between siblings; Up/Down change layer; Focus cycles other layers in this section.");
+            ImGui::Text("selected: %s", g_ed.SelNode() ? Node_ShortLabel(g_ed.SelNode()) : "-");
+            ImGui::EndGroup();
+            ImGui::End();
+        }
+
+        // ---------------------------------------------------------------------------
+        // Lock button + mode switching (bottom-right corner of palette area).
+        // ---------------------------------------------------------------------------
+        static void DrawLockButton()
+        {
+            ImGuiIO& io = ImGui::GetIO();
+            ImVec2 pos = ImVec2(io.DisplaySize.x - 92, io.DisplaySize.y - 152);
+            ImGui::SetNextWindowPos(pos, ImGuiCond_Always);
+            ImGui::SetNextWindowSize(ImVec2(84, 40), ImGuiCond_Always);
+            ImGui::Begin("##lock", nullptr, ImGuiWindowFlags_NoTitleBar | ImGuiWindowFlags_NoResize | ImGuiWindowFlags_NoMove | ImGuiWindowFlags_NoSavedSettings | ImGuiWindowFlags_NoScrollbar | ImGuiWindowFlags_NoBackground);
+            const char* lbl = g_ed.edit_mode ? "LOCK" : "UNLOCK";
+            ImGui::PushStyleColor(ImGuiCol_Button, g_ed.edit_mode ? ImVec4(0.35f, 0.30f, 0.10f, 1) : ImVec4(0.10f, 0.35f, 0.18f, 1));
+            if (ImGui::Button(lbl, ImVec2(78, 34)))
+            {
+                g_ed.edit_mode = !g_ed.edit_mode;
+                if (!g_ed.edit_mode) { g_ed.palette_fullscreen = true; g_ed.show_demo_test = false; }
+                else { g_ed.palette_fullscreen = false; }
+            }
+            ImGui::PopStyleColor();
+            ImGui::End();
+        }
+
+        // In locked (fullscreen preview) mode: a floating unlock + demo-test toggle.
+        static void DrawLockedOverlay()
+        {
+            ImGuiIO& io = ImGui::GetIO();
+            ImGui::SetNextWindowPos(ImVec2(io.DisplaySize.x - 190, 8), ImGuiCond_Always);
+            ImGui::SetNextWindowSize(ImVec2(182, 44), ImGuiCond_Always);
+            ImGui::Begin("##locked", nullptr, ImGuiWindowFlags_NoTitleBar | ImGuiWindowFlags_NoResize | ImGuiWindowFlags_NoMove | ImGuiWindowFlags_NoSavedSettings | ImGuiWindowFlags_NoScrollbar | ImGuiWindowFlags_NoBackground);
+            if (ImGui::Button("Demo Test", ImVec2(84, 30)))
+                g_ed.show_demo_test = !g_ed.show_demo_test;
+            ImGui::SameLine();
+            ImGui::PushStyleColor(ImGuiCol_Button, ImVec4(0.10f, 0.35f, 0.18f, 1));
+            if (ImGui::Button("Unlock", ImVec2(84, 30))) { g_ed.edit_mode = true; g_ed.palette_fullscreen = false; }
+            ImGui::PopStyleColor();
+            ImGui::End();
+        }
+
+        IMGUIED_EOF
+
+        echo '[gen] project files written:'
+        find . -type f | sort
+    - name: Fetch real Dear ImGui ${{ env.IMGUI_VERSION_TAG }}
+      run: curl -L --fail --retry 3 -o /tmp/imgui.tgz "https://codeload.github.com/ocornut/imgui/tar.gz/refs/tags/${IMGUI_VERSION_TAG}" && mkdir -p app/src/main/cpp/imgui && tar -xzf /tmp/imgui.tgz -C app/src/main/cpp/imgui --strip-components=1 && ls app/src/main/cpp/imgui | head && grep -q 'IMGUI_VERSION       "1.91.5"' app/src/main/cpp/imgui/imgui.h && echo 'Dear ImGui v1.91.5 fetched OK'
+    - name: Set up Gradle
+      uses: gradle/actions/setup-gradle@v4
+      with:
+        gradle-version: '8.9'
+    - name: Accept Android SDK licenses
+      run: yes | "$ANDROID_HOME/cmdline-tools/latest/bin/sdkmanager" --licenses > /dev/null || true
+    - name: Install NDK + CMake (pinned)
+      run: '"$ANDROID_HOME/cmdline-tools/latest/bin/sdkmanager" "ndk;${NDK_VERSION}" "cmake;${CMAKE_VERSION}" > /dev/null'
+    - name: Build debug APK (assembles native ImGui via CMake)
+      run: gradle assembleDebug --no-daemon --stacktrace
+    - name: Build release APK
+      run: gradle assembleRelease --no-daemon --stacktrace
+    - name: Collect APKs
+      run: mkdir -p dist && cp app/build/outputs/apk/debug/app-debug.apk dist/ImGuiMenuEditor-debug.apk && cp app/build/outputs/apk/release/app-release-unsigned.apk dist/ImGuiMenuEditor-release-unsigned.apk 2>/dev/null || cp app/build/outputs/apk/release/app-release.apk dist/ImGuiMenuEditor-release-unsigned.apk 2>/dev/null || true; ls -la dist/ || true
+    - name: Upload APK artifact
+      uses: actions/upload-artifact@v4
+      with:
+        name: ImGuiMenuEditor-APK
+        path: dist/*.apk
